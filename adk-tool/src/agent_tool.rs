@@ -388,6 +388,10 @@ impl CallbackContext for AgentToolInvocationContext {
     fn artifacts(&self) -> Option<Arc<dyn Artifacts>> {
         if self.forward_artifacts { self.parent_ctx.artifacts() } else { None }
     }
+
+    fn shared_state(&self) -> Option<Arc<adk_core::SharedState>> {
+        self.parent_ctx.shared_state()
+    }
 }
 
 #[async_trait]
@@ -423,6 +427,23 @@ impl InvocationContext for AgentToolInvocationContext {
     fn ended(&self) -> bool {
         self.ended.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Authenticated scopes are forwarded so a scope-guarded tool used by the
+    /// wrapped agent sees the caller's grants rather than an empty set.
+    fn user_scopes(&self) -> Vec<String> {
+        self.parent_ctx.user_scopes()
+    }
+
+    /// Secret access is forwarded so the wrapped agent's tools can resolve
+    /// secrets through the same provider as the calling agent.
+    async fn get_secret(&self, name: &str) -> adk_core::Result<Option<String>> {
+        self.parent_ctx.get_secret(name).await
+    }
+
+    // `is_cancelled` and `request_metadata` are not forwarded: they are not part
+    // of the `ToolContext` surface this wrapper is constructed from, so there is
+    // nothing to delegate to. Cancellation therefore does not currently reach an
+    // agent invoked as a tool.
 }
 
 // Minimal session for sub-agent execution

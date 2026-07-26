@@ -103,11 +103,19 @@ impl InvocationContext for SharedStateContext {
         self.inner.ended()
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+
     fn user_scopes(&self) -> Vec<String> {
         self.inner.user_scopes()
     }
 
     fn request_metadata(&self) -> HashMap<String, serde_json::Value> {
         self.inner.request_metadata()
+    }
+
+    async fn get_secret(&self, name: &str) -> adk_core::Result<Option<String>> {
+        self.inner.get_secret(name).await
     }
 }

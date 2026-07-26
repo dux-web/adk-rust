@@ -318,6 +318,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **adk-agent/adk-tool: workflow context wrappers no longer drop cancellation,
+  secrets, and shared state.** Each wrapper re-implements `InvocationContext` and
+  delegates to an inner context, but most capability methods have permissive trait
+  defaults — `is_cancelled()` returns `false`, `get_secret()` returns `None`,
+  `shared_state()`/`user_scopes()`/`request_metadata()` return empty — so a
+  wrapper that omitted one still compiled and silently lost it. Capabilities
+  therefore depended on which workflow agent a sub-agent happened to run under:
+  `LoopAgent`'s history wrapper dropped cancellation, secrets, and shared state;
+  the skill-injection wrapper dropped all five; `ParallelAgent`'s shared-state
+  wrapper dropped cancellation and secrets. Most visibly, `Runner::interrupt` did
+  not reach an LLM agent nested under any of them, because the agent's
+  `is_cancelled()` checks read `false` through the wrapper.
+
+  All wrappers now forward every capability. `adk-tool`'s agent-as-tool context
+  additionally forwards `user_scopes`, `get_secret`, and `shared_state`, so a
+  scope-guarded tool invoked by an agent-as-tool sees the caller's grants. A
+  conformance suite pushes a sentinel context with a non-default value for every
+  capability through each wrapper — and through a composed stack, since an inner
+  wrapper that drops a capability defeats a correct outer one.
+
+  Known remaining gap: `is_cancelled` and `request_metadata` are not part of the
+  `ToolContext` surface that the agent-as-tool wrapper is built from, so
+  cancellation still does not reach an agent invoked as a tool. Closing that needs
+  those methods added to `ToolContext`.
+
 - **adk-agent/adk-core/adk-runner: `ParallelAgent` sub-agents no longer read each
   other's output.** Concurrent branches all read the full session history, so an
   analyst in a fan-out could see a sibling's answer before forming its own — while

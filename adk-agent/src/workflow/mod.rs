@@ -6,6 +6,8 @@ mod parallel_agent;
 mod sequential_agent;
 mod shared_state_context;
 mod skill_context;
+#[cfg(test)]
+mod wrapper_conformance_tests;
 
 pub use conditional_agent::ConditionalAgent;
 pub use llm_conditional_agent::{LlmConditionalAgent, LlmConditionalAgentBuilder};

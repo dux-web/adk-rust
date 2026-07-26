@@ -257,6 +257,14 @@ impl Session for HistoryTrackingSession {
     }
 }
 
+/// Builds a [`HistoryTrackingContext`] for the wrapper conformance tests.
+#[cfg(test)]
+pub(crate) fn history_tracking_context_for_test(
+    parent: Arc<dyn InvocationContext>,
+) -> Arc<dyn InvocationContext> {
+    Arc::new(HistoryTrackingContext::new(parent))
+}
+
 struct HistoryTrackingContext {
     parent_ctx: Arc<dyn InvocationContext>,
     session: HistoryTrackingSession,
@@ -309,6 +317,10 @@ impl CallbackContext for HistoryTrackingContext {
     fn artifacts(&self) -> Option<Arc<dyn adk_core::Artifacts>> {
         self.parent_ctx.artifacts()
     }
+
+    fn shared_state(&self) -> Option<Arc<adk_core::SharedState>> {
+        self.parent_ctx.shared_state()
+    }
 }
 
 #[async_trait]
@@ -337,12 +349,20 @@ impl InvocationContext for HistoryTrackingContext {
         self.parent_ctx.ended()
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.parent_ctx.is_cancelled()
+    }
+
     fn user_scopes(&self) -> Vec<String> {
         self.parent_ctx.user_scopes()
     }
 
     fn request_metadata(&self) -> HashMap<String, serde_json::Value> {
         self.parent_ctx.request_metadata()
+    }
+
+    async fn get_secret(&self, name: &str) -> adk_core::Result<Option<String>> {
+        self.parent_ctx.get_secret(name).await
     }
 }
 
