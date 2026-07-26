@@ -17,15 +17,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::cast::AsArray;
-use arrow_array::types::Float32Type;
-use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
-};
-use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use futures::TryStreamExt;
 use lancedb::Connection;
+// All arrow types come from lancedb's own re-exports, so their arrow version is stated
+// exactly once (by lancedb) and cannot drift out from under us. See the comment on the
+// `lancedb` dependency in Cargo.toml.
+use lancedb::arrow::arrow_array::cast::AsArray;
+use lancedb::arrow::arrow_array::types::Float32Type;
+use lancedb::arrow::arrow_array::{
+    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, RecordBatchReader,
+    StringArray,
+};
+use lancedb::arrow::arrow_schema::{DataType, Field, Schema};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use tracing::debug;
 
@@ -137,8 +141,9 @@ impl VectorStore for LanceDBVectorStore {
 
         let table =
             self.connection.open_table(collection).execute().await.map_err(Self::map_err)?;
-        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        table.add(Box::new(batches)).execute().await.map_err(Self::map_err)?;
+        let batches: Box<dyn RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
+        table.add(batches).execute().await.map_err(Self::map_err)?;
 
         debug!(collection, count = chunks.len(), "upserted chunks to lancedb");
         Ok(())
