@@ -140,6 +140,15 @@ jobs:
   # plain runner via the shared setup-rust action (components + wild-linker
   # strip + cache come from there — no per-job setup drift).
   #
+  # System build deps needed by any matrix entry (currently just protoc, for
+  # `adk-rag --features lancedb`) are installed unconditionally below, so the
+  # "add ONE line" invariant holds without touching the steps.
+  #
+  # `adk-rag --features lancedb` is the slowest entry — it pulls the whole
+  # lance/datafusion tree. It lives in the PR tier on purpose: an arrow version
+  # mismatch sat broken on main for weeks because nothing in CI compiled the
+  # LanceDB backend, and nightly would let the next bad bump land on main first.
+  #
   # To cover another feature-gated module, add ONE line to the matrix below:
   #   - { package: <crate>, features: <feature> }
   feature-coverage:
@@ -153,6 +162,7 @@ jobs:
           - { package: adk-model, features: openrouter }
           - { package: adk-sandbox, features: wasm }
           - { package: adk-audio, features: fx }
+          - { package: adk-rag, features: lancedb }
     steps:
     - uses: actions/checkout@v7
 
@@ -163,6 +173,16 @@ jobs:
       with:
         components: clippy
         cache-key: feature-coverage-${{ matrix.package }}-${{ matrix.features }}
+
+    # protoc is required by lancedb's build script (adk-rag --features lancedb).
+    # Unconditional rather than gated on the matrix entry: the job header
+    # promises that covering a new feature costs ONE matrix line, and an `if:`
+    # keyed to a package name would break that for the next entry that needs a
+    # system dep. Cost is a prebuilt-binary download on the other entries.
+    - name: Install protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@v2
