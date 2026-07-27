@@ -160,6 +160,16 @@ pub struct LlmResponse {
 /// ```
 #[async_trait]
 pub trait CacheCapable: Send + Sync {
+    /// Identifies the provider and model a cache belongs to.
+    ///
+    /// A provider cache is only valid for the model it was created against, so a runner
+    /// includes this in the identity of a cache it holds. The default is empty, which
+    /// leaves the model out of that identity; implement it to keep caches for different
+    /// models apart.
+    fn cache_scope(&self) -> &str {
+        ""
+    }
+
     /// Create a cached content resource from the given system instruction,
     /// tool definitions, and TTL.
     ///

@@ -556,53 +556,72 @@ impl Runner {
             // create or refresh the cached content before agent execution.
             // Cache failures are non-fatal — log a warning and proceed without cache.
             if let (Some(cm_mutex), Some(cache_model)) = (&cache_manager_ref, &cache_capable) {
-                let should_refresh_cache = {
-                    let cm = cm_mutex.lock().await;
-                    cm.is_enabled() && (cm.active_cache_name().is_none() || cm.needs_refresh())
-                };
+                // Cache only material the agent will actually send. An agent whose
+                // instruction is computed per request returns `None`, and caching is
+                // skipped rather than caching a stand-in such as the description — a
+                // cache built from different text than the request it is attached to is
+                // either ignored by the provider or applies the wrong instruction.
+                let cache_key = agent_to_run.cacheable_instruction().map(|instruction| {
+                    // Tools are resolved inside the agent, so the key records that this
+                    // cache covers instruction material only.
+                    crate::cache::CacheKey::new(
+                        cache_model.cache_scope(),
+                        agent_to_run.name(),
+                        instruction,
+                        &[],
+                    )
+                });
 
-                if should_refresh_cache {
-                    // Gather system instruction from the agent's description
-                    // (the full instruction is resolved inside the agent, but the
-                    // description provides a reasonable proxy for cache keying).
-                    let system_instruction = agent_to_run.description().to_string();
-                    let tools = std::collections::HashMap::new();
-                    let ttl = context_cache_config.as_ref().map_or(600, |c| c.ttl_seconds);
+                let cache_name = match cache_key {
+                    None => None,
+                    Some(key) => {
+                        let should_refresh = {
+                            let cm = cm_mutex.lock().await;
+                            cm.is_enabled() && cm.needs_refresh(&key)
+                        };
 
-                    match cache_model.create_cache(&system_instruction, &tools, ttl).await {
-                        Ok(name) => {
-                            let old_cache = {
-                                let mut cm = cm_mutex.lock().await;
-                                let old = cm.clear_active_cache();
-                                cm.set_active_cache(name);
-                                old
-                            };
+                        if should_refresh {
+                            let instruction = agent_to_run
+                                .cacheable_instruction()
+                                .unwrap_or_default()
+                                .to_string();
+                            let tools = std::collections::HashMap::new();
+                            let ttl =
+                                context_cache_config.as_ref().map_or(600, |c| c.ttl_seconds);
 
-                            if let Some(old) = old_cache
-                                && let Err(e) = cache_model.delete_cache(&old).await {
+                            match cache_model.create_cache(&instruction, &tools, ttl).await {
+                                Ok(name) => {
+                                    let superseded = {
+                                        let mut cm = cm_mutex.lock().await;
+                                        cm.store(key.clone(), name)
+                                    };
+                                    // Delete what this replaced or evicted, so provider
+                                    // caches are not leaked.
+                                    for old in superseded {
+                                        if let Err(e) = cache_model.delete_cache(&old).await {
+                                            tracing::warn!(
+                                                old_cache = %old,
+                                                error = %e,
+                                                "failed to delete superseded cache"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
                                     tracing::warn!(
-                                        old_cache = %old,
                                         error = %e,
-                                        "failed to delete old cache, proceeding with new cache"
+                                        "cache creation failed, proceeding without cache"
                                     );
                                 }
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "cache creation failed, proceeding without cache"
-                            );
-                        }
-                    }
-                }
 
-                // Attach cache name to run config so agents can use it.
-                let cache_name = {
-                    let mut cm = cm_mutex.lock().await;
-                    if cm.is_enabled() {
-                        cm.record_invocation().map(str::to_string)
-                    } else {
-                        None
+                        let mut cm = cm_mutex.lock().await;
+                        if cm.is_enabled() {
+                            cm.record_invocation(&key).map(str::to_string)
+                        } else {
+                            None
+                        }
                     }
                 };
 

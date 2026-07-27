@@ -1338,6 +1338,17 @@ impl Agent for LlmAgent {
         &self.name
     }
 
+    /// The static instruction, when this agent has one.
+    ///
+    /// Returns `None` when an instruction provider is configured, because the text then
+    /// depends on the request and caching it would attach the wrong instruction.
+    fn cacheable_instruction(&self) -> Option<&str> {
+        match self.instruction_provider {
+            Some(_) => None,
+            None => self.instruction.as_deref(),
+        }
+    }
+
     fn description(&self) -> &str {
         &self.description
     }

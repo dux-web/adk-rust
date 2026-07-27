@@ -1687,6 +1687,10 @@ mod native_tool_tests {
 
 #[async_trait]
 impl CacheCapable for GeminiModel {
+    fn cache_scope(&self) -> &str {
+        self.name()
+    }
+
     async fn create_cache(
         &self,
         system_instruction: &str,

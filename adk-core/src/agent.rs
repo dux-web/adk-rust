@@ -22,6 +22,20 @@ pub trait Agent: Send + Sync {
     /// Returns the child agents managed by this agent.
     fn sub_agents(&self) -> &[Arc<dyn Agent>];
 
+    /// The system instruction this agent will send, when it is fixed for every turn.
+    ///
+    /// A runner uses this as the material for provider-side context caching. It must be
+    /// the instruction the agent actually sends, not a stand-in: a cache built from
+    /// different text than the request it is attached to is either ignored by the
+    /// provider or applies the wrong instruction.
+    ///
+    /// Returns `None` — the default — when the agent has no fixed instruction, for
+    /// example because it is computed per request. A runner must then skip caching
+    /// rather than caching something else.
+    fn cacheable_instruction(&self) -> Option<&str> {
+        None
+    }
+
     /// Whether this agent participates in LLM-driven agent transfer and may be
     /// resumed directly across conversation turns.
     ///

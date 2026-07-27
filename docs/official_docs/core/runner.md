@@ -159,6 +159,34 @@ let mut stream = runner.run_str(
 
 If the string fails validation (empty, contains null bytes, or exceeds the length limit), `run_str()` returns an error before starting the agent loop. The existing `run()` method with typed `UserId`/`SessionId` remains unchanged.
 
+## Context Caching
+
+Setting `context_cache_config` and `cache_capable` lets the runner create provider-side
+cached content and attach it to requests.
+
+A cache is only valid for the material it was built from, so the runner identifies each
+one by **model, agent, and a digest of the cached material** and holds a bounded map (16
+entries, oldest evicted) rather than a single name. Consequences worth knowing:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Two agents with different instructions | Separate caches; one is never attached to the other's request |
+| The same agent on a different model | Separate caches |
+| The instruction text changes | The old cache is not reused; a new one is created and the old one deleted |
+| A cache is superseded or evicted | Deleted provider-side, so caches are not leaked |
+
+Caching applies only to an agent's **fixed** instruction, read through
+`Agent::cacheable_instruction`. `LlmAgent` returns its static instruction, and returns
+`None` when an instruction *provider* is configured, because that text depends on the
+request. When it returns `None`, caching is skipped — the runner will not cache a
+stand-in such as the agent description, since a cache built from different text than the
+request it is attached to is either ignored by the provider or applies the wrong
+instruction.
+
+> **Note:** tools are resolved inside the agent, so a cache currently covers instruction
+> material only. Refresh is still counted in invocations via `cache_intervals`, per
+> cache entry rather than per runner.
+
 ## Interruption and Run Isolation
 
 A run is registered as soon as `run()` returns its stream, and deregistered when

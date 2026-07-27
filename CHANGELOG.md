@@ -426,6 +426,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **adk-runner: context caches are keyed by their material, not Runner-global.** A Runner
+  held one `active_cache_name` and one invocation counter, reused across sessions and
+  across whichever sub-agent `find_agent_to_run` selected, and created the cache from
+  `agent_to_run.description()` with an empty tool map — while the real instruction was
+  resolved later inside `LlmAgent`. A cache built for one agent could therefore be
+  attached to a request for another, refresh was driven by a Runner-wide counter rather
+  than by content changing, and the cached text was never the text being sent.
+
+  `CacheManager` now holds a bounded map (16 entries, oldest evicted) keyed by model,
+  agent, and a canonical digest of the cached material, so a cache is reused only for
+  byte-equivalent material on the same model and agent, and a superseded or evicted entry
+  is deleted provider-side instead of leaked. The new `Agent::cacheable_instruction`
+  (defaulted to `None`) supplies the material: `LlmAgent` returns its static instruction
+  and returns `None` when an instruction provider is configured, and the runner skips
+  caching rather than substituting the description. `CacheCapable::cache_scope`
+  (defaulted, implemented by `GeminiModel`) keeps caches for different models apart.
+  Tools are still resolved inside the agent, so a cache covers instruction material only;
+  the documentation states that.
+
 - **adk-server: background runs execute a workflow instead of reporting success.**
   `BackgroundRunner::run_with_timeout` received neither the workflow ID nor the input. It
   checked cancellation and returned `Completed` with an empty object, so a client got a

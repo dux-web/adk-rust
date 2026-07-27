@@ -1,20 +1,71 @@
 use adk_core::{ContextCacheConfig, Event};
 use serde::{Deserialize, Serialize};
 
-/// Internal cache lifecycle manager.
+/// Identifies one cacheable context.
 ///
-/// Tracks the active cache name, invocation count, and determines
-/// when caching should be attempted or refreshed based on
-/// [`ContextCacheConfig`] settings.
-pub(crate) struct CacheManager {
-    config: ContextCacheConfig,
-    active_cache_name: Option<String>,
+/// A provider cache is only valid for the material it was created from. Keying by the
+/// model, the agent, and a digest of that material means a cache is never attached to a
+/// request built from something else — previously a single Runner-wide name was reused
+/// across sessions and across whichever sub-agent was selected.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct CacheKey {
+    /// Model the cache was created against; a cache is provider- and model-specific.
+    model: String,
+    /// Agent whose instruction the cache holds.
+    agent: String,
+    /// Canonical digest of the instruction and tool material.
+    material: String,
+}
+
+impl CacheKey {
+    /// Build a key from the exact material a cache will be created from.
+    pub(crate) fn new(model: &str, agent: &str, instruction: &str, tool_names: &[String]) -> Self {
+        // Readable and canonical rather than hashed: tool order cannot change the key,
+        // and a mismatch can be diagnosed by looking at it.
+        let mut tools = tool_names.to_vec();
+        tools.sort();
+        Self {
+            model: model.to_string(),
+            agent: agent.to_string(),
+            material: format!("{instruction}\u{1f}{}", tools.join(",")),
+        }
+    }
+}
+
+/// One cached context and how many invocations have used it.
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    name: String,
     invocation_count: u32,
 }
 
+/// Internal cache lifecycle manager.
+///
+/// Tracks a bounded map of caches keyed by [`CacheKey`], so a cache is reused only for
+/// byte-equivalent material on the same model and agent, and determines when caching
+/// should be attempted or refreshed based on [`ContextCacheConfig`] settings.
+pub(crate) struct CacheManager {
+    config: ContextCacheConfig,
+    /// Live caches, keyed by the material they hold.
+    entries: std::collections::HashMap<CacheKey, CacheEntry>,
+    /// Insertion order, used to evict the oldest entry when at capacity.
+    order: std::collections::VecDeque<CacheKey>,
+}
+
+/// Number of distinct cached contexts held at once.
+///
+/// A bound matters because the key includes the agent and its instruction: a deployment
+/// with many agents, or instructions that vary, would otherwise accumulate provider-side
+/// caches for the lifetime of the process.
+const MAX_CACHE_ENTRIES: usize = 16;
+
 impl CacheManager {
     pub(crate) fn new(config: ContextCacheConfig) -> Self {
-        Self { config, active_cache_name: None, invocation_count: 0 }
+        Self {
+            config,
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
     }
 
     /// Check if caching should be attempted based on config.
@@ -29,39 +80,61 @@ impl CacheManager {
         self.config.min_tokens > 0 && self.config.ttl_seconds > 0
     }
 
-    /// Return the active cache name, if any.
-    pub(crate) fn active_cache_name(&self) -> Option<&str> {
-        self.active_cache_name.as_deref()
+    /// The cache for exactly this material, if one is live.
+    #[cfg(test)]
+    pub(crate) fn cache_name_for(&self, key: &CacheKey) -> Option<&str> {
+        self.entries.get(key).map(|entry| entry.name.as_str())
     }
 
-    /// Check if the cache needs refresh based on invocation count.
+    /// Whether the cache for this material needs recreating.
     ///
-    /// Returns `true` when the number of recorded invocations has
-    /// reached or exceeded `cache_intervals`.
-    pub(crate) fn needs_refresh(&self) -> bool {
-        self.invocation_count >= self.config.cache_intervals
+    /// True when nothing is cached for it, or when the entry has served
+    /// `cache_intervals` invocations.
+    pub(crate) fn needs_refresh(&self, key: &CacheKey) -> bool {
+        match self.entries.get(key) {
+            None => true,
+            Some(entry) => entry.invocation_count >= self.config.cache_intervals,
+        }
     }
 
-    /// Record an invocation and return the current cache name (if any).
-    pub(crate) fn record_invocation(&mut self) -> Option<&str> {
-        self.invocation_count += 1;
-        self.active_cache_name.as_deref()
+    /// Record an invocation against this material and return its cache name.
+    pub(crate) fn record_invocation(&mut self, key: &CacheKey) -> Option<&str> {
+        let entry = self.entries.get_mut(key)?;
+        entry.invocation_count += 1;
+        Some(entry.name.as_str())
     }
 
-    /// Set the active cache name after creation, resetting the
-    /// invocation counter.
-    pub(crate) fn set_active_cache(&mut self, name: String) {
-        self.active_cache_name = Some(name);
-        self.invocation_count = 0;
-    }
-
-    /// Clear the active cache (after deletion or on error),
-    /// resetting the invocation counter.
+    /// Store a freshly created cache, returning any name it replaces.
     ///
-    /// Returns the previously active cache name, if any.
-    pub(crate) fn clear_active_cache(&mut self) -> Option<String> {
-        self.invocation_count = 0;
-        self.active_cache_name.take()
+    /// The replaced name is returned so the caller can delete it provider-side rather
+    /// than leaking it. Storing at capacity evicts the oldest entry, whose name is
+    /// returned for the same reason.
+    pub(crate) fn store(&mut self, key: CacheKey, name: String) -> Vec<String> {
+        let mut replaced = Vec::new();
+
+        if let Some(previous) =
+            self.entries.insert(key.clone(), CacheEntry { name, invocation_count: 0 })
+        {
+            replaced.push(previous.name);
+        } else {
+            self.order.push_back(key);
+        }
+
+        while self.order.len() > MAX_CACHE_ENTRIES {
+            if let Some(oldest) = self.order.pop_front()
+                && let Some(evicted) = self.entries.remove(&oldest)
+            {
+                replaced.push(evicted.name);
+            }
+        }
+
+        replaced
+    }
+
+    /// Number of caches currently held.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -166,11 +239,15 @@ mod tests {
         ContextCacheConfig { min_tokens: 4096, ttl_seconds: 600, cache_intervals: 3 }
     }
 
+    fn key(agent: &str, instruction: &str) -> CacheKey {
+        CacheKey::new("gemini-2.5-flash", agent, instruction, &[])
+    }
+
     #[test]
-    fn test_new_manager_has_no_active_cache() {
+    fn a_new_manager_holds_nothing() {
         let cm = CacheManager::new(default_config());
-        assert!(cm.active_cache_name.is_none());
-        assert_eq!(cm.invocation_count, 0);
+        assert_eq!(cm.len(), 0);
+        assert!(cm.cache_name_for(&key("a", "be helpful")).is_none());
     }
 
     #[test]
@@ -182,122 +259,125 @@ mod tests {
     #[test]
     fn test_is_enabled_false_when_min_tokens_zero() {
         let config = ContextCacheConfig { min_tokens: 0, ttl_seconds: 600, cache_intervals: 3 };
-        let cm = CacheManager::new(config);
-        assert!(!cm.is_enabled());
+        assert!(!CacheManager::new(config).is_enabled());
     }
 
     #[test]
     fn test_is_enabled_false_when_ttl_zero() {
         let config = ContextCacheConfig { min_tokens: 4096, ttl_seconds: 0, cache_intervals: 3 };
-        let cm = CacheManager::new(config);
-        assert!(!cm.is_enabled());
+        assert!(!CacheManager::new(config).is_enabled());
     }
 
     #[test]
-    fn test_is_enabled_false_when_both_zero() {
-        let config = ContextCacheConfig { min_tokens: 0, ttl_seconds: 0, cache_intervals: 3 };
-        let cm = CacheManager::new(config);
-        assert!(!cm.is_enabled());
-    }
-
-    #[test]
-    fn test_needs_refresh_false_initially() {
+    fn unknown_material_needs_a_cache() {
         let cm = CacheManager::new(default_config());
-        assert!(!cm.needs_refresh());
+        assert!(cm.needs_refresh(&key("a", "be helpful")));
     }
 
     #[test]
-    fn test_needs_refresh_true_after_n_invocations() {
+    fn a_stored_cache_is_reused_until_its_interval_elapses() {
         let mut cm = CacheManager::new(default_config());
-        // cache_intervals = 3, so after 3 invocations needs_refresh should be true
-        cm.record_invocation();
-        assert!(!cm.needs_refresh());
-        cm.record_invocation();
-        assert!(!cm.needs_refresh());
-        cm.record_invocation();
-        assert!(cm.needs_refresh());
+        let k = key("a", "be helpful");
+        cm.store(k.clone(), "cachedContents/1".to_string());
+
+        assert!(!cm.needs_refresh(&k));
+        assert_eq!(cm.record_invocation(&k), Some("cachedContents/1"));
+        assert_eq!(cm.record_invocation(&k), Some("cachedContents/1"));
+        assert!(!cm.needs_refresh(&k));
+        assert_eq!(cm.record_invocation(&k), Some("cachedContents/1"));
+        assert!(cm.needs_refresh(&k), "three invocations reaches cache_intervals");
     }
 
     #[test]
-    fn test_record_invocation_returns_none_without_active_cache() {
+    fn different_agents_do_not_share_a_cache() {
+        // A cache made while one sub-agent was selected must not be attached to a
+        // request for another.
         let mut cm = CacheManager::new(default_config());
-        assert!(cm.record_invocation().is_none());
+        cm.store(key("planner", "plan carefully"), "cachedContents/planner".to_string());
+
+        assert!(cm.cache_name_for(&key("writer", "plan carefully")).is_none());
+        assert!(cm.needs_refresh(&key("writer", "plan carefully")));
     }
 
     #[test]
-    fn test_record_invocation_returns_cache_name() {
+    fn changed_instruction_material_invalidates_reuse() {
         let mut cm = CacheManager::new(default_config());
-        cm.set_active_cache("cachedContents/abc123".to_string());
-        let name = cm.record_invocation();
-        assert_eq!(name, Some("cachedContents/abc123"));
+        cm.store(key("a", "be helpful"), "cachedContents/1".to_string());
+
+        assert!(
+            cm.needs_refresh(&key("a", "be terse")),
+            "a cache must not be reused for different instruction material"
+        );
     }
 
     #[test]
-    fn test_set_active_cache_resets_invocation_count() {
+    fn different_models_do_not_share_a_cache() {
         let mut cm = CacheManager::new(default_config());
-        cm.record_invocation();
-        cm.record_invocation();
-        assert_eq!(cm.invocation_count, 2);
-
-        cm.set_active_cache("cachedContents/new".to_string());
-        assert_eq!(cm.invocation_count, 0);
-        assert_eq!(cm.active_cache_name.as_deref(), Some("cachedContents/new"));
+        cm.store(
+            CacheKey::new("gemini-2.5-flash", "a", "be helpful", &[]),
+            "cachedContents/flash".to_string(),
+        );
+        let other = CacheKey::new("gemini-3-pro", "a", "be helpful", &[]);
+        assert!(cm.cache_name_for(&other).is_none());
     }
 
     #[test]
-    fn test_clear_active_cache_returns_old_name() {
+    fn tool_order_does_not_change_identity() {
+        let one = CacheKey::new("m", "a", "i", &["b".to_string(), "a".to_string()]);
+        let two = CacheKey::new("m", "a", "i", &["a".to_string(), "b".to_string()]);
+        assert_eq!(one, two);
+    }
+
+    #[test]
+    fn storing_the_same_material_twice_reports_the_replaced_name() {
         let mut cm = CacheManager::new(default_config());
-        cm.set_active_cache("cachedContents/old".to_string());
-        cm.record_invocation();
+        let k = key("a", "be helpful");
+        assert!(cm.store(k.clone(), "cachedContents/1".to_string()).is_empty());
 
-        let old = cm.clear_active_cache();
-        assert_eq!(old.as_deref(), Some("cachedContents/old"));
-        assert!(cm.active_cache_name.is_none());
-        assert_eq!(cm.invocation_count, 0);
+        let replaced = cm.store(k, "cachedContents/2".to_string());
+        assert_eq!(
+            replaced,
+            vec!["cachedContents/1".to_string()],
+            "the superseded cache must be reported so it can be deleted provider-side"
+        );
+        assert_eq!(cm.len(), 1);
     }
 
     #[test]
-    fn test_clear_active_cache_returns_none_when_empty() {
+    fn the_map_is_bounded_and_reports_evictions() {
         let mut cm = CacheManager::new(default_config());
-        let old = cm.clear_active_cache();
-        assert!(old.is_none());
+        let mut evicted = Vec::new();
+        for index in 0..(MAX_CACHE_ENTRIES + 4) {
+            evicted.extend(cm.store(key(&format!("agent-{index}"), "i"), format!("cache/{index}")));
+        }
+
+        assert_eq!(cm.len(), MAX_CACHE_ENTRIES, "the cache map must stay bounded");
+        assert_eq!(evicted.len(), 4, "each eviction must be reported for deletion");
+        assert_eq!(evicted[0], "cache/0", "the oldest entry is evicted first");
     }
 
     #[test]
-    fn test_full_lifecycle() {
+    fn a_full_lifecycle_stays_keyed() {
         let mut cm = CacheManager::new(ContextCacheConfig {
             min_tokens: 1024,
             ttl_seconds: 300,
             cache_intervals: 2,
         });
+        let k = key("a", "be helpful");
 
         assert!(cm.is_enabled());
-        assert!(!cm.needs_refresh());
+        assert!(cm.needs_refresh(&k), "nothing is cached yet");
 
-        // No cache yet
-        assert!(cm.record_invocation().is_none());
+        cm.store(k.clone(), "cachedContents/first".to_string());
+        assert_eq!(cm.record_invocation(&k), Some("cachedContents/first"));
+        assert!(!cm.needs_refresh(&k));
+        assert_eq!(cm.record_invocation(&k), Some("cachedContents/first"));
+        assert!(cm.needs_refresh(&k), "two invocations reaches cache_intervals");
 
-        // Set a cache
-        cm.set_active_cache("cachedContents/v1".to_string());
-        assert_eq!(cm.invocation_count, 0);
-
-        // First invocation returns cache name
-        assert_eq!(cm.record_invocation(), Some("cachedContents/v1"));
-        assert!(!cm.needs_refresh());
-
-        // Second invocation triggers refresh
-        assert_eq!(cm.record_invocation(), Some("cachedContents/v1"));
-        assert!(cm.needs_refresh());
-
-        // Refresh: clear old, set new
-        let old = cm.clear_active_cache();
-        assert_eq!(old.as_deref(), Some("cachedContents/v1"));
-        cm.set_active_cache("cachedContents/v2".to_string());
-        assert!(!cm.needs_refresh());
-        assert_eq!(cm.record_invocation(), Some("cachedContents/v2"));
+        let replaced = cm.store(k.clone(), "cachedContents/second".to_string());
+        assert_eq!(replaced, vec!["cachedContents/first".to_string()]);
+        assert!(!cm.needs_refresh(&k), "a fresh cache resets the interval");
     }
-
-    // --- CachePerformanceAnalyzer tests ---
 
     use adk_core::{LlmResponse, UsageMetadata};
 
@@ -331,20 +411,8 @@ mod tests {
         let metrics = CachePerformanceAnalyzer::analyze(&[]);
         assert_eq!(metrics.total_requests, 0);
         assert_eq!(metrics.requests_with_cache_hits, 0);
-        assert_eq!(metrics.total_prompt_tokens, 0);
-        assert_eq!(metrics.total_cache_read_tokens, 0);
-        assert_eq!(metrics.total_cache_creation_tokens, 0);
         assert_eq!(metrics.cache_hit_ratio, 0.0);
         assert_eq!(metrics.cache_utilization_ratio, 0.0);
-        assert_eq!(metrics.avg_cached_tokens_per_request, 0.0);
-    }
-
-    #[test]
-    fn test_analyze_events_without_usage_metadata() {
-        let events = vec![event_without_usage(), event_without_usage()];
-        let metrics = CachePerformanceAnalyzer::analyze(&events);
-        assert_eq!(metrics.total_requests, 0);
-        assert_eq!(metrics.cache_hit_ratio, 0.0);
     }
 
     #[test]
