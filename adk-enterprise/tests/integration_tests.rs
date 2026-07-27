@@ -200,15 +200,14 @@ async fn test_custom_tool_round_trip() {
 
                     tool_use_id = Some(custom_tool_use_id);
                 }
-                SessionEvent::Message { content, .. } => {
-                    // 7. After tool result is sent, agent should produce a final message
-                    if tool_use_id.is_some() {
-                        let has_text =
-                            content.iter().any(|block| matches!(block, ContentBlock::Text { .. }));
-                        if has_text {
-                            final_message_received = true;
-                        }
-                    }
+                // 7. After tool result is sent, agent should produce a final message
+                SessionEvent::Message { content, .. }
+                    if tool_use_id.is_some()
+                        && content
+                            .iter()
+                            .any(|block| matches!(block, ContentBlock::Text { .. })) =>
+                {
+                    final_message_received = true;
                 }
                 SessionEvent::StatusIdle { .. } => {
                     break;

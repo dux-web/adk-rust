@@ -49,8 +49,8 @@ Environment:
 
 - Linux `michael-MacPro5-1`, kernel `7.1.3-x64v2-xanmod1`
 - x86_64, dual Intel Xeon E5520 at 2.27 GHz, 16 logical CPUs
-- rustc 1.94.0 with LLVM 21.1.8
-- cargo 1.94.0
+- rustc 1.95.0 with LLVM 21.1.8
+- cargo 1.95.0
 - default optimized benchmark profile
 
 ### Synchronous ownership cost

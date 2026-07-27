@@ -2,7 +2,7 @@ name: CodeAct Monty
 
 # `adk-codeact-monty` is intentionally OUTSIDE the main workspace: it depends on
 # the Monty interpreter via a git dependency (not yet on crates.io) and requires
-# rustc 1.95+, while the workspace is pinned to 1.94. The main CI workflow does
+# rustc 1.95+, which is the workspace toolchain. The main CI workflow does
 # not build it, so this workflow exercises it (and the CodeAct feature in
 # adk-agent) separately.
 #
@@ -71,7 +71,7 @@ jobs:
     - name: Test (codeact feature)
       run: cargo nextest run -p adk-agent --features codeact
 
-  # ── adk-codeact-monty (out-of-workspace: rustc 1.95 + Monty git dep) ──
+  # ── adk-codeact-monty (out-of-workspace: Monty git dep) ──
   # Weekly-cron tier: the heavy build stays off the per-PR path. The per-merge
   # build lives in ci-merge.yml (`out-of-workspace-monty`); this cron rebuilds
   # Monty against its pinned git dependency during quiet periods between merges.
@@ -80,13 +80,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v7
-    # Monty needs rustc 1.95 + rustfmt + clippy. The cache is keyed on the Monty
+    # Monty needs rustfmt + clippy. The cache is keyed on the Monty
     # crate's own lockfile so a dependency change there cannot be masked by a
     # stale workspace cache.
     - name: Setup Rust
       uses: ./.github/actions/setup-rust
       with:
-        toolchain: '1.95.0'
         components: rustfmt,clippy
         cache-key: monty-${{ hashFiles('adk-codeact-monty/Cargo.lock') }}
     - name: Format check

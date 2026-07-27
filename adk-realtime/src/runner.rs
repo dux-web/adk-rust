@@ -796,10 +796,10 @@ impl RealtimeRunner {
                 self.respond_after_tools().await?;
                 self.check_resumption_queue().await?;
             }
-            ServerEvent::FunctionCallDone { call_id, name, arguments, .. } => {
-                if self.runner_config.auto_execute_tools {
-                    self.execute_tool_call(&call_id, &name, &arguments).await?;
-                }
+            ServerEvent::FunctionCallDone { call_id, name, arguments, .. }
+                if self.runner_config.auto_execute_tools =>
+            {
+                self.execute_tool_call(&call_id, &name, &arguments).await?;
             }
             ServerEvent::SessionUpdated { session, .. } => {
                 // Check if the generic session update contains a resumption token

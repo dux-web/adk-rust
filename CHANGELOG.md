@@ -144,6 +144,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ADK agent tool confirmation can be resolved live.** `RunConfig` accepts an
   asynchronous `ToolConfirmationHandler`, and allow-once decisions are keyed by
   exact function-call ID rather than tool name.
+- **Breaking:** the minimum supported Rust version is now **1.95**, up from 1.94.0.
+  1.95 is the lowest version that satisfies every constraint the workspace already
+  had: `adk-codeact-monty` requires 1.95, and a fresh resolution of the `aws-secrets`
+  dependencies requires 1.94.1. `rust-toolchain.toml` is now the single source of
+  truth — `devenv` reads the same file through `languages.rust.toolchainFile`, so a
+  Nix shell and a plain `cargo` invocation can no longer disagree — and the workspace
+  moves to `resolver = "3"` so the declared MSRV is enforced during dependency
+  resolution rather than only documented.
+
 - **Breaking:** major version bump. The complete list of public API breakage since
   1.0.0, as reported by `cargo semver-checks check-release --release-type minor`
   against the published 1.0.0 baseline, is below. A migration guide with

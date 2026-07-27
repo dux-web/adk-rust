@@ -7,9 +7,11 @@ description: >-
 
 inputs:
   toolchain:
-    description: 'Rust toolchain version to install.'
+    description: >-
+      Rust toolchain version to install. Defaults to the workspace toolchain, so
+      a job only sets this when it genuinely needs a different one.
     required: false
-    default: '1.94.0'
+    default: '1.95.0'
   components:
     description: 'Comma-separated list of toolchain components (e.g. clippy,rustfmt).'
     required: false
