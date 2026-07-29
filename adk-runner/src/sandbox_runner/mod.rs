@@ -19,7 +19,10 @@
 //!
 //! let runner = Runner::new(config)?;
 //! let sandbox_runner = SandboxRunner::new(runner);
-//! let result = sandbox_runner.run(&sandbox_config, "user_1", "session_1").await?;
+//! let content = adk_core::Content::new("user").with_text("list the files");
+//! let result = sandbox_runner
+//!     .run(&sandbox_config, "user_1", "session_1", content)
+//!     .await?;
 //! ```
 
 pub mod binding;
@@ -29,7 +32,31 @@ use crate::Runner;
 use adk_sandbox::SandboxError;
 use adk_sandbox::workspace::{SandboxConfig, SnapshotId};
 use std::sync::Arc;
+
+use futures::StreamExt;
 use tracing::{info, warn};
+
+/// Exposes the tools bound to a live sandbox session as a [`Toolset`].
+///
+/// The tools hold the session handle, so they are valid only for the run that created them and
+/// are injected per-invocation rather than attached to the agent.
+struct SandboxToolset {
+    tools: Vec<Arc<dyn adk_core::Tool>>,
+}
+
+#[async_trait::async_trait]
+impl adk_core::Toolset for SandboxToolset {
+    fn name(&self) -> &str {
+        "sandbox"
+    }
+
+    async fn tools(
+        &self,
+        _ctx: Arc<dyn adk_core::ReadonlyContext>,
+    ) -> adk_core::Result<Vec<Arc<dyn adk_core::Tool>>> {
+        Ok(self.tools.clone())
+    }
+}
 
 /// Runner wrapper that manages the sandbox lifecycle around agent execution.
 ///
@@ -76,6 +103,7 @@ impl SandboxRunner {
         config: &SandboxConfig,
         user_id: &str,
         session_id: &str,
+        user_content: adk_core::Content,
     ) -> Result<SandboxRunResult, adk_core::AdkError> {
         // 1. Provision workspace from manifest
         info!("provisioning sandbox workspace");
@@ -95,23 +123,62 @@ impl SandboxRunner {
 
         // 3. Bind tools based on capabilities
         let session_arc = Arc::from(session);
-        let _bound_tools =
+        let bound_tools =
             binding::bind_tools(session_arc, &config.capabilities, config.command_timeout);
         info!(
             capabilities = ?config.capabilities,
-            tool_count = _bound_tools.len(),
+            tool_count = bound_tools.len(),
             "bound sandbox tools"
         );
 
-        // 4. Run agent loop with session timeout
-        // NOTE: The inner Runner doesn't yet support dynamic tool injection.
-        // The bound tools are prepared here; actual agent loop integration will
-        // be completed when the agent builder supports injecting tools at runtime.
-        // For now, we simulate the agent loop step as a placeholder.
+        // 4. Run the agent loop with the sandbox tools injected, under the session timeout.
+        //
+        // The tools exist only while this session is live, so they are supplied per-invocation
+        // through `runtime_toolsets` rather than baked into the agent.
+        let mut run_config = self.inner.run_config().clone();
+        run_config
+            .runtime_toolsets
+            .push(adk_core::RuntimeToolset::new(Arc::new(SandboxToolset { tools: bound_tools })));
+
         let agent_loop_future = async {
-            // Use the user_id and session_id for future agent loop integration
-            let _ = (user_id, session_id);
-            Ok::<(), adk_core::AdkError>(())
+            // The Runner requires the session to exist. Create it when absent so a caller can
+            // hand in a fresh session ID, matching how the A2A handler resolves sessions.
+            let session_service = self.inner.session_service();
+            if session_service
+                .get(adk_session::GetRequest {
+                    app_name: self.inner.app_name().to_string(),
+                    user_id: user_id.to_string(),
+                    session_id: session_id.to_string(),
+                    num_recent_events: None,
+                    after: None,
+                })
+                .await
+                .is_err()
+            {
+                session_service
+                    .create(adk_session::CreateRequest {
+                        app_name: self.inner.app_name().to_string(),
+                        user_id: user_id.to_string(),
+                        session_id: Some(session_id.to_string()),
+                        state: std::collections::HashMap::new(),
+                    })
+                    .await?;
+            }
+
+            let user_id = adk_core::UserId::new(user_id)?;
+            let session_id = adk_core::SessionId::new(session_id)?;
+            let mut events = self
+                .inner
+                .run_with_config(user_id, session_id, user_content, Some(run_config))
+                .await?;
+            // Drain the stream so the agent runs to completion before the session is stopped;
+            // returning early would tear the sandbox down underneath the agent.
+            let mut count = 0usize;
+            while let Some(event) = events.next().await {
+                event?;
+                count += 1;
+            }
+            Ok::<usize, adk_core::AdkError>(count)
         };
 
         let agent_loop_result =
@@ -126,9 +193,9 @@ impl SandboxRunner {
                     timeout = ?config.session_timeout,
                     "sandbox session timed out"
                 );
-                Err(adk_core::AdkError::from(SandboxError::SessionTimeout {
-                    timeout: config.session_timeout,
-                }))
+                Err::<usize, adk_core::AdkError>(adk_core::AdkError::from(
+                    SandboxError::SessionTimeout { timeout: config.session_timeout },
+                ))
             }
         };
 

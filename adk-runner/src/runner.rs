@@ -261,6 +261,43 @@ impl Runner {
         session_id: SessionId,
         user_content: Content,
     ) -> Result<EventStream> {
+        self.run_with_config(user_id, session_id, user_content, None).await
+    }
+
+    /// Returns the runner's application name.
+    pub fn app_name(&self) -> &str {
+        &self.app_name
+    }
+
+    /// Returns the runner's session service.
+    pub fn session_service(&self) -> &Arc<dyn adk_session::SessionService> {
+        &self.session_service
+    }
+
+    /// Returns the runner's configured [`RunConfig`].
+    ///
+    /// Useful as a base to clone and adjust for [`Self::run_with_config`].
+    pub fn run_config(&self) -> &RunConfig {
+        &self.run_config
+    }
+
+    /// Runs the agent with a per-invocation [`RunConfig`] override.
+    ///
+    /// Passing `None` uses the runner's configured `RunConfig`. Supply one to vary a single
+    /// invocation — injecting `runtime_toolsets` for tools that only exist for the duration of
+    /// that run, for example, as [`crate::sandbox_runner::SandboxRunner`] does with the tools
+    /// bound to a live sandbox session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session cannot be resolved or the agent fails to start.
+    pub async fn run_with_config(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        user_content: Content,
+        run_config: Option<RunConfig>,
+    ) -> Result<EventStream> {
         let app_name = self.app_name.clone();
         let typed_app_name = AppName::try_from(app_name.clone())?;
         let session_service = self.session_service.clone();
@@ -272,7 +309,7 @@ impl Runner {
         let plugin_manager = self.plugin_manager.clone();
         #[cfg(feature = "skills")]
         let skill_injector = self.skill_injector.clone();
-        let mut run_config = self.run_config.clone();
+        let mut run_config = run_config.unwrap_or_else(|| self.run_config.clone());
         let compaction_config = self.compaction_config.clone();
         let context_cache_config = self.context_cache_config.clone();
         let cache_capable = self.cache_capable.clone();

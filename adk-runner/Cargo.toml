@@ -39,6 +39,7 @@ sandbox-runner = ["dep:adk-sandbox", "adk-sandbox/workspace"]
 context-compaction = []
 
 [dev-dependencies]
+adk-session.workspace = true
 chrono = "0.4"
 proptest = "1.5"
 tempfile = "3"

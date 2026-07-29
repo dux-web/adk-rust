@@ -612,6 +612,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **adk-runner: `SandboxRunner::run` runs the agent instead of reporting a completed run that
+  did nothing.** The method provisioned the workspace, started the session, bound tools, then
+  executed a placeholder future and returned `Ok`. It now drives the inner `Runner` with the
+  bound sandbox tools injected through `RunConfig::runtime_toolsets`, creates the session when
+  absent, and drains the event stream before the session is stopped. **Breaking:** `run` takes a
+  `user_content: Content` argument — an agent loop cannot run without input.
+- **adk-runner: `Runner::run_with_config` supplies a per-invocation `RunConfig`.** Needed for
+  tools that exist only for the duration of one run. `Runner::run` delegates to it with `None`.
+  New accessors: `Runner::run_config`, `Runner::app_name`, `Runner::session_service`.
+
 - **adk-auth: the `sso` feature compiles and is gated by CI again.** No workflow built
   `adk-auth --features sso`, so its SSO/OAuth surface had drifted out of the clippy gate and
   failed `-D warnings` on four `collapsible_if` lints. `jsonwebtoken` moves to 11, whose
