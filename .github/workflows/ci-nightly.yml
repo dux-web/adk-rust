@@ -134,7 +134,7 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake protobuf-compiler libespeak-ng-dev
+        sudo apt-get install -y cmake protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev libespeak-ng-dev
 
     - name: Install system dependencies (macOS)
       if: runner.os == 'macOS'
@@ -217,7 +217,7 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake protobuf-compiler
+        sudo apt-get install -y cmake protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev
 
     - name: Compile standalone examples (shard ${{ matrix.shard }} of 4)
       run: bash scripts/check-examples-compile.sh ${{ matrix.shard }} 4
@@ -256,7 +256,7 @@ jobs:
     - name: Install system dependencies (Linux)
       run: |
         sudo apt-get update
-        sudo apt-get install -y cmake protobuf-compiler
+        sudo apt-get install -y cmake protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@v2
