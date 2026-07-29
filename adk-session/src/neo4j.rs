@@ -123,11 +123,11 @@ impl Neo4jSessionService {
         // constraint already exists, record v1 as applied.
         if max_applied == 0 {
             let existing = self.detect_existing_tables().await?;
-            if existing {
-                if let Some(&(version, description, _)) = Self::NEO4J_SESSION_MIGRATIONS.first() {
-                    self.record_migration(version, description).await?;
-                    max_applied = version;
-                }
+            if existing
+                && let Some(&(version, description, _)) = Self::NEO4J_SESSION_MIGRATIONS.first()
+            {
+                self.record_migration(version, description).await?;
+                max_applied = version;
             }
         }
 
@@ -325,10 +325,9 @@ impl SessionService for Neo4jSessionService {
             .next(&mut txn)
             .await
             .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+            && let Ok(state_str) = row.get::<String>("state")
         {
-            if let Ok(state_str) = row.get::<String>("state") {
-                app_state = json_string_to_state(&state_str)?;
-            }
+            app_state = json_string_to_state(&state_str)?;
         }
         app_state.extend(app_delta);
         let app_state_json = state_to_json_string(&app_state)?;
@@ -364,10 +363,9 @@ impl SessionService for Neo4jSessionService {
             .next(&mut txn)
             .await
             .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+            && let Ok(state_str) = row.get::<String>("state")
         {
-            if let Ok(state_str) = row.get::<String>("state") {
-                user_state = json_string_to_state(&state_str)?;
-            }
+            user_state = json_string_to_state(&state_str)?;
         }
         user_state.extend(user_delta);
         let user_state_json = state_to_json_string(&user_state)?;
@@ -653,10 +651,9 @@ impl SessionService for Neo4jSessionService {
             .next(&mut txn)
             .await
             .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+            && let Ok(state_str) = row.get::<String>("state")
         {
-            if let Ok(state_str) = row.get::<String>("state") {
-                app_state = json_string_to_state(&state_str)?;
-            }
+            app_state = json_string_to_state(&state_str)?;
         }
 
         // Load current user state
@@ -677,10 +674,9 @@ impl SessionService for Neo4jSessionService {
             .next(&mut txn)
             .await
             .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+            && let Ok(state_str) = row.get::<String>("state")
         {
-            if let Ok(state_str) = row.get::<String>("state") {
-                user_state = json_string_to_state(&state_str)?;
-            }
+            user_state = json_string_to_state(&state_str)?;
         }
 
         let (app_delta, user_delta, session_delta) =
@@ -848,10 +844,9 @@ impl SessionService for Neo4jSessionService {
             .next(&mut txn)
             .await
             .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+            && let Ok(state_str) = row.get::<String>("state")
         {
-            if let Ok(state_str) = row.get::<String>("state") {
-                app_state = json_string_to_state(&state_str)?;
-            }
+            app_state = json_string_to_state(&state_str)?;
         }
 
         // Load current user state
@@ -872,10 +867,9 @@ impl SessionService for Neo4jSessionService {
             .next(&mut txn)
             .await
             .map_err(|e| adk_core::AdkError::session(format!("query failed: {e}")))?
+            && let Ok(state_str) = row.get::<String>("state")
         {
-            if let Ok(state_str) = row.get::<String>("state") {
-                user_state = json_string_to_state(&state_str)?;
-            }
+            user_state = json_string_to_state(&state_str)?;
         }
 
         let (app_delta, user_delta, session_delta) =

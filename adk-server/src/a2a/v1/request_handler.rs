@@ -151,51 +151,46 @@ impl RequestHandler {
         }
 
         // Multi-turn resume: check if contextId matches an existing INPUT_REQUIRED task
-        if let Some(ref ctx_id) = msg.context_id {
-            if let Some(existing) = self.task_store.find_task_by_context(&ctx_id.0).await? {
-                if existing.status.state == TaskState::InputRequired {
-                    // Resume the existing task
-                    let task_id = existing.id.clone();
-                    let context_id = existing.context_id.clone();
+        if let Some(ref ctx_id) = msg.context_id
+            && let Some(existing) = self.task_store.find_task_by_context(&ctx_id.0).await?
+            && existing.status.state == TaskState::InputRequired
+        {
+            // Resume the existing task
+            let task_id = existing.id.clone();
+            let context_id = existing.context_id.clone();
 
-                    // Transition from INPUT_REQUIRED to Working
-                    self.executor
-                        .transition_state(&task_id, &context_id, TaskState::Working, None)
-                        .await?;
+            // Transition from INPUT_REQUIRED to Working
+            self.executor.transition_state(&task_id, &context_id, TaskState::Working, None).await?;
 
-                    // Append the new message to history
-                    self.task_store.add_history_message(&task_id, msg.clone()).await?;
+            // Append the new message to history
+            self.task_store.add_history_message(&task_id, msg.clone()).await?;
 
-                    // Run the agent if a runner config is available
-                    if let Some(runner_config) = &self.runner_config {
-                        match self.run_agent(runner_config, &task_id, &context_id, &msg).await {
-                            Ok(()) => {}
-                            Err(e) => {
-                                let _ = self
-                                    .executor
-                                    .fail_task(&task_id, &context_id, &e.to_string())
-                                    .await;
-                                let entry = self.task_store.get_task(&task_id).await?;
-                                return internal_task_to_wire(&entry);
-                            }
-                        }
+            // Run the agent if a runner config is available
+            if let Some(runner_config) = &self.runner_config {
+                match self.run_agent(runner_config, &task_id, &context_id, &msg).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let _ =
+                            self.executor.fail_task(&task_id, &context_id, &e.to_string()).await;
+                        let entry = self.task_store.get_task(&task_id).await?;
+                        return internal_task_to_wire(&entry);
                     }
-
-                    // Transition to COMPLETED
-                    self.executor
-                        .transition_state(&task_id, &context_id, TaskState::Completed, None)
-                        .await?;
-
-                    // Record idempotency mapping
-                    self.idempotency_map.write().await.insert(message_id, task_id.clone());
-
-                    let entry = self.task_store.get_task(&task_id).await?;
-                    return internal_task_to_wire(&entry);
                 }
-                // If task is in a terminal state or other non-INPUT_REQUIRED state,
-                // fall through to create a new task (existing behavior)
             }
+
+            // Transition to COMPLETED
+            self.executor
+                .transition_state(&task_id, &context_id, TaskState::Completed, None)
+                .await?;
+
+            // Record idempotency mapping
+            self.idempotency_map.write().await.insert(message_id, task_id.clone());
+
+            let entry = self.task_store.get_task(&task_id).await?;
+            return internal_task_to_wire(&entry);
         }
+        // If task is in a terminal state or other non-INPUT_REQUIRED state,
+        // fall through to create a new task (existing behavior)
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let context_id = msg

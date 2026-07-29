@@ -111,11 +111,11 @@ impl MongoSessionService {
 
         if max_applied == 0 {
             let existing = self.detect_existing_tables().await?;
-            if existing {
-                if let Some(&(version, description)) = Self::MONGO_SESSION_MIGRATIONS.first() {
-                    self.record_migration(version, description).await?;
-                    max_applied = version;
-                }
+            if existing
+                && let Some(&(version, description)) = Self::MONGO_SESSION_MIGRATIONS.first()
+            {
+                self.record_migration(version, description).await?;
+                max_applied = version;
             }
         }
 

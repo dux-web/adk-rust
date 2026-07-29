@@ -227,15 +227,15 @@ impl TaskStore for InMemoryTaskStore {
         let mut results: Vec<TaskStoreEntry> = tasks
             .values()
             .filter(|entry| {
-                if let Some(ref ctx) = params.context_id {
-                    if entry.context_id != *ctx {
-                        return false;
-                    }
+                if let Some(ref ctx) = params.context_id
+                    && entry.context_id != *ctx
+                {
+                    return false;
                 }
-                if let Some(ref state) = params.state {
-                    if entry.status.state != *state {
-                        return false;
-                    }
+                if let Some(ref state) = params.state
+                    && entry.status.state != *state
+                {
+                    return false;
                 }
                 true
             })
@@ -243,7 +243,7 @@ impl TaskStore for InMemoryTaskStore {
             .collect();
 
         // Sort by created_at for deterministic pagination
-        results.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        results.sort_by_key(|a| a.created_at);
 
         if let Some(page_size) = params.page_size {
             results.truncate(page_size as usize);

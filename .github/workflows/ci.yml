@@ -265,6 +265,26 @@ jobs:
       run: echo "### 🧪 doctests (workspace + adk-rust --features full) completed" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Scaffolds: cargo-adk generated projects compile ────────────
+  # Standalone examples are the public API's only consumer inside this repo, so a
+  # rename or an added required argument breaks them and nothing else. Two
+  # examples shipped broken because only the nightly tier compiled them and
+  # nightly is not branch-protection-required.
+  examples-compile:
+    name: examples-compile (${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    needs: fmt
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+    - uses: actions/checkout@v5
+    - uses: ./.github/actions/setup-rust
+      with:
+        cache-key: pr-examples-compile-${{ matrix.shard }}
+    - name: Compile standalone examples (shard ${{ matrix.shard }} of 4)
+      run: bash scripts/check-examples-compile.sh ${{ matrix.shard }} 4
+
   templates:
     needs: fmt
     runs-on: ubuntu-latest

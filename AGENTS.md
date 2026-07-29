@@ -445,6 +445,10 @@ cargo nextest run -p adk-realtime --features full            # with features
 
 - Prefer `cargo nextest run` over `cargo test` for speed (~10x faster via parallel test binary execution).
 - Use `cargo test` only for doctests (nextest doesn't run them) or when you need `--doc` specifically.
+- Run doctests with `make doctest`, not `cargo test --workspace --doc`. `adk-rust`'s examples
+  document feature-gated APIs (`GoogleSearchTool`, `artifact`, `server`, `telemetry`), so the
+  plain workspace command fails on five of them with unresolved imports. `make doctest` runs the
+  two commands CI runs: the workspace excluding `adk-rust`, then `adk-rust --features full`.
 
 - Unit tests: `#[cfg(test)]` modules in source files.
 - Integration tests: `tests/*.rs` in each crate.

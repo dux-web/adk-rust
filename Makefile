@@ -87,6 +87,13 @@ test:
 	cargo test --workspace
 
 # Run clippy lints
+# Doctests need two commands, not one: `adk-rust`'s examples document
+# feature-gated APIs, so a plain `cargo test --workspace --doc` fails on five of
+# them with unresolved imports. This mirrors what CI runs.
+doctest:
+	cargo test --workspace --doc --exclude adk-rust
+	cargo test -p adk-rust --features full --doc
+
 clippy:
 	cargo clippy --workspace
 
