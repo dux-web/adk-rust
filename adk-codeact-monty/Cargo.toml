@@ -2,6 +2,14 @@
 name = "adk-codeact-monty"
 version = "0.1.0"
 edition = "2024"
+# Not publishable, and the reason is no longer the git dependency that was
+# removed when Monty reached crates.io. The build only resolves because the
+# workspace `Cargo.lock` pins `get-size2` to `0.10.1` (see the `monty` dependency
+# note below). A published library ships no lockfile, so a downstream consumer
+# would resolve `get-size2 0.10.2+`, whose move to `compact_str ^0.10` stops
+# `ruff_python_ast 0.0.3`'s `GetSize` derive from resolving — the crate would not
+# compile for anyone who depended on it. Publishable once Monty upgrades past
+# `ruff_python_ast 0.0.3` and the pin can be dropped.
 publish = false
 description = "Python CodeRuntime for the ADK-Rust CodeActAgent, backed by the Pydantic Monty interpreter"
 license = "MIT OR Apache-2.0"
