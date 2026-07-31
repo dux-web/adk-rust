@@ -1,410 +1,311 @@
-# Spec: Adopting Monty 0.0.19 Capabilities in the CodeAct Runtime
+# Spec: The CodeAct Python Runtime on `monty-pool`
 
 | | |
 |---|---|
-| **Status** | Draft / RFC — requirements + design + tasks, pending approval |
-| **Depends on** | #525 (`adk-codeact-monty` joins the workspace on crates.io monty 0.0.19) |
-| **Affected crates** | `adk-agent` (`codeact` feature), `adk-codeact-monty`; optional touchpoints in `adk-devtools`, `adk-runner` |
-| **Related** | #380 (Code Agents), `docs/design/coding-agent.md`, `docs/official_docs/agents/code-agent.md` |
+| **Status** | Draft / RFC — revision 2, pending approval |
+| **Depends on** | #525 (`adk-codeact-monty` on crates.io monty 0.0.19) |
+| **Affected crates** | `adk-codeact-monty` (rewritten as a pool client), `adk-agent` (`codeact`); docs, CI |
+| **Related** | #380, `docs/design/coding-agent.md`, `docs/official_docs/agents/code-agent.md` |
+| **Reference** | `reference/monty` (gitignored clone of `pydantic/monty`) |
+
+## Revision history
+
+**r1** designed session support, mounts, tracebacks, print streams and cancellation
+*in-process*, by adopting more of the `monty` crate's API (`MontyRepl` et al).
+
+**r2 (this revision) pivots to `monty-pool`.** r1 was researched depth-first inside
+an API that had already been chosen, without first asking whether it was the right
+integration. It is not: Monty's own guidance is that `monty-pool` — not the
+in-process crate — is *"the recommended way to run Monty from Rust"* for untrusted
+code, and LLM-generated Python is untrusted by construction. Nearly every feature
+r1 proposed to build already exists there, with isolation the in-process API
+cannot provide. r1's requirements survive; its design mostly does not.
+
+The one r1 artifact that stands is the **session seam** already merged in
+`1afbb693` (`CodeSessionState`, `CodeRuntime::start_in_session`,
+`RunStep::with_session`). It is runtime-agnostic and maps directly onto
+`Checkout::dump`/`restore`, so it was not wasted work.
 
 ---
 
 ## 1. Summary
 
-Monty 0.0.19 exposes a substantially larger surface than the one-shot `MontyRun`
-we consume today: a **stateful, serializable REPL**, **structured tracebacks**,
-a **mount-based virtual filesystem**, **concurrent future resolution**, **lazy
-name lookup**, **per-stream print capture**, and **tracker-installed
-cancellation**. Seven of those are unreferenced in `adk-codeact-monty`.
+Rewrite `adk-codeact-monty` from an in-process interpreter embedder into a
+**`monty-pool` client**: Python executes in `monty` worker subprocesses, one
+dedicated `Checkout` per CodeAct session, reached over Monty's wire protocol.
 
-The blocker is not the runtime — it is our own abstraction. `CodeRuntime` models
-**one script execution**, so a persistent interpreter cannot be expressed even
-though Monty now supports one. This spec adds a session-scoped seam to
-`CodeRuntime` (defaulted, so existing runtimes are unaffected) and then adopts the
-capabilities that seam unlocks.
+This buys three things r1 could not:
 
-## 2. What Monty 0.0.19 actually provides
+1. **Crash isolation.** Monty's README is explicit: *"a Monty process can never be
+   made fully crash-proof against memory errors (stack overflow aborts, allocator
+   aborts)."* Today those aborts kill **the whole ADK agent process** — and no
+   `ResourceLimits` value prevents them, because limits catch time and memory, not
+   aborts. In the pool, a crash kills only the worker; the pool observes
+   `PoolError::Crashed`, discards it, and spawns a replacement.
+2. **A hard timeout that can catch a hang the sandbox cannot see** — a parent-side
+   watchdog kills any worker exceeding `request_timeout`.
+3. **Publishability.** Verified by `cargo tree`: the `get-size2 0.10.1` lockfile
+   pin — the sole reason the crate is `publish = false` — comes only via
+   `monty` → `ruff_python_ast 0.0.3`. `monty-pool` depends on `monty-types`,
+   `monty-fs`, `monty-proto`, `tungstenite`, `rustls` and **not** on `monty` core.
+   Dropping the in-process interpreter drops the pin, so the crate can ship.
 
-Verified against the vendored sources at
-`~/.cargo/registry/src/*/monty{,-types,-fs}-0.0.19`:
+That third point closes the largest real gap in the whole CodeAct feature: today a
+crates.io user gets `CodeActAgent` and the `CodeRuntime` trait with **no runtime
+able to execute anything**.
 
-| Capability | API | Verified detail |
-|---|---|---|
-| **Stateful REPL** | `MontyRepl::new/feed_start/feed`, `ReplProgress`, `ReplStartError` | "Preserves heap and global variable state between snippets… avoiding the cost and semantic risks of replaying prior code." `feed_start` suspends on external/OS calls and futures exactly like `MontyRun::start`. |
-| **Session serialization** | `MontyRepl::dump/load` | `#[derive(Serialize, Deserialize)]` on the whole struct + `postcard::to_allocvec(self)` — so heap, globals, slot map **and `snippet_sources`** all persist. Explicitly "between process runs". |
-| **State survives failure** | `ReplStartError { repl, error }` | "On a Python-level runtime exception the REPL is **not** destroyed" — a failed snippet keeps the namespace. |
-| **Structured tracebacks** | `MontyException::traceback() -> &[StackFrame]` | `StackFrame { filename, start: CodeLoc, end: CodeLoc, frame_name, source-line preview }`, `CodeLoc { line, column }`. Cross-snippet frames are resolvable because the REPL retains snippet sources. |
-| **Virtual filesystem** | `monty_fs::{MountTable, Mount, MountMode, MountCallOutcome, OverlayState}` | `Mount { virtual_path, host_path, mode }` with `MountMode::{ReadOnly, ReadWrite}`; `MountTable::handle_os_call` routes guest OS calls. `OverlayState` provides copy-on-write staging. |
-| **Concurrent futures** | `RunProgress::ResolveFutures` / `ReplResolveFutures` | Snapshot carries "the pending `call_ids` that this snapshot is waiting on" — i.e. several outstanding calls at once. |
-| **Lazy name binding** | `RunProgress::NameLookup` | `{ name, namespace slot, global-vs-local }` — the host resolves a name on first use and the value is cached in the slot. |
-| **Per-stream print** | `PrintWriter::collect_streams(&mut Vec<(PrintStream, String)>)`, `PrintWriterCallback` | Preserves stdout/stderr identity **and interleaving order**; callback form allows live streaming. |
-| **Cancellation** | `MontyRepl::tracker_mut()` | "REPL hosts use this to install ephemeral execution controls, such as async cancellation flags, before calling `feed_start()`." |
+## 2. Evidence: what `monty-pool` already provides
 
-Currently used: `MontyRun`, `RunProgress::{Complete,FunctionCall,OsCall,NameLookup,ResolveFutures}`,
-`MontyObject`, `DictPairs`, `ResourceLimits`, `MountTable`, `MountMode`,
-`MountCallOutcome`, `DEFAULT_MAX_PRINT_COLLECT_BYTES`.
+`Checkout::feed(code, inputs, mounts, skip_type_check, on_print) -> TurnEvent`,
+plus `resume` / `resume_name_lookup` / `resume_futures` / `dump` / `restore` /
+`finish`.
 
-Unused: `MontyRepl`, `ReplProgress`, `detect_repl_continuation_mode`,
-`OverlayState`, `StackFrame`, `CodeLoc`, `AssertMessageAnnotations`,
-`PrintWriterCallback`, `MontyFileHandle`.
+| r1 requirement | Already provided |
+|---|---|
+| R1/R2 sessions | A `Checkout` is a REPL session; *"session state persists between feeds"*. `PoolError::Runtime` and `PoolError::Typing` *"leave the session usable"*, so a failed step keeps its namespace. |
+| R3 restart survival | `Checkout::dump`/`restore` — *"including on a different worker or machine"*, strictly better than an in-process heap dump. |
+| R5 mounts | `feed(mounts: Vec<MountSpec>)` — **per-feed**, finer-grained than r1's per-runtime `MountTable`. |
+| R8 print streams | `on_print(stream, text)` — a streaming callback, better than collect-then-return. |
+| R9 cancellation | `request_timeout` watchdog + `max_duration` enforced from outside the child. |
+| *(missed in r1)* inputs | `feed(inputs: Vec<(String, MontyObject)>)` — host values as sandbox globals. |
+| *(never considered)* | **Type checking every snippet** (`skip_type_check`, `PoolError::Typing`, via `monty-type-checking`/`ty`). |
+| *(never considered)* | **Dependency installation** (`InstallDependencies`). |
+| *(impossible in-process)* | Crash isolation, worker recycling (`max_checkouts_per_worker`), untrusted-child wire validation. |
 
-## 3. Where today's architecture blocks adoption
+Two transports: `PoolConfig::subprocess(path)` (poolable, prewarmed, replaced on
+crash) and `PoolConfig::websocket(url)` (single-use, remote; isolation is the
+remote host's responsibility).
 
-`adk-agent::codeact::CodeRuntime`:
-
-```rust
-fn start(&self, script: &str, script_name: &str) -> Result<RunStep, RuntimeError>;
-fn resume(&self, snapshot: &[u8], with: ResumeWith) -> Result<RunStep, RuntimeError>;
-```
-
-- `start` takes a **script**, not a session. There is no "same interpreter, next
-  snippet" concept, so `MontyRepl` has nowhere to live.
-- `resume(snapshot, …)` already threads opaque bytes, but only for a **paused
-  run inside one script** — a genuinely good durable-continuation design we keep.
-- `RunStep` has no channel to hand *updated session state* back to the caller.
-- `adk-codeact-monty` documents this honestly: "**No shared state** … entirely
-  stateless", and builds "a fresh `MountTable`" per run.
-
-So state persists *within* a script across tool-call pauses, but **not across
-steps**. Canonical CodeAct carries a namespace across steps; the original design
-doc listed "fresh vs persistent interpreter state" as an open question. Monty now
-answers it, and this is the decision this spec makes.
-
-## 4. Goals / Non-goals
+## 3. Goals / Non-goals
 
 **Goals**
 
-- **G1** Let a `CodeRuntime` optionally be **session-scoped**, without breaking
-  the existing one-shot contract or any current implementor.
-- **G2** Give the model **structured, CPython-style tracebacks** for failed scripts.
-- **G3** Expose a **workspace as a mounted virtual filesystem** with explicit
-  read-only/read-write intent, composable with `adk-devtools::Workspace`.
-- **G4** ~~Dispatch concurrent tool calls from a script.~~ **Withdrawn** — it
-  conflicts with the single-continuation durability guarantee (D4).
-- **G5** Support **lazy tool binding**, so a large toolset need not be rendered
-  into every prompt.
-- **G6** Preserve stdout/stderr **identity and ordering**, and allow streaming.
-- **G7** Make a long-running script **cancellable** via ADK's existing token.
+- **G1** Execute CodeAct Python in crash-isolated workers, so adversarial or buggy
+  generated code cannot abort the agent process.
+- **G2** Make `adk-codeact-monty` **publishable**, so the CodeAct feature is usable
+  from crates.io.
+- **G3** Keep the `CodeRuntime` seam unchanged for `adk-agent` — the pivot must not
+  leak into the agent.
+- **G4** Adopt, rather than rebuild: sessions, per-feed mounts, inputs, streaming
+  print, watchdog timeouts, and snippet type checking.
+- **G5** Never block the async runtime on worker IPC.
+- **G6** Degrade honestly when the worker binary is absent — a clear error or a
+  skipped test, never a silent fallback to unisolated execution.
 
 **Non-goals**
 
-- **N1** Publishing `adk-codeact-monty`. It must stay `publish = false`: the build
-  only resolves because the **workspace `Cargo.lock` pins `get-size2` 0.10.1**, and
-  published libraries ship no lockfile, so a downstream consumer would resolve
-  `0.10.2+` and fail `ruff_python_ast 0.0.3`'s derive. Recording this reason is a
-  task; changing it is not.
-- **N2** Re-adding `max_allocations` — `ResourceLimits` no longer counts them and a
-  silently unenforced cap misrepresents the sandbox.
-- **N3** Changing the durable mid-script continuation model, which already works.
-- **N4** Making sessions the default in this change (see R1 acceptance criteria).
+- **N1** Keeping the in-process interpreter in this crate. It is what forces the
+  `get-size2` pin, so it is mutually exclusive with G2 (see D5).
+- **N2** Bundling or vendoring the `monty` binary.
+- **N3** Concurrent tool dispatch. Withdrawn in r1 and still withdrawn: the seam
+  is single-continuation by design, and `TurnEvent`'s futures variant is answered
+  one call at a time. (r1 §D4 argument retained below.)
+- **N4** Changing the CodeAct prompt/protocol (`call_tool`, `final_result`).
 
-## 5. Requirements
+## 4. Requirements
 
-**R1 — Session-scoped execution (opt-in).**
-As an agent author, I can configure a CodeAct agent so successive steps share one
-Python namespace.
-*Acceptance:* a script defining `x = 1` in step 1 can read `x` in step 2 when
-sessions are enabled; with sessions disabled (**the default**), step 2 raises
-`NameError`. A runtime that does not implement sessions keeps working unchanged
-and reports `supports_sessions() == false`.
+**R1 — Isolated execution.** A script that aborts the interpreter (stack overflow,
+allocator abort) must not terminate the agent process.
+*Acceptance:* a test feeding deliberately abort-inducing code observes
+`PoolError::Crashed`, the agent survives, and a subsequent step succeeds on a
+replacement worker.
 
-**R2 — Session state survives a failed step.**
-*Acceptance:* if step 2 raises, variables from step 1 are still visible in step 3.
+**R2 — Sessions.** Successive steps in one CodeAct session share a namespace.
+*Acceptance:* `x = 1` in step 1 is readable in step 2; a step that raises still
+leaves `x` readable in step 3.
 
-**R3 — Session state survives process restart.**
-*Acceptance:* session bytes round-trip through `SessionService` state; after a
-simulated restart, a prior variable is still readable. A configured size budget is
-enforced, and exceeding it degrades to a fresh session with a warning rather than
-failing the turn.
+**R3 — Session durability.** `Checkout::dump` bytes round-trip through
+`CodeSessionState` and `SessionService`; after a simulated restart a prior variable
+is readable. Over a configured budget, degrade to a fresh session with a warning.
 
-**R4 — Structured tracebacks.**
-*Acceptance:* a failing script yields an error containing ordered frames with
-`filename`, `line`, `column`, optional `frame_name`, and the source line; the
-rendered text a model sees names the failing line. Runtimes without traceback
-support still return today's flat message.
+**R4 — Tool calls.** `TurnEvent`'s function-call variant maps to `RunStep::Call`
+and resumes with the tool result, preserving today's `call_tool(...)` contract and
+the existing 22 `drive_script` behaviours.
 
-**R5 — Mounted workspace.**
-*Acceptance:* a script can read a file under a `ReadOnly` mount and is denied
-writing to it; it can write under a `ReadWrite` mount. Paths outside every mount
-are denied. Mount configuration is explicit — no implicit host-filesystem access.
+**R5 — Mounts.** A script reads under a read-only mount, is denied writing to it,
+writes under a read-write mount, and is denied outside every mount.
 
-**R6 — Concurrent tool calls from a script. — BLOCKED, see D4.**
-*Original acceptance:* a script awaiting two independent tool calls dispatches them
-under the agent's configured `ToolExecutionStrategy`, and results bind to the
-correct call ids regardless of completion order.
-*Status:* this requirement conflicts with an existing, deliberate design decision
-and must not be implemented as written. It is retained here only so the conflict
-is on the record; see D4 for the argument and the two honest options.
+**R6 — Inputs.** The driver can bind host values as named globals, so data need not
+be interpolated into the script source (and therefore need not round-trip through
+the model).
 
-**R7 — Lazy tool binding.**
-*Acceptance:* with lazy binding enabled, a tool not referenced by a script is
-never resolved, and the rendered preamble need not enumerate every tool; a
-referenced-but-unknown name produces the existing unknown-tool message.
+**R7 — Type checking.** A snippet with a static type error is reported to the model
+as a script error with the session intact, before execution. Defeatable per feed via
+`skip_type_check`.
 
-**R8 — Ordered stdout/stderr.**
-*Acceptance:* a script interleaving `print()` and `print(file=sys.stderr)` yields
-output preserving both stream identity and relative order.
+**R8 — Streaming output.** `print()` reaches the driver as `(stream, text)` while
+the script runs, preserving stream identity and order.
 
-**R9 — Cancellation.**
-*Acceptance:* cancelling the invocation stops a long-running script promptly and
-surfaces a cancellation outcome, not a timeout.
+**R9 — Timeout.** A script exceeding the configured wall clock is killed by the
+parent watchdog and surfaced distinctly from a script raise.
 
-## 6. Design
+**R10 — Worker discovery.** The binary is located explicitly (builder path, then
+`ADK_MONTY_BINARY`, then `PATH`), and its absence is a clear construction error.
 
-### D1 — The session seam (R1, R2, R3)
+**R11 — Publishable.** `adk-codeact-monty` builds from crates.io with no lockfile
+pin, and `cargo package` verifies.
 
-Add to `adk-agent::codeact`:
+## 5. Design
+
+### D1 — Runtime shape
 
 ```rust
-/// Opaque, runtime-owned interpreter state that survives between scripts.
-#[derive(Clone, Debug)]
-pub struct CodeSessionState(Vec<u8>);
-
-pub trait CodeRuntime: Send + Sync {
-    // … existing start() / resume() / capabilities() / render_tools() unchanged …
-
-    /// Whether this runtime can carry a namespace across scripts.
-    fn supports_sessions(&self) -> bool { false }
-
-    /// Execute `script` against prior session state, if any.
-    ///
-    /// Defaulted to ignore `state` and delegate to `start`, so every existing
-    /// implementor remains correct and stateless.
-    fn start_in_session(
-        &self,
-        state: Option<&CodeSessionState>,
-        script: &str,
-        script_name: &str,
-    ) -> Result<RunStep, RuntimeError> {
-        let _ = state;
-        self.start(script, script_name)
-    }
+pub struct MontyPoolRuntime {
+    pool: Arc<Pool>,                 // elastic, prewarmed workers
+    repl: ReplConfig,                // per-session limits + type checking
+    mounts: Vec<WorkspaceMount>,     // applied per feed
+    os: Arc<OsPolicy>,               // env/clock policy (unchanged in spirit)
 }
 ```
 
-`RunStep` gains an out-channel, set on **completion and on raise** (R2):
+`CodeRuntime` impl unchanged in signature (**G3**):
 
-```rust
-impl RunStep {
-    pub fn with_session(mut self, state: CodeSessionState) -> Self { … }
-    pub fn session(&self) -> Option<&CodeSessionState> { … }
-}
-```
-
-**Monty mapping.** `MontyRuntime::start_in_session`:
-`MontyRepl::load(state)` (or `MontyRepl::new`) → `feed_start(script)` →
-match `ReplProgress`:
-
-| `ReplProgress` | `RunStep` |
+| `CodeRuntime` | Pool call |
 |---|---|
-| `Complete` → `into_complete() -> (MontyRepl, MontyObject)` | `complete(value).with_session(repl.dump())` |
-| `FunctionCall` / `OsCall` / `ResolveFutures` / `NameLookup` | existing pause path — `ReplProgress::dump()` already contains the REPL |
-| `Err(ReplStartError { repl, error })` | `raised(render(error)).with_session(repl.dump())` — **R2** |
+| `start(script, name)` | `pool.checkout(&repl)` → `feed(script, inputs, mounts, …)` → drop the checkout on completion |
+| `start_in_session(state, script, name)` | `checkout` → `Checkout::restore(state.bytes_for(RUNTIME_ID))` → `feed(…)` → `dump()` into the returned `RunStep` |
+| `resume(snapshot, with)` | `restore(snapshot)` → `Checkout::resume(value, on_print)` |
+| `supports_sessions()` | `true` |
 
-The mid-script pause snapshot and the cross-script session snapshot are therefore
-*the same kind of thing*, which is why no second durability mechanism is needed.
+`RUNTIME_ID` is `"monty-pool/0.0.19"`, so a snapshot from a different Monty
+version is rejected by `bytes_for` and degrades to a fresh session (r1's Q5
+mitigation, already implemented).
 
-**Persistence (R3).** `CodeActAgent` stores session bytes in session state under a
-new `SESSION_STATE_KEY`, beside the existing `PENDING_STATE_KEY`. Because a heap
-dump is unbounded in principle and `SessionService` may be SQLite-backed, the
-agent enforces `max_session_state_bytes` (default to be chosen from measurement,
-see Q1): over budget → drop the session, log a warning, next step starts fresh.
-Sessions are **opt-in** (`CodeActAgentBuilder::persistent_session(true)`) so the
-default cost profile is unchanged (**N4**).
+**One snapshot format.** `Checkout::dump` serializes an idle *or suspended*
+session, so the mid-call continuation and the cross-step session are the same
+bytes. The tagged-envelope problem that blocked r1's Phase 1 does not arise.
 
-### D2 — Structured tracebacks (R4)
+### D2 — Event and error mapping
 
-Runtime-agnostic types in `adk-agent::codeact`:
+`TurnEvent` → `RunStep`: completion → `Complete`; function call → `Call`; OS call
+→ resolved in-place against the host policy and resumed; name lookup → `Undefined`
+(tools are only callable, never bare names); futures → answered one at a time with
+the existing corrective message (**N3**).
 
-```rust
-pub struct ScriptFrame {
-    pub filename: String,
-    pub line: u32,
-    pub column: u32,
-    pub frame_name: Option<String>,
-    pub source_line: Option<String>,
-}
-pub struct ScriptError { pub message: String, pub frames: Vec<ScriptFrame> }
-```
+`PoolError` splits along the seam's existing script-vs-host line:
 
-`RunStep::raised` keeps taking a message; add `raised_with(ScriptError)`.
-`error_map` renders frames into the CPython-style block the model sees. The monty
-side is a direct projection of `MontyException::traceback()`. Advertise via
-`RuntimeCapabilities::structured_errors`, so a runtime without frames degrades to
-the current message.
+| `PoolError` | Maps to | Why |
+|---|---|---|
+| `Runtime` | `RunStep::Raised` | A script error; session stays usable — the model can fix it. |
+| `Typing` | `RunStep::Raised` | Same: the model wrote code that does not type-check (**R7**). |
+| `Timeout` | `RunStep::Raised`, distinctly worded | The model should see it and write cheaper code (**R9**). |
+| `Crashed` | `RunStep::Raised` + `warn!` | The script killed a worker; the pool already replaced it. Not a host failure — the agent is healthy (**R1**). |
+| `Protocol`, pool exhaustion, spawn failure | `RuntimeError` | Genuine host breakage. |
 
-### D3 — Mounted workspace (R5)
+Crash-as-`Raised` is deliberate: the agent survives, so the run should continue
+with the model informed, not abort.
 
-Runtime-agnostic mount description on the builder, so the trait stays
-Monty-free:
+### D3 — The async boundary (**G5**)
 
-```rust
-pub enum MountAccess { ReadOnly, ReadWrite }
-pub struct WorkspaceMount { pub guest_path: String, pub host_path: PathBuf, pub access: MountAccess }
-```
+`monty-pool` is fully synchronous (no tokio) and now performs subprocess IPC, so
+the seam's stated assumption — *"advancing the interpreter is synchronous and
+fast"* — no longer holds. Every pool call is wrapped in
+`tokio::task::spawn_blocking`. Because `CodeRuntime::start`/`resume` are sync but
+called from async agent code, the adapter owns a small blocking bridge; the trait
+does not change.
 
-`MontyRuntimeBuilder::mount(WorkspaceMount)` builds the `MountTable` once per
-runtime (not per run) and hands it to `OsAccess`. Default remains **no mounts**.
+### D4 — Worker discovery (**R10**, **G6**)
 
-This is the natural join with the coding agent: an `adk_devtools::Workspace` root
-becomes a `WorkspaceMount`, so `bash`/`read_file` and the Python sandbox address
-the same tree with the same intent. `OverlayState` is a follow-up (Q3): stage
-writes, then review or discard — attractive for an agent that should not mutate a
-repo in place.
+Resolution order: explicit builder path → `ADK_MONTY_BINARY` → `monty` on `PATH`.
+Absence is a construction-time error naming the two fixes
+(`cargo install monty-runtime`, or set the env var). No silent fallback to
+in-process execution — that would quietly drop the isolation this design exists to
+provide.
 
-### D4 — Concurrent tool calls (R6) — **withdrawn as specified**
+For CI and tests, `monty-runtime 0.0.19` is on crates.io, so a setup step installs
+the binary; runtime tests **skip with a printed reason** when it is absent, the
+same pattern used for the Windows sandbox portability tests.
 
-The original plan was: map `ResolveFutures` (which carries a set of pending
-`call_ids`) to a `RunStep` variant holding **many** `PendingCall`s, and dispatch
-them through the agent's existing `ToolExecutionStrategy` /
-`ToolConcurrencyManager` rather than a second mechanism.
+### D5 — In-process path: removed, not feature-gated
 
-**That contradicts a documented, deliberate decision.** `adk-agent`'s
-`codeact::runtime` module doc states the seam is *sequential by design*:
+Feature-gating in-process support in the same crate would look attractive but is a
+footgun: cargo publishes the manifest with every feature, so a downstream user
+enabling it would hit the unpinnable `get-size2` resolution and fail to build. The
+in-process interpreter therefore **leaves this crate**. If an embedded, non-isolated
+runtime is wanted later (no external binary, lower latency, trusted code only), it
+belongs in a separate unpublished crate — a decision deferred, not made here.
 
-> The seam is a *single continuation*: `RunStep::Call` surfaces exactly one
-> pending call … Tool execution is therefore strictly sequential, even if the
-> script's language supports `async`/threads.
->
-> This is deliberate: durability rests on snapshotting *one* continuation at
-> *one* call boundary. Multiple in-flight calls would force a checkpoint to
-> capture partial completion (e.g. a long-running tool inside an
-> `asyncio.gather` alongside two finished tools), which has no clean
-> suspend/resume semantics. Concurrent host dispatch would require a different
-> seam (e.g. a multi-call step) and is intentionally out of scope.
+### D6 — Error rendering
 
-The objection is correct, and the failure it names is concrete: with N calls in
-flight and a suspend, the checkpoint must encode *which subset already completed
-and with what values*. `PendingCall::dump` has no representation for that, so a
-resumed run would either re-dispatch completed tools (double side effects) or
-lose their results. Concurrency here would be bought by weakening the durability
-guarantee that makes this runtime useful for long-running agents.
-
-**Two honest options, neither of which is "implement R6 as written":**
-
-1. **Keep sequential (recommended).** Accept that a script's `asyncio.gather` is
-   serialized at the call boundary, and say so in the CodeAct docs so the
-   behaviour is not a surprise. Cost: a script awaiting several slow tools pays
-   their sum, not their max.
-2. **Design a durable multi-call step first.** Requires extending the snapshot
-   format to record per-call completion state, plus a resume path that replays
-   only the outstanding calls. That is a larger change than everything else in
-   this spec combined, and it must be specified — with its own suspend/resume
-   semantics — before any code.
-
-Until option 2 is specified and accepted, `ResolveFutures` should continue to be
-serviced one call at a time.
-
-### D5 — Lazy tool binding (R7)
-
-`NameLookup` gives `{ name, slot, global? }`. The agent resolves the name against
-its toolset on first use and returns the binding; unknown names reuse
-`unknown_tool_message`. `render_tools` then only needs a **summary** rather than
-full signatures for every tool, which is the same lazy philosophy as
-`adk-skill`. Gated by `RuntimeCapabilities::lazy_names` and a builder flag,
-because it changes what the model is told upfront.
-
-### D6 — Ordered stdout/stderr (R8)
-
-Replace the single collected `String` with
-`PrintWriter::collect_streams(&mut Vec<(PrintStream, String)>)`, and widen
-`ScriptOutput` to an ordered `Vec<(OutputStream, String)>` while keeping the
-existing flat accessor for compatibility. `PrintWriterCallback` enables live
-streaming as a follow-up (Q4).
-
-### D7 — Cancellation (R9)
-
-Before `feed_start`, install a cancellation flag via `repl.tracker_mut()`, driven
-by the invocation's `CancellationToken`. Surface a distinct cancellation outcome so
-it is not reported as a timeout.
-
-### Error handling
-
-Three failure classes stay distinct: **Python-level raise** (R4 traceback, session
-preserved), **resource limit** (time/memory from `ResourceLimits`), and
-**host/dispatch error** (`RuntimeError`). Only the first is script-visible.
+`monty-types` still supplies `MontyException` and `StackFrame`/`CodeLoc` over the
+wire, so r1's structured-traceback design (r1 §D2 — `ScriptFrame`/`ScriptError`,
+capability flag, CPython-style rendering) carries over unchanged and is the one r1
+design section adopted wholesale.
 
 ### Testing
 
-- Unit, `adk-agent`: the defaulted seam — a stateless test runtime must be
-  unaffected and report `supports_sessions() == false`.
-- Unit, `adk-codeact-monty`: `x = 1` then `print(x)` across two `start_in_session`
-  calls; failure-then-read (R2); dump→load→read across a fresh runtime (R3);
-  traceback frame assertions (R4); mount allow/deny matrix (R5); two-call
-  concurrent resume with reversed completion order (R6); lazy lookup of an
-  unreferenced tool never resolving (R7); interleaved stream ordering (R8).
-- Integration: a `CodeActAgent` over the monty runtime with sessions enabled,
-  asserting namespace continuity through the real agent loop.
-- A **negative control** for R3: corrupt/oversize state must degrade to a fresh
-  session, not fail the turn.
+- Isolation (**R1**): abort-inducing script → `Crashed` → agent alive → next step
+  succeeds on a replacement worker. This is the test that justifies the pivot.
+- Sessions (**R2**, **R3**): continuity; failure-then-read; dump→restore across a
+  *different* worker; oversize/corrupt state degrades rather than fails.
+- Behaviour parity (**R4**): the existing 22 `drive_script` tests must pass against
+  the pool runtime with only construction changed — the regression net for the
+  rewrite.
+- Mounts (**R5**) allow/deny matrix; inputs (**R6**); type-error-with-live-session
+  (**R7**); interleaved stream order (**R8**); timeout distinct from raise (**R9**);
+  missing-binary error text (**R10**); `cargo package` (**R11**).
 
-## 7. Risks and open questions
+## 6. Risks and open questions
 
-- **Q1 — Session size.** A heap dump's realistic size is unmeasured. Needs a
-  measurement pass (typical agent script, 10 steps) before fixing the default
-  budget. If large, options are compression, or storing session bytes in an
-  artifact rather than session state.
-- **Q2 — Tracker serialization.** `MontyRepl::dump` requires
-  `T: ResourceTracker + Serialize`. Confirm `LimitedTracker` satisfies it and that
-  a restored tracker's counters start from a sane state (a restored session should
-  not inherit an exhausted time budget).
-- **Q3 — `OverlayState` semantics.** Deferred; needs its own read of the
-  copy-on-write model before promising review-then-commit behavior.
-- **Q4 — Streaming print.** `PrintWriterCallback` interacts with the borrow of the
-  output buffer during a suspendable run; deferred behind D6.
-- **Q6 — Concurrency vs durability (resolved: durability wins, for now).** R6/D4 as
-  first written would have traded the single-continuation durability guarantee for
-  script-level parallelism. Found by reading `codeact::runtime`'s module doc during
-  Phase 1 rather than by design review, which is itself a lesson: the constraint
-  was documented in the code and not in this spec. Recorded in D4; no work
-  proceeds on it.
-- **Q5 — Monty is `0.0.x`.** Every release is potentially breaking, and the
-  `get-size2` pin is load-bearing. Sessions increase our coupling to Monty's
-  serialized representation: **a snapshot is not portable across Monty versions.**
-  Session state must therefore be version-stamped and discarded on mismatch.
+- **Q1 — Worker binary as a deployment dependency.** The strongest objection to
+  this pivot. It is a Rust binary rather than a Python install, and obtainable via
+  `cargo install monty-runtime`, but it is still an artifact to ship and locate.
+  Weigh against: without it there is no crash isolation *and* no publishable
+  runtime.
+- **Q2 — Latency.** Per-step IPC plus checkout, versus an in-process call. Prewarmed
+  workers (`min_processes`) amortize spawn cost; unmeasured, and worth measuring
+  before defaults are fixed.
+- **Q3 — Session size** (carried from r1). `Checkout::dump` size is unmeasured;
+  measure before fixing `max_session_state_bytes`.
+- **Q4 — Monty is `0.0.x`.** Both the wire protocol and the snapshot format may
+  change per release. `RUNTIME_ID` gates snapshots; the protocol is pinned by the
+  dependency version. A `monty` binary older or newer than the linked
+  `monty-proto` is a real misconfiguration — needs a version handshake check.
+- **Q5 — Type checking cost.** On by default is the safer choice for generated
+  code, but it runs per feed; measure before deciding the default.
+- **Q6 — `InstallDependencies`.** Powerful (pip packages in the sandbox) and
+  dangerous (network egress, supply chain). Out of scope here; do not enable without
+  its own security review.
 
-## 8. Tasks
+## 7. Tasks
 
-**Phase 1 — the seam (R1, R2)**
-- [ ] `CodeSessionState`, `supports_sessions`, `start_in_session` (defaulted), `RunStep::with_session/session` — `adk-agent` (D1)
-- [ ] Version-stamp session bytes; discard on mismatch (Q5)
-- [ ] `MontyRuntime::start_in_session` over `MontyRepl`, incl. `ReplStartError` state preservation (D1)
-- [ ] Unit tests: stateless runtime unaffected; continuity; failure-then-read
+**Phase 0 — decide and prepare**
+- [x] Session seam in `adk-agent` (merged, `1afbb693`)
+- [x] Clone `pydantic/monty` into gitignored `reference/`
+- [ ] Accept or reject the pivot (this document)
+- [ ] CI: install `monty-runtime`; make runtime tests skip-with-reason when absent
 
-**Phase 2 — persistence (R3)**
-- [ ] `SESSION_STATE_KEY` + `persistent_session` builder flag + size budget with graceful degradation (D1)
-- [ ] Measure realistic snapshot sizes; fix the default (Q1)
-- [ ] Restart round-trip test + oversize/corrupt negative control
+**Phase 1 — pool client**
+- [ ] `MontyPoolRuntime` + builder; worker discovery (D1, D4)
+- [ ] `TurnEvent` → `RunStep`; `PoolError` split (D2)
+- [ ] `spawn_blocking` bridge (D3)
+- [ ] Port the 22 `drive_script` tests; drop the in-process path (D5)
 
-**Phase 3 — diagnostics (R4, R8)**
-- [ ] `ScriptFrame`/`ScriptError`, `raised_with`, capability flag, renderer (D2)
-- [ ] Monty projection from `MontyException::traceback()` (D2)
-- [ ] Ordered `ScriptOutput` via `collect_streams` (D6)
+**Phase 2 — sessions**
+- [ ] `start_in_session` over `restore`/`dump`; `RUNTIME_ID` gating (D1)
+- [ ] Persist via `SessionService` + size budget; restart and cross-worker tests
 
-**Phase 4 — sandbox (R5)**
-- [ ] `WorkspaceMount`/`MountAccess` + builder wiring + allow/deny tests (D3)
-- [ ] Join with `adk_devtools::Workspace` in the coding-agent path (D3)
-- [ ] ~~Multi-`PendingCall` step + dispatch via `ToolExecutionStrategy`~~ — withdrawn,
-      see D4. Instead: document in `docs/official_docs/agents/code-agent.md` that
-      script-level `async`/`gather` is serialized at the call boundary, and why.
+**Phase 3 — isolation and limits**
+- [ ] Crash test (**R1**); watchdog timeout mapping (**R9**); worker recycling config
 
-**Phase 5 — lazy binding (R7)**
-- [ ] `NameLookup` resolution + `render_tools` summary mode + capability flag (D5)
+**Phase 4 — adopt the rest**
+- [ ] Per-feed mounts (**R5**); inputs (**R6**); type checking (**R7**); streaming
+      print (**R8**); structured tracebacks (r1 §D2)
 
-**Phase 6 — cancellation (R9)**
-- [ ] Tracker-installed cancellation wired to `CancellationToken` (D7)
+**Phase 5 — ship**
+- [ ] Drop `publish = false` and the `get-size2` pin; `cargo package` verifies (**R11**)
+- [ ] Docs: `code-agent.md` rewrite, worker install, isolation guarantees, and the
+      note that script-level `async`/`gather` is serialized at the call boundary (**N3**)
 
-**Housekeeping (independent, do first — it is one line plus a comment)**
-- [ ] Record in `adk-codeact-monty/Cargo.toml` *why* `publish = false` must remain:
-      the `get-size2` lockfile pin cannot travel with a published crate (N1)
+## 8. Sequencing
 
-## 9. Sequencing note
+Nothing here precedes the 2.0.0 tag. Phase 5 is the point of the exercise — a
+published, crash-isolated Python runtime — so Phases 1–4 should not be split
+across releases if avoidable.
 
-Phases 1–3 and 5 are additive and behind defaults, so they are safe on a 2.0.x
-line. Phase 4 grants a script filesystem reach it does not have today and wants
-its own security review. Nothing here needs to precede the 2.0.0 tag.
-
-The withdrawn D4 is the one place this spec was wrong on first writing: it
-proposed a capability the code had already considered and rejected, with the
-reasoning recorded in a module doc rather than here. Where a constraint is load
-bearing, it belongs in the spec.
+**Method note.** Twice in r1 I researched depth-first inside an assumed API instead
+of first asking whether it was the right one: it missed `feed`'s `inputs` (an unused
+*parameter* of a *used* call, invisible to a survey of unreferenced symbols) and
+then the entire recommended integration. Reading a vendor's whole workspace as a
+reference crate, before designing against one of its modules, is cheaper than
+either correction.
