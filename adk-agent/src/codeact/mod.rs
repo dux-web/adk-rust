@@ -133,6 +133,6 @@ pub use checkpoint::{CodeActCheckpoint, Disposition, PENDING_STATE_KEY, PendingT
 pub use error_map::{denied_message, tool_error_message, unknown_tool_message};
 pub use output::ScriptOutput;
 pub use runtime::{
-    CodeRuntime, PendingCall, ResumeWith, RunStep, RuntimeCapabilities, RuntimeError,
-    bind_call_args, default_tool_catalog,
+    CodeRuntime, CodeSessionState, PendingCall, ResumeWith, RunStep, RuntimeCapabilities,
+    RuntimeError, bind_call_args, default_tool_catalog,
 };

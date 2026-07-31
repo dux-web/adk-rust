@@ -460,7 +460,7 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
 
             'script: loop {
                 match step {
-                    RunStep::Call { call, stdout } => {
+                    RunStep::Call { call, stdout, .. } => {
                         script_output.push_str(&stdout);
                         let name = call.function_name().to_string();
                         let call_id = call.call_id();
@@ -718,7 +718,7 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                             }
                         }
                     }
-                    RunStep::Complete { value, stdout } => {
+                    RunStep::Complete { value, stdout, .. } => {
                         script_output.push_str(&stdout);
                         match ScriptOutput::decode(value) {
                         ScriptOutput::Observation { value } => {
@@ -799,7 +799,7 @@ fn run_codeact(input: LoopInputs) -> impl Stream<Item = adk_core::Result<Event>>
                         }
                         }
                     }
-                    RunStep::Raised { message, stdout } => {
+                    RunStep::Raised { message, stdout, .. } => {
                         script_output.push_str(&stdout);
                         transcript.push(error_content(&truncate_middle(&message, max_error_chars)));
                         break 'script;

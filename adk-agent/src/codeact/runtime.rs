@@ -79,6 +79,80 @@ pub enum ResumeWith {
     Raise(String),
 }
 
+/// Opaque interpreter state that survives *between* scripts in one session.
+///
+/// A session-capable [`CodeRuntime`] hands this back from a completed or failed
+/// step (see [`RunStep::with_session`]) and accepts it on the next script
+/// ([`CodeRuntime::start_in_session`]), so a name bound in one step is still
+/// bound in the next. It is distinct from a [`PendingCall::dump`] snapshot, which
+/// suspends *one* script mid-call; a runtime may implement either, both, or
+/// neither.
+///
+/// # Portability
+///
+/// The bytes are the runtime's private serialization and are **not portable** —
+/// not across runtimes, and not across versions of the same runtime. Monty, for
+/// instance, serializes its heap and globals with `postcard`, and every `0.0.x`
+/// release may change that representation. Each value therefore carries a
+/// `runtime_id` stamp naming the producer *and* its format version. Read the
+/// bytes through [`bytes_for`](Self::bytes_for), which yields `None` on a
+/// mismatch, so a stale snapshot degrades to a fresh session instead of being
+/// handed to an interpreter that would misread it.
+///
+/// # Example
+///
+/// ```
+/// use adk_agent::codeact::CodeSessionState;
+///
+/// let state = CodeSessionState::new("monty/0.0.19", vec![1, 2, 3]);
+/// assert_eq!(state.bytes_for("monty/0.0.19"), Some([1, 2, 3].as_slice()));
+/// // A different runtime, or a different format version, cannot read it.
+/// assert_eq!(state.bytes_for("monty/0.0.20"), None);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CodeSessionState {
+    /// Names the producing runtime and its serialization format version.
+    runtime_id: String,
+    /// The runtime's opaque bytes.
+    bytes: Vec<u8>,
+}
+
+impl CodeSessionState {
+    /// Stamp `bytes` as produced by `runtime_id`.
+    ///
+    /// `runtime_id` must change whenever the byte format changes, so include the
+    /// interpreter version (e.g. `"monty/0.0.19"`).
+    pub fn new(runtime_id: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self { runtime_id: runtime_id.into(), bytes }
+    }
+
+    /// The stamp identifying the producing runtime and format.
+    #[must_use]
+    pub fn runtime_id(&self) -> &str {
+        &self.runtime_id
+    }
+
+    /// The bytes, only if this state was produced by `runtime_id`.
+    ///
+    /// Returns `None` on a mismatch — the caller should start a fresh session.
+    #[must_use]
+    pub fn bytes_for(&self, runtime_id: &str) -> Option<&[u8]> {
+        (self.runtime_id == runtime_id).then_some(self.bytes.as_slice())
+    }
+
+    /// Size of the stored state in bytes, for budgeting what is persisted.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the stored state is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
 /// The result of advancing the interpreter to its next host-relevant stop.
 ///
 /// Every variant carries the `stdout` (e.g. `print`) the script produced *since
@@ -95,6 +169,11 @@ pub enum RunStep {
         /// Output the script produced since the previous step (empty if none or
         /// if the runtime does not capture output).
         stdout: String,
+        /// Session state to carry into the next script, if the runtime keeps any.
+        ///
+        /// Normally `None` here: a paused call's interpreter state travels inside
+        /// its own [`PendingCall::dump`] snapshot.
+        session: Option<CodeSessionState>,
     },
     /// The script ran to completion; carries the returned value (decoded to JSON).
     Complete {
@@ -102,6 +181,8 @@ pub enum RunStep {
         value: Value,
         /// Output the script produced since the previous step.
         stdout: String,
+        /// Session state to carry into the next script, if the runtime keeps any.
+        session: Option<CodeSessionState>,
     },
     /// The script failed: an error propagated to the top. The message is the
     /// runtime's native error rendering, fed back to the model verbatim. This
@@ -112,6 +193,12 @@ pub enum RunStep {
         message: String,
         /// Output the script produced before the error.
         stdout: String,
+        /// Session state to carry into the next script, if the runtime keeps any.
+        ///
+        /// A session-capable runtime should attach it here too: a step that raised
+        /// still leaves its namespace intact, and the next step is usually the
+        /// model's correction attempt, which needs it.
+        session: Option<CodeSessionState>,
     },
 }
 
@@ -119,19 +206,19 @@ impl RunStep {
     /// A tool-call step with no captured output.
     #[must_use]
     pub fn call(call: Box<dyn PendingCall>) -> Self {
-        Self::Call { call, stdout: String::new() }
+        Self::Call { call, stdout: String::new(), session: None }
     }
 
     /// A completion step with no captured output.
     #[must_use]
     pub fn complete(value: Value) -> Self {
-        Self::Complete { value, stdout: String::new() }
+        Self::Complete { value, stdout: String::new(), session: None }
     }
 
     /// A script-error step with no captured output.
     #[must_use]
     pub fn raised(message: impl Into<String>) -> Self {
-        Self::Raised { message: message.into(), stdout: String::new() }
+        Self::Raised { message: message.into(), stdout: String::new(), session: None }
     }
 
     /// Attach captured `stdout` to this step (builder-style).
@@ -155,23 +242,66 @@ impl RunStep {
         *slot = stdout.into();
         self
     }
+
+    /// Attach the session state to carry into the next script (builder-style).
+    ///
+    /// A session-capable runtime attaches this on completion *and* on a raise, so
+    /// a failed step does not discard the namespace the next attempt needs.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_agent::codeact::{CodeSessionState, RunStep};
+    /// use serde_json::json;
+    ///
+    /// let step = RunStep::complete(json!(1))
+    ///     .with_session(CodeSessionState::new("monty/0.0.19", vec![7]));
+    /// assert_eq!(step.session().map(CodeSessionState::len), Some(1));
+    /// ```
+    #[must_use]
+    pub fn with_session(mut self, state: CodeSessionState) -> Self {
+        let slot = match &mut self {
+            Self::Call { session, .. } => session,
+            Self::Complete { session, .. } => session,
+            Self::Raised { session, .. } => session,
+        };
+        *slot = Some(state);
+        self
+    }
+
+    /// The session state to carry into the next script, if the runtime kept any.
+    #[must_use]
+    pub fn session(&self) -> Option<&CodeSessionState> {
+        match self {
+            Self::Call { session, .. }
+            | Self::Complete { session, .. }
+            | Self::Raised { session, .. } => session.as_ref(),
+        }
+    }
 }
 
 impl std::fmt::Debug for RunStep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Call { call, stdout } => f
+            Self::Call { call, stdout, session } => f
                 .debug_struct("Call")
                 .field("function_name", &call.function_name())
                 .field("call_id", &call.call_id())
                 .field("stdout", stdout)
+                .field("session_bytes", &session.as_ref().map(CodeSessionState::len))
                 .finish(),
-            Self::Complete { value, stdout } => {
-                f.debug_struct("Complete").field("value", value).field("stdout", stdout).finish()
-            }
-            Self::Raised { message, stdout } => {
-                f.debug_struct("Raised").field("message", message).field("stdout", stdout).finish()
-            }
+            Self::Complete { value, stdout, session } => f
+                .debug_struct("Complete")
+                .field("value", value)
+                .field("stdout", stdout)
+                .field("session_bytes", &session.as_ref().map(CodeSessionState::len))
+                .finish(),
+            Self::Raised { message, stdout, session } => f
+                .debug_struct("Raised")
+                .field("message", message)
+                .field("stdout", stdout)
+                .field("session_bytes", &session.as_ref().map(CodeSessionState::len))
+                .finish(),
         }
     }
 }
@@ -226,6 +356,39 @@ pub trait CodeRuntime: Send + Sync {
     /// long-running tool completion. Interpreter-captured callbacks (e.g. a
     /// stdout sink) are not serialized and must be re-attached by the adapter.
     fn resume(&self, snapshot: &[u8], with: ResumeWith) -> Result<RunStep, RuntimeError>;
+
+    /// Whether this runtime can carry a namespace across scripts.
+    ///
+    /// `false` — the default — means every script starts from an empty
+    /// namespace, and a driver should not bother persisting session state.
+    fn supports_sessions(&self) -> bool {
+        false
+    }
+
+    /// Begin executing `script` against prior [`CodeSessionState`], if any.
+    ///
+    /// This is [`start`](Self::start) plus continuity: names bound by an earlier
+    /// script in the same session are still bound. A session-capable runtime
+    /// returns the updated state on the resulting step (see
+    /// [`RunStep::with_session`]), including when the script raises.
+    ///
+    /// `state` produced by a different runtime or format version must be
+    /// ignored rather than trusted — read it through
+    /// [`CodeSessionState::bytes_for`], which enforces that, and fall back to a
+    /// fresh session.
+    ///
+    /// The default implementation discards `state` and delegates to
+    /// [`start`](Self::start), so a stateless runtime is already correct and
+    /// needs no change.
+    fn start_in_session(
+        &self,
+        state: Option<&CodeSessionState>,
+        script: &str,
+        script_name: &str,
+    ) -> Result<RunStep, RuntimeError> {
+        let _ = state;
+        self.start(script, script_name)
+    }
 
     /// Report what this runtime can do and which language/environment it
     /// accepts.
@@ -458,11 +621,76 @@ mod tests {
     }
 
     #[test]
+    fn a_session_snapshot_is_readable_only_by_its_producer() {
+        // Monty's serialized heap is not portable across `0.0.x` releases, so the
+        // stamp must gate the bytes rather than merely label them.
+        let state = CodeSessionState::new("monty/0.0.19", vec![1, 2, 3]);
+
+        assert_eq!(state.bytes_for("monty/0.0.19"), Some([1, 2, 3].as_slice()));
+        assert_eq!(state.bytes_for("monty/0.0.20"), None, "a newer format must not be read");
+        assert_eq!(state.bytes_for("other-runtime/1.0"), None, "another runtime must not be read");
+        assert_eq!(state.runtime_id(), "monty/0.0.19");
+        assert_eq!(state.len(), 3);
+        assert!(!state.is_empty());
+    }
+
+    #[test]
+    fn a_session_snapshot_survives_serialization() {
+        // Phase 2 persists these bytes through `SessionService` state.
+        let state = CodeSessionState::new("monty/0.0.19", vec![9, 8]);
+        let json = serde_json::to_string(&state).expect("serializes");
+        let restored: CodeSessionState = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(restored, state);
+        assert_eq!(restored.bytes_for("monty/0.0.19"), Some([9, 8].as_slice()));
+    }
+
+    #[test]
+    fn every_step_can_carry_session_state() {
+        use serde_json::json;
+        let state = CodeSessionState::new("t/1", vec![4]);
+
+        // A raise carries it too: the namespace outlives a failed step, and the
+        // next step is usually the model's correction attempt.
+        for step in [
+            RunStep::complete(json!(1)).with_session(state.clone()),
+            RunStep::raised("boom").with_session(state.clone()),
+        ] {
+            assert_eq!(step.session(), Some(&state), "{step:?}");
+        }
+
+        assert_eq!(RunStep::complete(json!(1)).session(), None, "absent unless attached");
+    }
+
+    #[test]
+    fn a_stateless_runtime_is_unaffected_by_the_session_seam() {
+        use crate::codeact::test_support::{Planned, ScriptedRuntime};
+        use serde_json::json;
+
+        // `ScriptedRuntime` implements only `start`/`resume`, as every runtime
+        // written before the seam existed does.
+        let runtime = ScriptedRuntime::new(vec![vec![Planned::Complete(json!("done"))]]);
+        assert!(!runtime.supports_sessions(), "the default must be no session support");
+
+        // The defaulted `start_in_session` ignores state and behaves like `start`.
+        let state = CodeSessionState::new("t/1", vec![1]);
+        let step = runtime
+            .start_in_session(Some(&state), "ignored", "s.py")
+            .expect("the default delegates to start");
+        match step {
+            RunStep::Complete { value, session, .. } => {
+                assert_eq!(value, json!("done"));
+                assert_eq!(session, None, "a stateless runtime returns no session state");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn run_step_constructors_and_with_stdout() {
         use serde_json::json;
         let step = RunStep::complete(json!(1)).with_stdout("hi");
         match step {
-            RunStep::Complete { value, stdout } => {
+            RunStep::Complete { value, stdout, .. } => {
                 assert_eq!(value, json!(1));
                 assert_eq!(stdout, "hi");
             }

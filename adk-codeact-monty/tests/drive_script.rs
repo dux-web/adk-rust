@@ -87,7 +87,7 @@ fn captures_stdout_and_surfaces_it_on_the_step() {
     let rt = MontyRuntime::new();
     let script = "print(\"hello from python\")\n{\"type\": \"final_result\", \"value\": 1}\n";
     match rt.start(script, "test").expect("start") {
-        RunStep::Complete { value, stdout } => {
+        RunStep::Complete { value, stdout, .. } => {
             assert_eq!(value, json!({"type": "final_result", "value": 1}));
             assert!(stdout.contains("hello from python"), "missing stdout: {stdout:?}");
         }
