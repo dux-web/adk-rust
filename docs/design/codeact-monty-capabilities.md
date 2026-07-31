@@ -207,14 +207,41 @@ does not change.
 ### D4 — Worker discovery (**R10**, **G6**)
 
 Resolution order: explicit builder path → `ADK_MONTY_BINARY` → `monty` on `PATH`.
-Absence is a construction-time error naming the two fixes
-(`cargo install monty-runtime`, or set the env var). No silent fallback to
+Absence is a construction-time error naming the fix. No silent fallback to
 in-process execution — that would quietly drop the isolation this design exists to
 provide.
 
-For CI and tests, `monty-runtime 0.0.19` is on crates.io, so a setup step installs
-the binary; runtime tests **skip with a printed reason** when it is absent, the
-same pattern used for the Windows sandbox portability tests.
+**The install command must carry `--locked`, and this was verified, not assumed.**
+`cargo install monty-runtime --version 0.0.19` **fails to compile**:
+
+```
+error[E0277]: the trait bound `CompactString: GetSize` is not satisfied
+  --> ruff_python_ast-0.0.3/src/name.rs:15
+  = note: there are multiple different versions of crate `compact_str` in the
+          dependency graph
+```
+
+It is the same `get-size2` break that pins our own lockfile (§1): a fresh
+resolution picks `get-size2 0.10.3` → `compact_str 0.10`, while
+`ruff_python_ast 0.0.3` derives `GetSize` on `compact_str 0.9` fields. Binary
+crates publish their `Cargo.lock`, so `--locked` uses Monty's own known-good
+resolution:
+
+```bash
+cargo install monty-runtime --version 0.0.19 --locked
+```
+
+Consequences for the design:
+
+- The setup error must print the command **with `--locked`**. Printing it without
+  would send every user into a confusing upstream compile failure — the single
+  highest-value string in this feature.
+- Pin the version alongside `monty-pool`, since the wire protocol is version-tied (Q4).
+- CI installs the same way.
+
+Runtime tests **skip with a printed reason** when the binary is absent, the same
+pattern used for the Windows sandbox portability tests, so a contributor without
+it still gets a green, honest run.
 
 ### D5 — In-process path: removed, not feature-gated
 
@@ -248,10 +275,12 @@ design section adopted wholesale.
 ## 6. Risks and open questions
 
 - **Q1 — Worker binary as a deployment dependency.** The strongest objection to
-  this pivot. It is a Rust binary rather than a Python install, and obtainable via
-  `cargo install monty-runtime`, but it is still an artifact to ship and locate.
-  Weigh against: without it there is no crash isolation *and* no publishable
-  runtime.
+  this pivot, and measurably rougher than r2 first assumed: the plain
+  `cargo install monty-runtime` **does not compile** (see D4) and needs `--locked`.
+  It is a Rust binary rather than a Python install, but it is still an artifact to
+  build, ship, and locate, and the install has a sharp edge we must paper over in
+  our own error text. Weigh against: without it there is no crash isolation *and*
+  no publishable runtime.
 - **Q2 — Latency.** Per-step IPC plus checkout, versus an in-process call. Prewarmed
   workers (`min_processes`) amortize spawn cost; unmeasured, and worth measuring
   before defaults are fixed.
