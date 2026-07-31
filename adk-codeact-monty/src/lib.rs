@@ -81,8 +81,11 @@ mod os_access;
 mod prompt;
 mod runtime;
 
+pub mod setup;
+
 pub use os_access::{OsAccess, OsAccessBuilder, PathAccess};
 pub use runtime::{MontyRuntime, MontyRuntimeBuilder};
+pub use setup::{SetupError, WorkerBinary};
 
 /// Re-export of Monty's resource-limit configuration, for
 /// [`MontyRuntimeBuilder::resource_limits`].

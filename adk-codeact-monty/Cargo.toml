@@ -36,6 +36,7 @@ monty = "0.0.19"
 monty-types = "0.0.19"
 monty-fs = "0.0.19"
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 # `date.today()` / `datetime.now()` OS calls are serviced from the host clock
 # (see `os_access`). `clock` pulls in the local-timezone lookup. Kept explicit
 # with `default-features = false` because the workspace default enables `serde`,
