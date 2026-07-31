@@ -79,8 +79,8 @@ answers it, and this is the decision this spec makes.
 - **G2** Give the model **structured, CPython-style tracebacks** for failed scripts.
 - **G3** Expose a **workspace as a mounted virtual filesystem** with explicit
   read-only/read-write intent, composable with `adk-devtools::Workspace`.
-- **G4** Dispatch **concurrent tool calls** from a script through ADK's existing
-  concurrency policy rather than a second mechanism.
+- **G4** ~~Dispatch concurrent tool calls from a script.~~ **Withdrawn** — it
+  conflicts with the single-continuation durability guarantee (D4).
 - **G5** Support **lazy tool binding**, so a large toolset need not be rendered
   into every prompt.
 - **G6** Preserve stdout/stderr **identity and ordering**, and allow streaming.
@@ -128,10 +128,13 @@ support still return today's flat message.
 writing to it; it can write under a `ReadWrite` mount. Paths outside every mount
 are denied. Mount configuration is explicit — no implicit host-filesystem access.
 
-**R6 — Concurrent tool calls from a script.**
-*Acceptance:* a script awaiting two independent tool calls dispatches them under
-the agent's configured `ToolExecutionStrategy`, and results bind to the correct
-call ids regardless of completion order.
+**R6 — Concurrent tool calls from a script. — BLOCKED, see D4.**
+*Original acceptance:* a script awaiting two independent tool calls dispatches them
+under the agent's configured `ToolExecutionStrategy`, and results bind to the
+correct call ids regardless of completion order.
+*Status:* this requirement conflicts with an existing, deliberate design decision
+and must not be implemented as written. It is retained here only so the conflict
+is on the record; see D4 for the argument and the two honest options.
 
 **R7 — Lazy tool binding.**
 *Acceptance:* with lazy binding enabled, a tool not referenced by a script is
@@ -249,13 +252,48 @@ the same tree with the same intent. `OverlayState` is a follow-up (Q3): stage
 writes, then review or discard — attractive for an agent that should not mutate a
 repo in place.
 
-### D4 — Concurrent tool calls (R6)
+### D4 — Concurrent tool calls (R6) — **withdrawn as specified**
 
-`ResolveFutures` carries the set of pending `call_ids`. Map it to a `RunStep`
-variant carrying **many** `PendingCall`s, and dispatch them through the agent's
-existing `ToolExecutionStrategy` and `ToolConcurrencyManager` — the same policy
-that governs JSON tool calls, not a parallel one. Resume binds results by
-`call_id`, so completion order is irrelevant.
+The original plan was: map `ResolveFutures` (which carries a set of pending
+`call_ids`) to a `RunStep` variant holding **many** `PendingCall`s, and dispatch
+them through the agent's existing `ToolExecutionStrategy` /
+`ToolConcurrencyManager` rather than a second mechanism.
+
+**That contradicts a documented, deliberate decision.** `adk-agent`'s
+`codeact::runtime` module doc states the seam is *sequential by design*:
+
+> The seam is a *single continuation*: `RunStep::Call` surfaces exactly one
+> pending call … Tool execution is therefore strictly sequential, even if the
+> script's language supports `async`/threads.
+>
+> This is deliberate: durability rests on snapshotting *one* continuation at
+> *one* call boundary. Multiple in-flight calls would force a checkpoint to
+> capture partial completion (e.g. a long-running tool inside an
+> `asyncio.gather` alongside two finished tools), which has no clean
+> suspend/resume semantics. Concurrent host dispatch would require a different
+> seam (e.g. a multi-call step) and is intentionally out of scope.
+
+The objection is correct, and the failure it names is concrete: with N calls in
+flight and a suspend, the checkpoint must encode *which subset already completed
+and with what values*. `PendingCall::dump` has no representation for that, so a
+resumed run would either re-dispatch completed tools (double side effects) or
+lose their results. Concurrency here would be bought by weakening the durability
+guarantee that makes this runtime useful for long-running agents.
+
+**Two honest options, neither of which is "implement R6 as written":**
+
+1. **Keep sequential (recommended).** Accept that a script's `asyncio.gather` is
+   serialized at the call boundary, and say so in the CodeAct docs so the
+   behaviour is not a surprise. Cost: a script awaiting several slow tools pays
+   their sum, not their max.
+2. **Design a durable multi-call step first.** Requires extending the snapshot
+   format to record per-call completion state, plus a resume path that replays
+   only the outstanding calls. That is a larger change than everything else in
+   this spec combined, and it must be specified — with its own suspend/resume
+   semantics — before any code.
+
+Until option 2 is specified and accepted, `ResolveFutures` should continue to be
+serviced one call at a time.
 
 ### D5 — Lazy tool binding (R7)
 
@@ -314,6 +352,12 @@ preserved), **resource limit** (time/memory from `ResourceLimits`), and
   copy-on-write model before promising review-then-commit behavior.
 - **Q4 — Streaming print.** `PrintWriterCallback` interacts with the borrow of the
   output buffer during a suspendable run; deferred behind D6.
+- **Q6 — Concurrency vs durability (resolved: durability wins, for now).** R6/D4 as
+  first written would have traded the single-continuation durability guarantee for
+  script-level parallelism. Found by reading `codeact::runtime`'s module doc during
+  Phase 1 rather than by design review, which is itself a lesson: the constraint
+  was documented in the code and not in this spec. Recorded in D4; no work
+  proceeds on it.
 - **Q5 — Monty is `0.0.x`.** Every release is potentially breaking, and the
   `get-size2` pin is load-bearing. Sessions increase our coupling to Monty's
   serialized representation: **a snapshot is not portable across Monty versions.**
@@ -337,10 +381,12 @@ preserved), **resource limit** (time/memory from `ResourceLimits`), and
 - [ ] Monty projection from `MontyException::traceback()` (D2)
 - [ ] Ordered `ScriptOutput` via `collect_streams` (D6)
 
-**Phase 4 — sandbox + orchestration (R5, R6)**
+**Phase 4 — sandbox (R5)**
 - [ ] `WorkspaceMount`/`MountAccess` + builder wiring + allow/deny tests (D3)
 - [ ] Join with `adk_devtools::Workspace` in the coding-agent path (D3)
-- [ ] Multi-`PendingCall` step + dispatch via `ToolExecutionStrategy` (D4)
+- [ ] ~~Multi-`PendingCall` step + dispatch via `ToolExecutionStrategy`~~ — withdrawn,
+      see D4. Instead: document in `docs/official_docs/agents/code-agent.md` that
+      script-level `async`/`gather` is serialized at the call boundary, and why.
 
 **Phase 5 — lazy binding (R7)**
 - [ ] `NameLookup` resolution + `render_tools` summary mode + capability flag (D5)
@@ -354,6 +400,11 @@ preserved), **resource limit** (time/memory from `ResourceLimits`), and
 
 ## 9. Sequencing note
 
-Phases 1–3 are additive and behind defaults, so they are safe on a 2.0.x line.
-Phase 4's `ToolExecutionStrategy` reuse touches shared dispatch and wants its own
-review. Nothing here needs to precede the 2.0.0 tag.
+Phases 1–3 and 5 are additive and behind defaults, so they are safe on a 2.0.x
+line. Phase 4 grants a script filesystem reach it does not have today and wants
+its own security review. Nothing here needs to precede the 2.0.0 tag.
+
+The withdrawn D4 is the one place this spec was wrong on first writing: it
+proposed a capability the code had already considered and rejected, with the
+reasoning recorded in a module doc rather than here. Where a constraint is load
+bearing, it belongs in the spec.
