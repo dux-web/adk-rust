@@ -175,16 +175,31 @@ let agent = GraphAgent::builder("processor")
     .edge(START, "fetch")
     .edge("fetch", "transform")
     .edge("transform", END)
-    .checkpointer(SqliteCheckpointer::new("state.db").await?)
+    .checkpointer(SqliteCheckpointer::new("sqlite:state.db?mode=rwc").await?)
     .build()?;
 ```
 
 Features:
 - Cyclic graphs for ReAct patterns
-- Conditional routing
+- Conditional routing, and `with_goto` for a node that picks its own successor
 - State management with reducers
-- Checkpointing (memory, SQLite)
-- Human-in-the-loop interrupts
+- Checkpointing (memory, SQLite), delta checkpoints, and retention policies
+- Human-in-the-loop interrupts, before or after a node
+- Subgraphs — a compiled graph as a node, nested, with its own checkpoint thread
+- Per-node retry with capped backoff, node timeouts, and a concurrency bound
+- Time travel — step, fork, and state history
+
+The `SqliteCheckpointer` above needs the `graph-sqlite` feature. `adk-graph` has no
+default features, so each capability is forwarded from this crate:
+
+| Feature | Enables | In `full` |
+|---------|---------|-----------|
+| `graph-functional` | `#[entrypoint]`/`#[task]` functional API | yes |
+| `graph-node-cache` | node result caching with content keys | yes |
+| `graph-delta` | delta checkpoints | yes |
+| `graph-time-travel` | step, fork, and state history | yes |
+| `graph-sqlite` | the SQLite checkpointer | no — needs a database |
+| `graph-redis-cache` | Redis-backed node cache | no — needs a server |
 
 ## Browser Automation
 
