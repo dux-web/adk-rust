@@ -137,7 +137,7 @@ use adk_rust::Launcher;
 #[tokio::main]
 async fn main() -> AnyhowResult<()> {
     dotenvy::dotenv().ok();
-    let model = GeminiModel::new(&std::env::var("GOOGLE_API_KEY")?, "gemini-2.5-flash")?;
+    let model = GeminiModel::new(&std::env::var("GOOGLE_API_KEY")?, "gemini-3.1-flash-lite-preview")?;
 
     let agent = LlmAgentBuilder::new("assistant")
         .instruction("You are a helpful assistant. Be concise and accurate.")
