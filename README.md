@@ -18,10 +18,10 @@ and async, across 42 crates for agent orchestration.
 
 ### 🎬 Rust & Beyond Podcast — Episode 3: Agents That Act
 
-**ADK-Rust v2.0.0 — Agents That Act.** Eight chapters on what it takes for an agent
-to run on its own: carrying on after a crash, changing course when the problem
-changes, and the unglamorous half nobody demos. 42 crates. Subgraphs, durable
-resume, governed computer use.
+**ADK-Rust v2.0.0 — Agents That Act.** Eight chapters on agents that run on their
+own and finish what they start: a workflow that resumes exactly where it stopped,
+a graph that changes course when the problem does, and approvals you can trust
+down to the digest. 42 crates, 4,300+ tests, sub-millisecond loop overhead.
 
 <a href="https://www.youtube.com/watch?v=RIh-M0W1CiQ">
   <img src="docs/podcast/episode-3-thumbnail.png" alt="▶ Watch Episode 3: ADK-Rust v2.0.0 — Agents That Act" width="100%">
@@ -43,8 +43,8 @@ resume, governed computer use.
   when the parent compiles rather than as an absent value at run time
 - **Deciding At Run Time** — `run_node_with` for work whose size comes from state, and
   `with_goto` for a node that picks its own successor with no edge declared
-- **The Unglamorous Half** — retries with capped backoff, concurrency bounds, node
-  timeouts, and checkpoint retention so a week-long thread stops growing
+- **Built To Run Unattended** — retries with capped backoff, concurrency bounds,
+  node timeouts, and checkpoint retention that keeps a week-long thread steady
 - **Governed Computer Use** — approval interrupts bound to a digest, so what you
   approved is what runs
 - **What It Costs** — no automatic crash recovery, an unbounded child ledger, and why
