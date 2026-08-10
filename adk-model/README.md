@@ -542,7 +542,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `gemini-2.5-pro` | Advanced reasoning and multimodal understanding |
 | `gemini-2.5-flash` | Balanced speed and capability (recommended) |
 | `gemini-2.5-flash-lite` | Ultra-fast for high-volume tasks |
-| `gemini-2.0-flash` | Previous generation (retiring March 2026) |
+| `gemini-2.0-flash` | Shut down 31 March 2026 — do not use |
 
 See [Gemini models documentation](https://ai.google.dev/gemini-api/docs/models/gemini) for the full list.
 
