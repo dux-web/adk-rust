@@ -482,7 +482,7 @@ fn parse_finish_reason(fr: &str) -> FinishReason {
 
 /// Parse usage metadata from a raw SSE chunk JSON value.
 fn parse_usage_from_chunk(chunk: &serde_json::Value) -> Option<UsageMetadata> {
-    let u = chunk.get("usage")?;
+    let u = chunk.get("usage")?.as_object()?;
     let prompt_tokens = u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     let completion_tokens = u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     let total_tokens = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
@@ -595,6 +595,7 @@ impl Llm for OpenAICompatible {
                 let mut tool_call_accumulators: HashMap<u32, (String, String, String)> =
                     HashMap::new();
                 let mut text_tool_buffer = crate::tool_call_parser::ToolCallBuffer::new();
+                let mut pending_final_response: Option<LlmResponse> = None;
 
                 while let Some(chunk_result) = byte_stream.next().await {
                     let chunk = chunk_result.map_err(|e| {
@@ -608,7 +609,14 @@ impl Llm for OpenAICompatible {
                         let line = buffer[..line_end].trim().to_string();
                         buffer = buffer[line_end + 1..].to_string();
 
-                        if line.is_empty() || line == "data: [DONE]" {
+                        if line.is_empty() {
+                            continue;
+                        }
+
+                        if line == "data: [DONE]" {
+                            if let Some(response) = pending_final_response.take() {
+                                yield response;
+                            }
                             continue;
                         }
 
@@ -622,10 +630,19 @@ impl Llm for OpenAICompatible {
                                     continue;
                                 }
                             };
+                            let usage_metadata = parse_usage_from_chunk(&chunk_json);
 
                             let choice = match chunk_json.get("choices").and_then(|c| c.get(0)) {
                                 Some(c) => c,
-                                None => continue,
+                                None => {
+                                    if let Some(usage_metadata) = usage_metadata
+                                        && let Some(mut response) = pending_final_response.take()
+                                    {
+                                        response.usage_metadata = Some(usage_metadata);
+                                        yield response;
+                                    }
+                                    continue;
+                                }
                             };
                             let delta = match choice.get("delta") {
                                 Some(d) => d,
@@ -673,7 +690,6 @@ impl Llm for OpenAICompatible {
                             // Check for finish_reason → emit final response.
                             if let Some(ref fr) = finish_reason_str {
                                 let finish_reason = Some(parse_finish_reason(fr));
-                                let usage_metadata = parse_usage_from_chunk(&chunk_json);
 
                                 // Emit accumulated tool calls if any.
                                 if !tool_call_accumulators.is_empty() {
@@ -696,7 +712,7 @@ impl Llm for OpenAICompatible {
                                         })
                                         .collect();
 
-                                    yield LlmResponse {
+                                    let response = LlmResponse {
                                         content: Some(Content {
                                             role: "model".to_string(),
                                             parts,
@@ -714,6 +730,11 @@ impl Llm for OpenAICompatible {
                                         provider_metadata: None,
                                         interaction_id: None,
                                     };
+                                    if response.usage_metadata.is_some() {
+                                        yield response;
+                                    } else {
+                                        pending_final_response = Some(response);
+                                    }
                                     continue;
                                 }
 
@@ -724,7 +745,7 @@ impl Llm for OpenAICompatible {
                                         parts.push(Part::Text { text: text.to_string() });
                                     }
 
-                                yield LlmResponse {
+                                let response = LlmResponse {
                                     content: if parts.is_empty() { None } else {
                                         Some(Content {
                                             role: "model".to_string(),
@@ -742,6 +763,11 @@ impl Llm for OpenAICompatible {
                                     provider_metadata: None,
                                     interaction_id: None,
                                 };
+                                if response.usage_metadata.is_some() {
+                                    yield response;
+                                } else {
+                                    pending_final_response = Some(response);
+                                }
                                 continue;
                             }
 
@@ -807,6 +833,10 @@ impl Llm for OpenAICompatible {
                                 }
                         }
                     }
+                }
+
+                if let Some(response) = pending_final_response.take() {
+                    yield response;
                 }
 
                 // Flush any remaining buffered content from the tool call buffer

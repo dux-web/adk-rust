@@ -102,7 +102,7 @@ mod streaming_exploration {
         let sse_body = [
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n",
-            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
             "data: [DONE]\n\n",
         ]
         .join("");
@@ -153,6 +153,52 @@ mod streaming_exploration {
         let final_resp = responses.last().unwrap();
         assert!(!final_resp.partial, "final response should have partial=false");
         assert!(final_resp.turn_complete, "final response should have turn_complete=true");
+    }
+
+    #[tokio::test]
+    async fn usage_only_chunk_is_attached_to_the_terminal_response() {
+        let server = MockServer::start().await;
+
+        let sse_body = [
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16}}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        .join("");
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(&sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server.uri());
+        let mut stream = client
+            .generate_content(make_request(), true)
+            .await
+            .expect("generate_content should not error");
+        let mut responses = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            responses.push(item.expect("stream should not yield an error"));
+        }
+
+        let terminal_responses: Vec<_> =
+            responses.iter().filter(|response| response.turn_complete).collect();
+        assert_eq!(terminal_responses.len(), 1);
+        let usage = terminal_responses[0]
+            .usage_metadata
+            .as_ref()
+            .expect("usage-only chunk should be attached to the terminal response");
+        assert_eq!(usage.prompt_token_count, 11);
+        assert_eq!(usage.candidates_token_count, 5);
+        assert_eq!(usage.total_token_count, 16);
     }
 
     // ── Test 3: reasoning_content chunks yield Part::Thinking ────────────
@@ -249,8 +295,9 @@ mod streaming_exploration {
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\"\"}}]},\"finish_reason\":null}]}\n\n",
             // Third chunk: tool call index 0, more argument fragment
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\": \\\"Paris\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
-            // Finish chunk
-            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":15,\"total_tokens\":25}}\n\n",
+            // Finish chunk followed by the usage-only chunk required by the OpenAI stream contract.
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":15,\"total_tokens\":25}}\n\n",
             "data: [DONE]\n\n",
         ]
         .join("");
@@ -316,6 +363,13 @@ mod streaming_exploration {
             "final response carrying tool calls must have turn_complete=false — the turn \
              continues until tool results are processed (issue #401)"
         );
+        let usage = final_resp
+            .usage_metadata
+            .as_ref()
+            .expect("usage-only chunk should be attached to the tool-call response");
+        assert_eq!(usage.prompt_token_count, 10);
+        assert_eq!(usage.candidates_token_count, 15);
+        assert_eq!(usage.total_token_count, 25);
     }
 
     /// Regression test for providers using "delta.reasoning" field instead of "delta.reasoning_content"

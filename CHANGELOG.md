@@ -60,6 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a structured error, and grounding responses surface
   `retrievedContext` including `ragChunk` provenance.
 
+### Fixed
+
+- **OpenAI-compatible streaming usage** (`adk-model`): usage-only terminal
+  chunks with empty `choices` attach token counts to the final response.
+
 ## [2.1.0] - 2026-08-25
 
 ### Added
