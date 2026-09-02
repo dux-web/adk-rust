@@ -32,7 +32,7 @@ pub trait Tool: Send + Sync {
     ///         "name": self.name(),
     ///         "description": self.description(),
     ///         "x-adk-openai-tool": {
-    ///             "type": "web_search_2025_08_26"
+    ///             "type": "web_search"
     ///         }
     ///     })
     /// }

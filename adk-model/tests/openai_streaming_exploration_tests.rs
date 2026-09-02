@@ -372,6 +372,106 @@ mod streaming_exploration {
         assert_eq!(usage.total_token_count, 25);
     }
 
+    #[tokio::test]
+    async fn structured_tool_call_arguments_are_preserved() {
+        let server = MockServer::start().await;
+
+        let sse_body = [
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"arguments\":{\"command\":\"printf 'OK\\\\n'\"}}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":15,\"total_tokens\":25}}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        .join("");
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(&sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server.uri());
+        let mut stream = client
+            .generate_content(make_request(), true)
+            .await
+            .expect("generate_content should not error");
+
+        let mut function_call = None;
+        while let Some(item) = stream.next().await {
+            let response = item.expect("stream should not yield an error");
+            function_call = response
+                .content
+                .as_ref()
+                .into_iter()
+                .flat_map(|content| &content.parts)
+                .find_map(|part| match part {
+                    Part::FunctionCall { name, args, id, .. } => {
+                        Some((name.clone(), args.clone(), id.clone()))
+                    }
+                    _ => None,
+                })
+                .or(function_call);
+        }
+
+        let (name, args, id) = function_call.expect("expected a function call");
+        assert_eq!(name, "run_command");
+        assert_eq!(args["command"], "printf 'OK\\n'");
+        assert_eq!(id.as_deref(), Some("call_abc"));
+    }
+
+    #[tokio::test]
+    async fn repeated_structured_tool_call_snapshots_do_not_corrupt_arguments() {
+        let server = MockServer::start().await;
+
+        let sse_body = [
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"arguments\":{\"command\":\"printf 'OK\\\\n'\"}}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":{}}}]},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        .join("");
+
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(&sse_body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = make_client(&server.uri());
+        let mut stream = client
+            .generate_content(make_request(), true)
+            .await
+            .expect("generate_content should not error");
+
+        let mut function_call = None;
+        while let Some(item) = stream.next().await {
+            let response = item.expect("stream should not yield an error");
+            function_call = response
+                .content
+                .as_ref()
+                .into_iter()
+                .flat_map(|content| &content.parts)
+                .find_map(|part| match part {
+                    Part::FunctionCall { args, .. } => Some(args.clone()),
+                    _ => None,
+                })
+                .or(function_call);
+        }
+
+        let args = function_call.expect("expected a function call");
+        assert_eq!(args["command"], "printf 'OK\\n'");
+    }
+
     /// Regression test for providers using "delta.reasoning" field instead of "delta.reasoning_content"
     /// (OpenRouter, Kilo Gateway, SambaNova, Cerebras, Groq).
     /// Without the fallback fix, this test would fail — reasoning silently dropped in streaming.

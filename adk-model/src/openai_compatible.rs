@@ -480,6 +480,22 @@ fn parse_finish_reason(fr: &str) -> FinishReason {
     }
 }
 
+/// Accumulate string deltas while treating structured values as complete snapshots.
+fn append_tool_call_arguments(accumulator: &mut String, arguments: &serde_json::Value) {
+    match arguments {
+        serde_json::Value::String(fragment) => accumulator.push_str(fragment),
+        serde_json::Value::Null => {}
+        structured => {
+            let empty_snapshot = matches!(structured, serde_json::Value::Object(fields) if fields.is_empty())
+                || matches!(structured, serde_json::Value::Array(items) if items.is_empty());
+            if accumulator.is_empty() || !empty_snapshot {
+                accumulator.clear();
+                accumulator.push_str(&structured.to_string());
+            }
+        }
+    }
+}
+
 /// Parse usage metadata from a raw SSE chunk JSON value.
 fn parse_usage_from_chunk(chunk: &serde_json::Value) -> Option<UsageMetadata> {
     let u = chunk.get("usage")?.as_object()?;
@@ -678,10 +694,8 @@ impl Llm for OpenAICompatible {
                                         if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
                                             entry.1 = name.to_string();
                                         }
-                                        if let Some(args_chunk) =
-                                            func.get("arguments").and_then(|v| v.as_str())
-                                        {
-                                            entry.2.push_str(args_chunk);
+                                        if let Some(arguments) = func.get("arguments") {
+                                            append_tool_call_arguments(&mut entry.2, arguments);
                                         }
                                     }
                                 }

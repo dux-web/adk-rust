@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenAI-compatible structured tool arguments** (`adk-model`): Chat
+  Completions streaming now preserves structured JSON `function.arguments`
+  emitted by compatible intermediaries, including repeated and empty snapshot
+  chunks, instead of converting the tool call to empty arguments.
+- **OpenAI Responses web search** (`adk-tool`): the stable built-in tool now
+  serializes as `web_search`, matching the OpenAI Responses API. The explicit
+  preview variant remains `web_search_preview_2025_03_11`. URL annotations from
+  response text are preserved as ADK citation metadata. Open Responses mode now
+  also accepts compatible endpoints that omit output-message IDs, statuses, or
+  empty `output_text.annotations`, and reconstructs final function arguments
+  from their streaming events when the completed response omits them.
+
 ## [2.2.0] - 2026-09-01
 
 ### Added

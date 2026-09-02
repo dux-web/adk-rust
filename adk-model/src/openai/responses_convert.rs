@@ -5,11 +5,11 @@
 
 use crate::attachment;
 use adk_core::{
-    AdkError, Content, ErrorCategory, ErrorComponent, FinishReason, LlmRequest, LlmResponse, Part,
-    UsageMetadata,
+    AdkError, CitationMetadata, CitationSource, Content, ErrorCategory, ErrorComponent,
+    FinishReason, LlmRequest, LlmResponse, Part, UsageMetadata,
 };
 use async_openai::types::responses::{
-    ApplyPatchToolCallItemParam, ApplyPatchToolCallOutputItemParam, ConversationParam,
+    Annotation, ApplyPatchToolCallItemParam, ApplyPatchToolCallOutputItemParam, ConversationParam,
     CreateResponse, CreateResponseArgs, EasyInputContent, EasyInputMessage, FunctionCallOutput,
     FunctionCallOutputItemParam, FunctionShellCallItemParam, FunctionShellCallOutputItemParam,
     FunctionTool, FunctionToolCall, IncludeEnum, InputContent, InputImageContent, InputItem,
@@ -588,12 +588,53 @@ pub fn from_response(response: &Response) -> LlmResponse {
     let usage_metadata = response.usage.as_ref().map(convert_usage);
     let finish_reason = map_finish_reason(response);
     let provider_metadata = build_provider_metadata(response);
+    let citation_sources = response
+        .output
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::Message(message) => Some(&message.content),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|content| match content {
+            OutputMessageContent::OutputText(text) => Some(&text.annotations),
+            OutputMessageContent::Refusal(_) => None,
+        })
+        .flatten()
+        .filter_map(|annotation| match annotation {
+            Annotation::UrlCitation(citation) => {
+                let value = serde_json::to_value(citation).ok()?;
+                Some(CitationSource {
+                    uri: value.get("url").and_then(serde_json::Value::as_str).map(str::to_owned),
+                    title: value
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    start_index: value
+                        .get("start_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|index| i32::try_from(index).ok()),
+                    end_index: value
+                        .get("end_index")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|index| i32::try_from(index).ok()),
+                    license: None,
+                    publication_date: None,
+                })
+            }
+            Annotation::FileCitation(_)
+            | Annotation::ContainerFileCitation(_)
+            | Annotation::FilePath(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let citation_metadata =
+        (!citation_sources.is_empty()).then_some(CitationMetadata { citation_sources });
 
     LlmResponse {
         content,
         usage_metadata,
         finish_reason,
-        citation_metadata: None,
+        citation_metadata,
         partial: false,
         turn_complete: true,
         interrupted: false,
@@ -1060,7 +1101,7 @@ mod tests {
             "openai_web_search".to_string(),
             serde_json::json!({
                 "x-adk-openai-tool": {
-                    "type": "web_search_2025_08_26"
+                    "type": "web_search"
                 }
             }),
         );
@@ -1360,7 +1401,7 @@ mod tests {
             "openai".to_string(),
             serde_json::json!({
                 "built_in_tools": [
-                    { "type": "web_search_2025_08_26" },
+                    { "type": "web_search" },
                     { "type": "image_generation", "size": "1024x1024", "quality": "high" }
                 ]
             }),
@@ -1414,7 +1455,7 @@ mod tests {
                 "prompt_cache_retention": "24h",
                 "service_tier": "priority",
                 "built_in_tools": [
-                    { "type": "web_search_2025_08_26" }
+                    { "type": "web_search" }
                 ]
             }),
         );
@@ -1469,6 +1510,56 @@ mod tests {
         let metadata = llm_response.provider_metadata.expect("metadata should exist");
         assert_eq!(metadata["openai"]["response_id"], "resp_status_test");
         assert_eq!(metadata["openai"]["status"], "completed");
+    }
+
+    #[test]
+    fn test_from_response_maps_url_citations() {
+        let response: Response = serde_json::from_value(serde_json::json!({
+            "id": "resp_citation_test",
+            "object": "response",
+            "created_at": 0,
+            "model": "gpt-5.4",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_citation_test",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": "OpenAI",
+                    "annotations": [{
+                        "type": "url_citation",
+                        "start_index": 0,
+                        "end_index": 6,
+                        "title": "OpenAI",
+                        "url": "https://openai.com"
+                    }]
+                }]
+            }],
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": { "cached_tokens": 0 },
+                "output_tokens": 5,
+                "output_tokens_details": { "reasoning_tokens": 0 },
+                "total_tokens": 15
+            }
+        }))
+        .expect("response should deserialize");
+
+        let llm_response = from_response(&response);
+        let citations = llm_response.citation_metadata.expect("citation metadata should exist");
+        assert_eq!(
+            citations.citation_sources,
+            vec![adk_core::CitationSource {
+                uri: Some("https://openai.com".to_string()),
+                title: Some("OpenAI".to_string()),
+                start_index: Some(0),
+                end_index: Some(6),
+                license: None,
+                publication_date: None,
+            }]
+        );
     }
 
     #[test]
