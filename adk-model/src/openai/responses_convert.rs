@@ -231,8 +231,10 @@ fn content_to_input_items(content: &Content) -> Vec<InputItem> {
 /// If the type is not recognized (e.g., `tool_search`, `skill`), the tool falls back to
 /// being treated as a regular function tool.
 pub fn convert_tools(tools: &HashMap<String, serde_json::Value>) -> Result<Vec<Tool>, AdkError> {
+    let mut tools = tools.iter().collect::<Vec<_>>();
+    tools.sort_unstable_by_key(|(name, _)| *name);
     tools
-        .iter()
+        .into_iter()
         .map(|(name, decl)| {
             if let Some(provider_tool) = decl.get("x-adk-openai-tool") {
                 convert_native_tool(name, decl, provider_tool)
@@ -1006,6 +1008,29 @@ mod tests {
         assert_eq!(converted.len(), 1);
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
         assert_eq!(value["type"], "local_shell");
+    }
+
+    #[test]
+    fn convert_tools_has_deterministic_name_order() {
+        for _ in 0..32 {
+            let tools = HashMap::from([
+                ("zeta".to_string(), serde_json::json!({})),
+                ("alpha".to_string(), serde_json::json!({})),
+                ("middle".to_string(), serde_json::json!({})),
+            ]);
+            let names = convert_tools(&tools)
+                .expect("tool conversion should succeed")
+                .into_iter()
+                .map(|tool| {
+                    serde_json::to_value(tool).expect("tool should serialize")["name"]
+                        .as_str()
+                        .expect("function tool should have a name")
+                        .to_string()
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(names, ["alpha", "middle", "zeta"]);
+        }
     }
 
     #[test]

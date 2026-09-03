@@ -239,8 +239,10 @@ pub fn convert_tools(
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
 ) -> Vec<ChatCompletionTools> {
+    let mut tools = tools.iter().collect::<Vec<_>>();
+    tools.sort_unstable_by_key(|(name, _)| *name);
     tools
-        .iter()
+        .into_iter()
         .map(|(name, decl)| {
             let description = decl.get("description").and_then(|d| d.as_str()).map(String::from);
 
@@ -852,6 +854,30 @@ mod tests {
             assert_eq!(tool.function.name, "get_weather");
         } else {
             panic!("Expected Function variant");
+        }
+    }
+
+    #[test]
+    fn convert_tools_has_deterministic_name_order() {
+        use super::super::schema_adapter::OpenAiSchemaAdapter;
+
+        let adapter = OpenAiSchemaAdapter;
+        let cache = SchemaCache::for_adapter(std::sync::Arc::new(OpenAiSchemaAdapter));
+        for _ in 0..32 {
+            let tools = HashMap::from([
+                ("zeta".to_string(), serde_json::json!({})),
+                ("alpha".to_string(), serde_json::json!({})),
+                ("middle".to_string(), serde_json::json!({})),
+            ]);
+            let names = convert_tools(&tools, &adapter, &cache)
+                .into_iter()
+                .map(|tool| match tool {
+                    ChatCompletionTools::Function(tool) => tool.function.name,
+                    ChatCompletionTools::Custom(_) => panic!("expected a function tool"),
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(names, ["alpha", "middle", "zeta"]);
         }
     }
 
