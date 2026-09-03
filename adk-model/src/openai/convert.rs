@@ -350,6 +350,36 @@ pub fn from_openai_response(resp: &CreateChatCompletionResponse) -> LlmResponse 
     }
 }
 
+/// Normalize one raw Chat Completions `usage` object while retaining the
+/// provider payload for diagnostics and future provider-specific projections.
+pub(crate) fn usage_metadata_from_raw(usage: &serde_json::Value) -> Option<UsageMetadata> {
+    let usage = usage.as_object()?;
+    let prompt_details = usage.get("prompt_tokens_details");
+    let completion_details = usage.get("completion_tokens_details");
+
+    Some(UsageMetadata {
+        prompt_token_count: json_i32(usage.get("prompt_tokens")).unwrap_or_default(),
+        candidates_token_count: json_i32(usage.get("completion_tokens")).unwrap_or_default(),
+        total_token_count: json_i32(usage.get("total_tokens")).unwrap_or_default(),
+        cache_read_input_token_count: prompt_details
+            .and_then(|details| json_i32(details.get("cached_tokens"))),
+        cache_creation_input_token_count: prompt_details
+            .and_then(|details| json_i32(details.get("cache_write_tokens"))),
+        thinking_token_count: completion_details
+            .and_then(|details| json_i32(details.get("reasoning_tokens"))),
+        audio_input_token_count: prompt_details
+            .and_then(|details| json_i32(details.get("audio_tokens"))),
+        audio_output_token_count: completion_details
+            .and_then(|details| json_i32(details.get("audio_tokens"))),
+        provider_usage: Some(serde_json::Value::Object(usage.clone())),
+        ..Default::default()
+    })
+}
+
+fn json_i32(value: Option<&serde_json::Value>) -> Option<i32> {
+    i32::try_from(value?.as_i64()?).ok()
+}
+
 /// Convert a raw OpenAI JSON response to ADK LlmResponse.
 ///
 /// Unlike [`from_openai_response`], this parses the raw JSON directly so it can
@@ -412,38 +442,7 @@ pub fn from_raw_openai_response(json: &serde_json::Value) -> LlmResponse {
     });
 
     // Parse usage metadata
-    let usage_metadata = json.get("usage").map(|u| {
-        let prompt_tokens = u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let completion_tokens =
-            u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let total_tokens = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-
-        let prompt_details = u.get("prompt_tokens_details");
-        let completion_details = u.get("completion_tokens_details");
-
-        UsageMetadata {
-            prompt_token_count: prompt_tokens,
-            candidates_token_count: completion_tokens,
-            total_token_count: total_tokens,
-            cache_read_input_token_count: prompt_details
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32),
-            thinking_token_count: completion_details
-                .and_then(|d| d.get("reasoning_tokens"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32),
-            audio_input_token_count: prompt_details
-                .and_then(|d| d.get("audio_tokens"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32),
-            audio_output_token_count: completion_details
-                .and_then(|d| d.get("audio_tokens"))
-                .and_then(|v| v.as_i64())
-                .map(|v| v as i32),
-            ..Default::default()
-        }
-    });
+    let usage_metadata = json.get("usage").and_then(usage_metadata_from_raw);
 
     // Parse finish reason
     let finish_reason =
@@ -786,6 +785,45 @@ mod tests {
         let usage = resp.usage_metadata.unwrap();
         assert_eq!(usage.prompt_token_count, 5);
         assert_eq!(usage.candidates_token_count, 3);
+    }
+
+    #[test]
+    fn raw_response_preserves_complete_provider_usage() {
+        let provider_usage = serde_json::json!({
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "total_tokens": 150,
+            "prompt_tokens_details": {
+                "cached_tokens": 80,
+                "cache_write_tokens": 12,
+                "audio_tokens": 4
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 18,
+                "audio_tokens": 2
+            },
+            "provider_meter": {"units": 9}
+        });
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }],
+            "usage": provider_usage.clone()
+        });
+
+        let response = from_raw_openai_response(&json);
+        let usage = response.usage_metadata.expect("usage should be parsed");
+
+        assert_eq!(usage.prompt_token_count, 120);
+        assert_eq!(usage.candidates_token_count, 30);
+        assert_eq!(usage.total_token_count, 150);
+        assert_eq!(usage.cache_read_input_token_count, Some(80));
+        assert_eq!(usage.cache_creation_input_token_count, Some(12));
+        assert_eq!(usage.thinking_token_count, Some(18));
+        assert_eq!(usage.audio_input_token_count, Some(4));
+        assert_eq!(usage.audio_output_token_count, Some(2));
+        assert_eq!(usage.provider_usage, Some(provider_usage));
     }
 
     #[test]

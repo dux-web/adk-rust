@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenAI-compatible usage metadata** (`adk-model`): Chat Completions
+  streaming and non-streaming responses now use one normalization path,
+  preserve the complete provider-native `usage` object in `provider_usage`,
+  and project reported cache-write tokens alongside cache reads.
+
 ## [2.2.0] - 2026-09-01
 
 ### Added

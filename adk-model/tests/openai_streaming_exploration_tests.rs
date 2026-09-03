@@ -162,7 +162,7 @@ mod streaming_exploration {
         let sse_body = [
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":null}\n\n",
-            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16}}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":5,\"total_tokens\":16,\"prompt_tokens_details\":{\"cached_tokens\":7,\"cache_write_tokens\":2},\"provider_meter\":{\"units\":3}}}\n\n",
             "data: [DONE]\n\n",
         ]
         .join("");
@@ -199,6 +199,21 @@ mod streaming_exploration {
         assert_eq!(usage.prompt_token_count, 11);
         assert_eq!(usage.candidates_token_count, 5);
         assert_eq!(usage.total_token_count, 16);
+        assert_eq!(usage.cache_read_input_token_count, Some(7));
+        assert_eq!(usage.cache_creation_input_token_count, Some(2));
+        assert_eq!(
+            usage.provider_usage,
+            Some(serde_json::json!({
+                "prompt_tokens": 11,
+                "completion_tokens": 5,
+                "total_tokens": 16,
+                "prompt_tokens_details": {
+                    "cached_tokens": 7,
+                    "cache_write_tokens": 2
+                },
+                "provider_meter": {"units": 3}
+            }))
+        );
     }
 
     // ── Test 3: reasoning_content chunks yield Part::Thinking ────────────
