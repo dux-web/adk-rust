@@ -498,36 +498,7 @@ fn append_tool_call_arguments(accumulator: &mut String, arguments: &serde_json::
 
 /// Parse usage metadata from a raw SSE chunk JSON value.
 fn parse_usage_from_chunk(chunk: &serde_json::Value) -> Option<UsageMetadata> {
-    let u = chunk.get("usage")?.as_object()?;
-    let prompt_tokens = u.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let completion_tokens = u.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-    let total_tokens = u.get("total_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-
-    let prompt_details = u.get("prompt_tokens_details");
-    let completion_details = u.get("completion_tokens_details");
-
-    Some(UsageMetadata {
-        prompt_token_count: prompt_tokens,
-        candidates_token_count: completion_tokens,
-        total_token_count: total_tokens,
-        cache_read_input_token_count: prompt_details
-            .and_then(|d| d.get("cached_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        thinking_token_count: completion_details
-            .and_then(|d| d.get("reasoning_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        audio_input_token_count: prompt_details
-            .and_then(|d| d.get("audio_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        audio_output_token_count: completion_details
-            .and_then(|d| d.get("audio_tokens"))
-            .and_then(|v| v.as_i64())
-            .map(|v| v as i32),
-        ..Default::default()
-    })
+    chunk.get("usage").and_then(convert::usage_metadata_from_raw)
 }
 
 #[async_trait]
