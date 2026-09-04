@@ -886,7 +886,7 @@ cargo publish -p <crate-name>
 - `McpServerManager` — lifecycle management for multiple MCP server processes with auto-restart
 - Graph durable resume: `PregelExecutor` resumes from last checkpoint on startup
 - `ServerBuilder` — register custom Axum controllers alongside built-in routes
-- `ToolExecutionStrategy` — `Sequential`, `Parallel`, `ParallelDelegations`, or `Auto` dispatch for tool calls
+- `ToolExecutionStrategy` — `Sequential`, `Parallel`, or `Auto` dispatch for tool calls
 - `StatefulTool<S>` — generic wrapper for stateful tool closures
 - `SimpleToolContext` — lightweight context for non-agent callers (testing, MCP servers)
 - `SchemaAdapter` trait — provider-aware schema normalization (Gemini, OpenAI strict/non-strict, Anthropic, Generic)

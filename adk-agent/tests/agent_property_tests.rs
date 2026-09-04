@@ -140,7 +140,6 @@ fn arb_tool_execution_strategy() -> impl Strategy<Value = ToolExecutionStrategy>
     prop_oneof![
         Just(ToolExecutionStrategy::Sequential),
         Just(ToolExecutionStrategy::Parallel),
-        Just(ToolExecutionStrategy::ParallelDelegations),
         Just(ToolExecutionStrategy::Auto),
     ]
 }
@@ -340,9 +339,7 @@ proptest! {
                 ToolExecutionStrategy::Sequential => {
                     Arc::new(SequentialAgent::new("seq_orchestrator", sub_agents))
                 }
-                ToolExecutionStrategy::Parallel
-                | ToolExecutionStrategy::ParallelDelegations
-                | ToolExecutionStrategy::Auto => {
+                ToolExecutionStrategy::Parallel | ToolExecutionStrategy::Auto => {
                     Arc::new(ParallelAgent::new("par_orchestrator", sub_agents))
                 }
             };

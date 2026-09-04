@@ -68,7 +68,7 @@ pub trait Tool: Send + Sync {
 
 `ToolExecutionStrategy::Auto` includes a call in its concurrent subset only when the selected tool returns `true` from both `is_read_only()` and `is_concurrency_safe()`. It runs that safe subset first, then executes the remaining calls sequentially. Both methods default to `false`, so existing implementations remain sequential.
 
-`ToolExecutionStrategy::ParallelDelegations` overlaps only consecutive tools that return `true` from `is_agent_delegation()`. Ordinary tools keep their original sequential phase ordering.
+Agent implementations may use `is_agent_delegation()` to identify consecutive delegation calls that can overlap without parallelizing ordinary tools.
 
 ### Toolset
 
@@ -360,12 +360,11 @@ Controls how multiple tool calls from a single LLM response are dispatched:
 pub enum ToolExecutionStrategy {
     Sequential,  // One at a time, in order (default)
     Parallel,    // All concurrently; caller owns safety
-    ParallelDelegations, // Consecutive agent delegations concurrently
     Auto,        // Safe read-only subset concurrently, then the rest sequentially
 }
 ```
 
-Set per-agent via `LlmAgentBuilder::tool_execution_strategy()`. `Parallel` is an explicit override that does not inspect tool metadata. `ParallelDelegations` is intended for routed teams that may dispatch several independent subagents from one model response without also parallelizing ordinary tools.
+Set per-agent via `LlmAgentBuilder::tool_execution_strategy()`. `Parallel` is an explicit override that does not inspect tool metadata.
 
 ## Related Crates
 

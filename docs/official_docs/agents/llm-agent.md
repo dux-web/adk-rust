@@ -537,7 +537,8 @@ Intercept agent behavior:
 | `output_key(key)` | Saves response to state |
 | `include_contents(mode)` | History visibility |
 | `max_iterations(n)` | Maximum LLM round-trips (default: 100) |
-| `tool_execution_strategy(strategy)` | Tool dispatch mode: `Sequential`, `Parallel`, `ParallelDelegations`, or `Auto` |
+| `tool_execution_strategy(strategy)` | Tool dispatch mode: `Sequential`, `Parallel`, or `Auto` |
+| `parallelize_agent_delegations(bool)` | Overlap consecutive agent-delegation calls without parallelizing ordinary tools |
 | `default_retry_budget(RetryBudget)` | Retry failed tools up to N times with delay |
 | `tool_retry_budget(name, RetryBudget)` | Per-tool retry override |
 | `circuit_breaker_threshold(u32)` | Disable tool after N consecutive failures |
@@ -641,16 +642,16 @@ let agent = LlmAgentBuilder::new("fast_agent")
     .build()?;
 ```
 
-Four strategies are available:
+Three strategies are available:
 
 - `Sequential` (default) — tools execute one at a time in LLM order
 - `Parallel` — all tools execute concurrently; this explicit override bypasses safety metadata, so the caller owns safety
-- `ParallelDelegations` — consecutive agent-delegation tools execute concurrently while ordinary tools remain sequential in their original phases
 - `Auto` — calls whose tools are both read-only and concurrency-safe run concurrently first; all remaining calls then run sequentially
 
 Results are always returned in the original LLM order regardless of strategy. Failed tools produce a JSON error response without aborting the batch.
 
 The strategy is set per-agent via `LlmAgentBuilder::tool_execution_strategy()`. If not set, the default is `Sequential`.
+Use `LlmAgentBuilder::parallelize_agent_delegations(true)` when only consecutive agent-delegation calls should overlap. Ordinary tools remain sequential and keep their original phase ordering.
 
 ## Tool Resilience
 

@@ -816,7 +816,7 @@ async fn test_parallel_delegations_only_overlaps_consecutive_agent_tools() {
         .model(model.clone())
         .tool(delegate_tool)
         .tool(ordinary_tool)
-        .tool_execution_strategy(adk_core::ToolExecutionStrategy::ParallelDelegations)
+        .parallelize_agent_delegations(true)
         .build()
         .unwrap();
 

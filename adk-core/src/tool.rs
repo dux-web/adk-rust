@@ -122,9 +122,9 @@ pub trait Tool: Send + Sync {
 
     /// Indicates whether this tool delegates work to another agent.
     ///
-    /// [`ToolExecutionStrategy::ParallelDelegations`] uses this marker to
-    /// overlap consecutive delegation calls while preserving sequential
-    /// execution for ordinary tools.
+    /// Agent implementations can use this marker to overlap consecutive
+    /// delegation calls while preserving sequential execution for ordinary
+    /// tools.
     fn is_agent_delegation(&self) -> bool {
         false
     }
@@ -330,10 +330,6 @@ pub enum ToolExecutionStrategy {
     /// This is an explicit caller override. The caller is responsible for
     /// ensuring every selected tool is safe to execute concurrently.
     Parallel,
-    /// Execute consecutive agent-delegation calls concurrently while keeping
-    /// ordinary tools sequential and preserving their position in the call
-    /// sequence.
-    ParallelDelegations,
     /// Execute calls whose tools report both read-only and concurrency-safe
     /// concurrently, then execute all remaining calls sequentially.
     Auto,
