@@ -3251,6 +3251,45 @@ impl Agent for LlmAgent {
                                     .collect()
                                     .await
                                 }
+                                ToolExecutionStrategy::ParallelDelegations => {
+                                    use futures::StreamExt as _;
+
+                                    let mut all_results = Vec::with_capacity(fc_parts.len());
+                                    let mut calls = fc_parts.into_iter().peekable();
+                                    while let Some(call) = calls.next() {
+                                        let is_delegation = tool_map
+                                            .get(&call.name)
+                                            .is_some_and(|tool| tool.is_agent_delegation());
+                                        if !is_delegation {
+                                            all_results.push(executor.execute(call).await);
+                                            continue;
+                                        }
+
+                                        let mut delegation_batch = vec![call];
+                                        while calls.peek().is_some_and(|next| {
+                                            tool_map.get(&next.name).is_some_and(|tool| {
+                                                tool.is_agent_delegation()
+                                            })
+                                        }) {
+                                            if let Some(next) = calls.next() {
+                                                delegation_batch.push(next);
+                                            }
+                                        }
+
+                                        let buffer_size = delegation_batch.len();
+                                        all_results.extend(
+                                            futures::stream::iter(
+                                                delegation_batch
+                                                    .into_iter()
+                                                    .map(|call| executor.execute(call)),
+                                            )
+                                            .buffer_unordered(buffer_size)
+                                            .collect::<Vec<_>>()
+                                            .await,
+                                        );
+                                    }
+                                    all_results
+                                }
                                 ToolExecutionStrategy::Auto => {
                                     // A call may overlap another only when its tool is
                                     // read-only *and* declares concurrency safety.

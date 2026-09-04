@@ -2,7 +2,7 @@
 //!
 //! Showcases all seven ergonomics improvements introduced in ADK-Rust 0.5.x:
 //!
-//! 1. **ToolExecutionStrategy** — Sequential, Parallel, Auto dispatch
+//! 1. **ToolExecutionStrategy** — Sequential, Parallel, ParallelDelegations, Auto dispatch
 //! 2. **Tool metadata** — `is_read_only()` / `is_concurrency_safe()` on Tool trait
 //! 3. **RunnerConfigBuilder** — typestate builder for Runner construction
 //! 4. **SimpleToolContext** — lightweight ToolContext for non-agent callers
@@ -85,14 +85,15 @@ fn validate_tool_execution_strategy() {
     assert_eq!(default, ToolExecutionStrategy::Sequential);
     println!("  ✓ Default is Sequential");
 
-    // All three variants exist and are comparable
+    // All four variants exist and are comparable
     let strategies = [
         ToolExecutionStrategy::Sequential,
         ToolExecutionStrategy::Parallel,
+        ToolExecutionStrategy::ParallelDelegations,
         ToolExecutionStrategy::Auto,
     ];
-    assert_eq!(strategies.len(), 3);
-    println!("  ✓ Three variants: Sequential, Parallel, Auto");
+    assert_eq!(strategies.len(), 4);
+    println!("  ✓ Four variants: Sequential, Parallel, ParallelDelegations, Auto");
 
     // Copy + Clone + Debug
     let s = ToolExecutionStrategy::Auto;
