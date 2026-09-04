@@ -582,7 +582,11 @@ pub fn build_create_response(
 /// collects all parts into a single `Content`, and maps usage, finish reason,
 /// and provider metadata.
 pub fn from_response(response: &Response) -> LlmResponse {
-    let parts: Vec<Part> = response.output.iter().flat_map(output_item_to_parts).collect();
+    let parts = response.output.iter().map(output_item_to_parts).collect::<Result<Vec<_>, _>>();
+    let (parts, argument_error) = match parts {
+        Ok(parts) => (parts.into_iter().flatten().collect::<Vec<_>>(), None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
 
     let content =
         if parts.is_empty() { None } else { Some(Content { role: "model".to_string(), parts }) };
@@ -640,8 +644,10 @@ pub fn from_response(response: &Response) -> LlmResponse {
         partial: false,
         turn_complete: true,
         interrupted: false,
-        error_code: None,
-        error_message: None,
+        error_code: argument_error
+            .as_ref()
+            .map(|_| "model.openai_responses.invalid_tool_arguments".to_owned()),
+        error_message: argument_error,
         provider_metadata,
         interaction_id: None,
     }
@@ -653,8 +659,8 @@ pub fn from_response(response: &Response) -> LlmResponse {
 /// - `Reasoning` → `Part::Thinking` with concatenated summary text
 /// - `FunctionCall` → `Part::FunctionCall` with parsed JSON args
 /// - Other variants (WebSearchCall, FileSearchCall, etc.) → empty vec (handled in provider_metadata)
-fn output_item_to_parts(item: &OutputItem) -> Vec<Part> {
-    match item {
+fn output_item_to_parts(item: &OutputItem) -> Result<Vec<Part>, String> {
+    let parts = match item {
         OutputItem::Message(msg) => msg
             .content
             .iter()
@@ -682,8 +688,9 @@ fn output_item_to_parts(item: &OutputItem) -> Vec<Part> {
             }
         }
         OutputItem::FunctionCall(fc) => {
-            let args: serde_json::Value =
-                serde_json::from_str(&fc.arguments).unwrap_or(serde_json::json!({}));
+            let encoded = serde_json::Value::String(fc.arguments.clone());
+            let args = super::convert::decode_tool_call_arguments(Some(&encoded))
+                .map_err(|error| format!("invalid arguments for tool '{}': {error}", fc.name))?;
             vec![Part::FunctionCall {
                 name: fc.name.clone(),
                 args,
@@ -736,7 +743,8 @@ fn output_item_to_parts(item: &OutputItem) -> Vec<Part> {
             response_item_part(Item::CustomToolCall(call.clone()), false)
         }
         _ => Vec::new(),
-    }
+    };
+    Ok(parts)
 }
 
 fn response_item_part(item: Item, is_output: bool) -> Vec<Part> {
@@ -1042,7 +1050,8 @@ mod tests {
             })),
             id: "ws_123".to_string(),
             status: WebSearchToolCallStatus::Completed,
-        }));
+        }))
+        .expect("server tool output should convert");
 
         assert!(matches!(parts[0], Part::ServerToolCall { .. }));
 
@@ -1056,6 +1065,34 @@ mod tests {
             }
             other => panic!("expected web_search_call item, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn function_tool_arguments_share_compatible_normalization() {
+        let empty = output_item_to_parts(&OutputItem::FunctionCall(FunctionToolCall {
+            call_id: "call_empty".to_string(),
+            name: "no_args".to_string(),
+            arguments: "null".to_string(),
+            namespace: None,
+            id: None,
+            status: None,
+        }))
+        .expect("an empty compatible payload should normalize");
+        assert!(matches!(
+            &empty[0],
+            Part::FunctionCall { args, .. } if args == &serde_json::json!({})
+        ));
+
+        let error = output_item_to_parts(&OutputItem::FunctionCall(FunctionToolCall {
+            call_id: "call_invalid".to_string(),
+            name: "bash".to_string(),
+            arguments: r#"{"command":"#.to_string(),
+            namespace: None,
+            id: None,
+            status: None,
+        }))
+        .expect_err("truncated arguments must remain invalid");
+        assert!(error.contains("bash"));
     }
 
     #[test]

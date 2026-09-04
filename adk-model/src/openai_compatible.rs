@@ -493,7 +493,8 @@ fn parse_tool_call_arguments(
     tool_name: &str,
     arguments: &str,
 ) -> Result<serde_json::Value, AdkError> {
-    serde_json::from_str(arguments).map_err(|error| {
+    let encoded = serde_json::Value::String(arguments.to_owned());
+    convert::decode_tool_call_arguments(Some(&encoded)).map_err(|error| {
         AdkError::new(
             ErrorComponent::Model,
             ErrorCategory::Internal,
@@ -900,7 +901,15 @@ impl Llm for OpenAICompatible {
                 })
                 .await?;
 
-                let adk_response = convert::from_raw_openai_response(&response);
+                let adk_response = convert::from_raw_openai_response(&response).map_err(|error| {
+                    AdkError::new(
+                        ErrorComponent::Model,
+                        ErrorCategory::Internal,
+                        "model.openai_compat.invalid_tool_arguments",
+                        format!("{provider_name} returned {error}"),
+                    )
+                    .with_provider(&provider_name)
+                })?;
                 yield adk_response;
             };
 
@@ -943,12 +952,44 @@ mod tests {
                 .expect("valid arguments should parse");
         assert_eq!(parsed["command"], "pwd");
 
-        let error = parse_tool_call_arguments("compatible-provider", "bash", "")
-            .expect_err("empty arguments are not a valid function call payload");
+        assert_eq!(
+            parse_tool_call_arguments("compatible-provider", "no_args", "")
+                .expect("an empty compatible payload should normalize"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            parse_tool_call_arguments("compatible-provider", "no_args", "   ")
+                .expect("a whitespace-only compatible payload should normalize"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            parse_tool_call_arguments("compatible-provider", "no_args", "[]")
+                .expect("an empty array compatible payload should normalize"),
+            serde_json::json!({})
+        );
+
+        let error = parse_tool_call_arguments("compatible-provider", "bash", r#"{"command":"#)
+            .expect_err("truncated arguments must remain invalid");
         assert_eq!(error.component, ErrorComponent::Model);
         assert_eq!(error.category, ErrorCategory::Internal);
         assert_eq!(error.code, "model.openai_compat.invalid_tool_arguments");
         assert_eq!(error.details.provider.as_deref(), Some("compatible-provider"));
+
+        let error = parse_tool_call_arguments("compatible-provider", "bash", r#"["pwd"]"#)
+            .expect_err("non-empty array arguments must remain invalid");
+        assert_eq!(error.code, "model.openai_compat.invalid_tool_arguments");
+    }
+
+    #[test]
+    fn streamed_structured_tool_arguments_are_canonicalized() {
+        let mut arguments = String::new();
+        append_tool_call_arguments(&mut arguments, &serde_json::json!({"command": "pwd"}));
+
+        assert_eq!(
+            parse_tool_call_arguments("compatible-provider", "bash", &arguments)
+                .expect("a structured object should normalize"),
+            serde_json::json!({"command": "pwd"})
+        );
     }
 
     #[test]
