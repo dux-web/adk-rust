@@ -376,14 +376,6 @@ pub(crate) fn build_request_json(
         body["reasoning_effort"] = serde_json::Value::String("max".to_string());
     }
 
-    // GPT-5.6 defaults to medium reasoning, while Chat Completions function
-    // tools require effective reasoning `none`. ADK's public reasoning enum
-    // predates that value, so preserve source compatibility and make the safe
-    // effective setting explicit only for this otherwise-invalid combination.
-    if model.starts_with("gpt-5.6") && !request.tools.is_empty() && reasoning_effort.is_none() {
-        body["reasoning_effort"] = serde_json::Value::String("none".to_string());
-    }
-
     // Merge provider-specific extensions from config.extensions["openai"] into
     // the request body.  This allows users to pass provider-specific fields
     // that the typed builder doesn't cover (e.g. provider-specific parameters
@@ -494,6 +486,24 @@ fn append_tool_call_arguments(accumulator: &mut String, arguments: &serde_json::
             }
         }
     }
+}
+
+fn parse_tool_call_arguments(
+    provider_name: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> Result<serde_json::Value, AdkError> {
+    serde_json::from_str(arguments).map_err(|error| {
+        AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::Internal,
+            "model.openai_compat.invalid_tool_arguments",
+            format!(
+                "{provider_name} returned invalid JSON arguments for tool '{tool_name}': {error}"
+            ),
+        )
+        .with_provider(provider_name)
+    })
 }
 
 /// Parse usage metadata from a raw SSE chunk JSON value.
@@ -685,17 +695,19 @@ impl Llm for OpenAICompatible {
                                     let parts: Vec<Part> = sorted_calls
                                         .into_iter()
                                         .map(|(_, (id, name, args_str))| {
-                                            let args: serde_json::Value =
-                                                serde_json::from_str(&args_str)
-                                                    .unwrap_or(serde_json::json!({}));
-                                            Part::FunctionCall {
+                                            let args = parse_tool_call_arguments(
+                                                &provider_name,
+                                                &name,
+                                                &args_str,
+                                            )?;
+                                            Ok(Part::FunctionCall {
                                                 name,
                                                 args,
                                                 id: Some(id),
                                                 thought_signature: None,
-                                            }
+                                            })
                                         })
-                                        .collect();
+                                        .collect::<Result<Vec<_>, AdkError>>()?;
 
                                     let response = LlmResponse {
                                         content: Some(Content {
@@ -925,7 +937,22 @@ mod tests {
     }
 
     #[test]
-    fn gpt_56_chat_tools_default_to_no_reasoning() {
+    fn streamed_tool_arguments_require_valid_json() {
+        let parsed =
+            parse_tool_call_arguments("compatible-provider", "bash", r#"{"command":"pwd"}"#)
+                .expect("valid arguments should parse");
+        assert_eq!(parsed["command"], "pwd");
+
+        let error = parse_tool_call_arguments("compatible-provider", "bash", "")
+            .expect_err("empty arguments are not a valid function call payload");
+        assert_eq!(error.component, ErrorComponent::Model);
+        assert_eq!(error.category, ErrorCategory::Internal);
+        assert_eq!(error.code, "model.openai_compat.invalid_tool_arguments");
+        assert_eq!(error.details.provider.as_deref(), Some("compatible-provider"));
+    }
+
+    #[test]
+    fn gpt_56_chat_tools_preserve_configured_reasoning() {
         let adapter = GenericSchemaAdapter;
         let cache = SchemaCache::for_adapter(Arc::new(GenericSchemaAdapter));
         let mut request = LlmRequest {
@@ -943,17 +970,23 @@ mod tests {
             }),
         );
 
-        let body = build_request_json(
-            crate::catalog::OPENAI_DEFAULT,
-            &request,
-            &None,
-            true,
-            &adapter,
-            &cache,
-        )
-        .expect("request should build");
+        for (configured_effort, expected) in [
+            (None, None),
+            (Some(OpenAIReasoningEffort::Medium), Some("medium")),
+            (Some(OpenAIReasoningEffort::Max), Some("max")),
+        ] {
+            let body = build_request_json(
+                crate::catalog::OPENAI_DEFAULT,
+                &request,
+                &configured_effort,
+                true,
+                &adapter,
+                &cache,
+            )
+            .expect("request should build");
 
-        assert_eq!(body["reasoning_effort"], "none");
+            assert_eq!(body.get("reasoning_effort").and_then(serde_json::Value::as_str), expected);
+        }
     }
 
     #[test]
