@@ -506,6 +506,152 @@ fn conversation_history_preserves_tool_role() {
 }
 
 #[test]
+fn conversation_history_closes_interrupted_tool_calls_before_next_user_turn() {
+    let session = Arc::new(MockSessionWithState::new());
+    let mutable = MutableSession::new(session);
+
+    let mut first_user = Event::new("inv-1");
+    first_user.author = "user".to_string();
+    first_user.llm_response.content = Some(Content::new("user").with_text("run tests"));
+    mutable.append_event(first_user);
+
+    let mut tool_call = Event::new("inv-1");
+    tool_call.author = "assistant".to_string();
+    tool_call.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![
+            Part::FunctionCall {
+                name: "bash".to_string(),
+                args: serde_json::json!({"command": "cargo test"}),
+                id: Some("call-1".to_string()),
+                thought_signature: None,
+            },
+            Part::FunctionCall {
+                name: "read_file".to_string(),
+                args: serde_json::json!({"path": "README.md"}),
+                id: Some("call-2".to_string()),
+                thought_signature: None,
+            },
+        ],
+    });
+    mutable.append_event(tool_call);
+
+    // The run is interrupted before the tool can persist its response. A new
+    // user message is the durable boundary that proves the previous turn ended.
+    let mut next_user = Event::new("inv-2");
+    next_user.author = "user".to_string();
+    next_user.llm_response.content = Some(Content::new("user").with_text("continue"));
+    mutable.append_event(next_user);
+
+    let history = mutable.conversation_history();
+    assert_eq!(history.len(), 5);
+    assert_eq!(history[2].role, "function");
+    assert_eq!(history[3].role, "function");
+    assert_eq!(history[4].role, "user");
+    assert!(matches!(
+        &history[2].parts[..],
+        [Part::FunctionResponse {
+            id: Some(id),
+            function_response,
+            ..
+        }] if id == "call-1"
+            && function_response.name == "bash"
+            && function_response.response == serde_json::json!({
+                "error": "Tool execution was interrupted before completion."
+            })
+    ));
+    assert!(matches!(
+        &history[3].parts[..],
+        [Part::FunctionResponse {
+            id: Some(id),
+            function_response,
+            ..
+        }] if id == "call-2"
+            && function_response.name == "read_file"
+            && function_response.response == serde_json::json!({
+                "error": "Tool execution was interrupted before completion."
+            })
+    ));
+}
+
+#[test]
+fn conversation_history_matches_idless_tool_responses_by_name() {
+    let session = Arc::new(MockSessionWithState::new());
+    let mutable = MutableSession::new(session);
+
+    let mut first_user = Event::new("inv-1");
+    first_user.author = "user".to_string();
+    first_user.llm_response.content = Some(Content::new("user").with_text("read the file"));
+    mutable.append_event(first_user);
+
+    let mut tool_call = Event::new("inv-1");
+    tool_call.author = "assistant".to_string();
+    tool_call.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![Part::FunctionCall {
+            name: "read_file".to_string(),
+            args: serde_json::json!({"path": "README.md"}),
+            id: None,
+            thought_signature: None,
+        }],
+    });
+    mutable.append_event(tool_call);
+
+    let mut tool_response = Event::new("inv-1");
+    tool_response.author = "assistant".to_string();
+    tool_response.llm_response.content = Some(Content {
+        role: "function".to_string(),
+        parts: vec![Part::FunctionResponse {
+            function_response: FunctionResponseData::new(
+                "read_file",
+                serde_json::json!({"content": "Sailry"}),
+            ),
+            id: None,
+            annotations: None,
+        }],
+    });
+    mutable.append_event(tool_response);
+
+    let mut next_user = Event::new("inv-2");
+    next_user.author = "user".to_string();
+    next_user.llm_response.content = Some(Content::new("user").with_text("continue"));
+    mutable.append_event(next_user);
+
+    let history = mutable.conversation_history();
+    assert_eq!(history.len(), 4);
+    assert_eq!(history[2].role, "function");
+    assert_eq!(history[3].role, "user");
+}
+
+#[test]
+fn conversation_history_keeps_an_active_tool_call_open_at_the_tail() {
+    let session = Arc::new(MockSessionWithState::new());
+    let mutable = MutableSession::new(session);
+
+    let mut user = Event::new("inv-1");
+    user.author = "user".to_string();
+    user.llm_response.content = Some(Content::new("user").with_text("run tests"));
+    mutable.append_event(user);
+
+    let mut tool_call = Event::new("inv-1");
+    tool_call.author = "assistant".to_string();
+    tool_call.llm_response.content = Some(Content {
+        role: "model".to_string(),
+        parts: vec![Part::FunctionCall {
+            name: "bash".to_string(),
+            args: serde_json::json!({"command": "cargo test"}),
+            id: Some("call-1".to_string()),
+            thought_signature: None,
+        }],
+    });
+    mutable.append_event(tool_call);
+
+    let history = mutable.conversation_history();
+    assert_eq!(history.len(), 2);
+    assert!(matches!(history[1].parts.as_slice(), [Part::FunctionCall { .. }]));
+}
+
+#[test]
 fn conversation_history_maps_agent_events_to_model() {
     // Non-tool agent events should still map to "model"
     let session = Arc::new(MockSessionWithState::new());

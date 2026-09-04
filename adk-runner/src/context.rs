@@ -1,7 +1,7 @@
 use adk_core::{
     AdkIdentity, Agent, AppName, Artifacts, CallbackContext, Content, Event, ExecutionIdentity,
-    InvocationContext as InvocationContextTrait, InvocationId, Memory, ReadonlyContext,
-    RequestContext, RunConfig, SecretService, SessionId, UserId,
+    FunctionResponseData, InvocationContext as InvocationContextTrait, InvocationId, Memory, Part,
+    ReadonlyContext, RequestContext, RunConfig, SecretService, SessionId, UserId,
 };
 use adk_session::Session as AdkSession;
 use async_trait::async_trait;
@@ -178,8 +178,65 @@ impl MutableSession {
             }
         }
 
-        history
+        close_interrupted_tool_calls(history)
     }
+}
+
+/// Makes persisted conversation history valid for the next model turn without
+/// rewriting the source events.
+///
+/// A runner interruption can happen after a model function call is persisted
+/// but before its tool response is available. Once a later user message exists,
+/// that unfinished call belongs to a closed turn and cannot still be executed.
+/// Providers also require every replayed function call to have a matching
+/// response before accepting the next user message, so insert a provider-neutral
+/// cancellation response at that durable turn boundary.
+fn close_interrupted_tool_calls(history: Vec<Content>) -> Vec<Content> {
+    let mut normalized = Vec::with_capacity(history.len());
+    let mut pending = Vec::<(Option<String>, String)>::new();
+
+    for content in history {
+        for part in &content.parts {
+            if let Part::FunctionResponse { function_response, id, .. } = part {
+                let matching_index = match id.as_deref() {
+                    Some(response_id) => pending
+                        .iter()
+                        .position(|(call_id, _)| call_id.as_deref() == Some(response_id)),
+                    None => pending.iter().position(|(_, name)| name == &function_response.name),
+                };
+                if let Some(index) = matching_index {
+                    pending.remove(index);
+                }
+            }
+        }
+
+        let starts_user_turn = content.role == "user"
+            && content.parts.iter().any(|part| !matches!(part, Part::FunctionResponse { .. }));
+        if starts_user_turn && !pending.is_empty() {
+            normalized.extend(pending.drain(..).map(|(id, name)| Content {
+                role: "function".to_string(),
+                parts: vec![Part::FunctionResponse {
+                    function_response: FunctionResponseData::new(
+                        name,
+                        serde_json::json!({
+                            "error": "Tool execution was interrupted before completion."
+                        }),
+                    ),
+                    id,
+                    annotations: None,
+                }],
+            }));
+        }
+
+        for part in &content.parts {
+            if let Part::FunctionCall { name, id, .. } = part {
+                pending.push((id.clone(), name.clone()));
+            }
+        }
+        normalized.push(content);
+    }
+
+    normalized
 }
 
 impl adk_core::Session for MutableSession {

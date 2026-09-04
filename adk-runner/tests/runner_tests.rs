@@ -209,6 +209,33 @@ impl Agent for TransferAgent {
     }
 }
 
+#[tokio::test]
+async fn started_run_exposes_the_invocation_identity_before_polling() {
+    let runner = Runner::builder()
+        .app_name("test_app")
+        .agent(Arc::new(TransferAgent { name: "test_agent".to_string(), target: None })
+            as Arc<dyn Agent>)
+        .session_service(Arc::new(MockSessionService) as Arc<dyn SessionService>)
+        .build()
+        .unwrap();
+
+    let started = runner
+        .start_with_config(
+            UserId::new("user123").unwrap(),
+            SessionId::new("session456").unwrap(),
+            Content::new("user").with_text("Hello"),
+            None,
+        )
+        .await
+        .unwrap();
+    let invocation_id = started.invocation_id().to_string();
+    let events = started.into_events().collect::<Vec<_>>().await;
+
+    assert!(!invocation_id.is_empty());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].as_ref().unwrap().invocation_id, invocation_id);
+}
+
 struct StrictTransferRoot {
     root: TransferAgent,
     children: Vec<Arc<dyn Agent>>,
