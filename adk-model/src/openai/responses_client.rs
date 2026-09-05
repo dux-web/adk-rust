@@ -60,16 +60,7 @@ fn completed_stream_response(full: LlmResponse) -> LlmResponse {
     let content = (!trailing_parts.is_empty())
         .then_some(Content { role: "model".to_string(), parts: trailing_parts });
 
-    LlmResponse {
-        content,
-        usage_metadata: full.usage_metadata,
-        finish_reason: full.finish_reason,
-        citation_metadata: full.citation_metadata,
-        provider_metadata: full.provider_metadata,
-        partial: false,
-        turn_complete: true,
-        ..Default::default()
-    }
+    LlmResponse { content, partial: false, turn_complete: true, ..full }
 }
 
 impl OpenAIResponsesClient {
@@ -348,14 +339,19 @@ fn normalize_responses_bytes(
     if !open_responses_mode {
         return normalized;
     }
+    // Empty SSE data fields are heartbeats, not JSON model events.
+    if normalized.strip_prefix(b"data:").is_some_and(|payload| payload.trim_ascii().is_empty()) {
+        return Vec::new();
+    }
 
     let payload_start = normalized
         .strip_prefix(b"data:")
         .map_or(0, |payload| normalized.len() - payload.trim_ascii_start().len());
     let payload_end = normalized.trim_ascii_end().len();
-    let Ok(mut value) =
-        serde_json::from_slice::<serde_json::Value>(&normalized[payload_start..payload_end])
-    else {
+    let Some(payload) = normalized.get(payload_start..payload_end) else {
+        return normalized;
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(payload) else {
         return normalized;
     };
     let message_status = value
@@ -382,49 +378,122 @@ fn normalize_responses_bytes(
 
 #[derive(Default)]
 struct OpenResponsesStreamState {
-    function_arguments: std::collections::BTreeMap<u64, String>,
+    function_calls: std::collections::BTreeMap<u64, StreamedFunctionCall>,
+}
+
+#[derive(Default)]
+struct StreamedFunctionCall {
+    item_id: Option<String>,
+    call_id: Option<String>,
+    arguments: Option<String>,
 }
 
 impl OpenResponsesStreamState {
     fn normalize_event(&mut self, event: &mut serde_json::Value) {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
         match event_type {
+            Some("response.output_item.added" | "response.output_item.done") => {
+                let is_done = event_type == Some("response.output_item.done");
+                if let Some(output_index) =
+                    event.get("output_index").and_then(serde_json::Value::as_u64)
+                    && let Some(item) = event.get_mut("item")
+                    && item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+                {
+                    let call = self.function_calls.entry(output_index).or_default();
+                    if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+                        call.item_id = Some(id.to_string());
+                    }
+                    if let Some(id) = item.get("call_id").and_then(serde_json::Value::as_str) {
+                        call.call_id = Some(id.to_string());
+                    }
+                    if is_done
+                        && let Some(arguments) =
+                            item.get("arguments").and_then(serde_json::Value::as_str)
+                        && (!arguments.trim().is_empty() || call.arguments.is_none())
+                    {
+                        call.arguments = Some(arguments.to_string());
+                    } else if is_done
+                        && let Some(arguments) = &call.arguments
+                        && item.get("arguments").is_none_or(|value| {
+                            value.as_str().is_some_and(|arguments| arguments.trim().is_empty())
+                        })
+                    {
+                        item["arguments"] = arguments.clone().into();
+                    }
+                }
+            }
             Some("response.function_call_arguments.delta") => {
                 if let (Some(output_index), Some(delta)) = (
                     event.get("output_index").and_then(serde_json::Value::as_u64),
                     event.get("delta").and_then(serde_json::Value::as_str),
                 ) {
-                    self.function_arguments.entry(output_index).or_default().push_str(delta);
+                    let call = self.function_calls.entry(output_index).or_default();
+                    if let Some(id) = event.get("item_id").and_then(serde_json::Value::as_str) {
+                        call.item_id = Some(id.to_string());
+                    }
+                    call.arguments.get_or_insert_default().push_str(delta);
                 }
             }
             Some("response.function_call_arguments.done") => {
                 if let Some(output_index) =
                     event.get("output_index").and_then(serde_json::Value::as_u64)
                 {
+                    let call = self.function_calls.entry(output_index).or_default();
+                    if let Some(id) = event.get("item_id").and_then(serde_json::Value::as_str) {
+                        call.item_id = Some(id.to_string());
+                    }
                     if let Some(arguments) =
                         event.get("arguments").and_then(serde_json::Value::as_str)
+                        && (!arguments.trim().is_empty() || call.arguments.is_none())
                     {
-                        self.function_arguments.insert(output_index, arguments.to_string());
-                    } else if let Some(arguments) = self.function_arguments.get(&output_index) {
+                        call.arguments = Some(arguments.to_string());
+                    } else if let Some(arguments) = &call.arguments
+                        && event.get("arguments").is_none_or(|value| {
+                            value.as_str().is_some_and(|arguments| arguments.trim().is_empty())
+                        })
+                    {
                         event["arguments"] = serde_json::Value::String(arguments.clone());
                     }
                 }
             }
             Some("response.completed") => {
-                let mut streamed_arguments = self.function_arguments.values();
                 if let Some(output) =
                     event.pointer_mut("/response/output").and_then(serde_json::Value::as_array_mut)
                 {
-                    for item in output {
+                    for (output_index, item) in output.iter_mut().enumerate() {
                         let is_function_call = item.get("type").and_then(serde_json::Value::as_str)
                             == Some("function_call");
-                        if is_function_call {
-                            let arguments = streamed_arguments.next();
-                            if item.get("arguments").is_none()
-                                && let Some(arguments) = arguments
-                            {
-                                item["arguments"] = serde_json::Value::String(arguments.clone());
-                            }
+                        if !is_function_call || item.get("arguments").is_some() {
+                            continue;
+                        }
+                        let item_id = item.get("id").and_then(serde_json::Value::as_str);
+                        let call_id = item.get("call_id").and_then(serde_json::Value::as_str);
+                        let call = self
+                            .function_calls
+                            .values()
+                            .find(|call| {
+                                ((item_id.is_some() && item_id == call.item_id.as_deref())
+                                    || (call_id.is_some() && call_id == call.call_id.as_deref()))
+                                    && item_id
+                                        .zip(call.item_id.as_deref())
+                                        .is_none_or(|(left, right)| left == right)
+                                    && call_id
+                                        .zip(call.call_id.as_deref())
+                                        .is_none_or(|(left, right)| left == right)
+                            })
+                            .or_else(|| {
+                                self.function_calls.get(&(output_index as u64)).filter(|call| {
+                                    // An index must not override a contradictory item identity.
+                                    item_id
+                                        .zip(call.item_id.as_deref())
+                                        .is_none_or(|(left, right)| left == right)
+                                        && call_id
+                                            .zip(call.call_id.as_deref())
+                                            .is_none_or(|(left, right)| left == right)
+                                })
+                            });
+                        if let Some(arguments) = call.and_then(|call| call.arguments.as_ref()) {
+                            item["arguments"] = arguments.clone().into();
                         }
                     }
                 }
@@ -719,6 +788,107 @@ mod tests {
     use async_openai::error::{ApiError, ApiErrorResponse, OpenAIError};
 
     #[test]
+    fn completed_stream_response_preserves_errors() {
+        let full = LlmResponse {
+            error_code: Some("model.openai_responses.invalid_tool_arguments".to_string()),
+            error_message: Some("invalid function arguments".to_string()),
+            ..Default::default()
+        };
+        let expected = LlmResponse { turn_complete: true, ..full.clone() };
+
+        assert_eq!(
+            serde_json::to_value(completed_stream_response(full)).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn open_responses_mode_ignores_empty_sse_payloads() {
+        for frame in ["data:\n", "data: \r\n", "data:"] {
+            assert!(normalize_responses_bytes(frame.as_bytes(), false, true, None).is_empty());
+        }
+        for frame in ["\n", ": keepalive\n"] {
+            assert_eq!(
+                normalize_responses_bytes(frame.as_bytes(), false, true, None),
+                frame.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn open_responses_mode_restores_sparse_arguments_by_output_index() {
+        for first_arguments in [None, Some("{}"), Some(r#"{"path":"first.txt"}"#)] {
+            let mut state = OpenResponsesStreamState::default();
+            state.normalize_event(&mut serde_json::json!({
+                "type": "response.function_call_arguments.delta", "output_index": 1,
+                "item_id": "fc_b", "delta": r#"{"path":"second.txt"}"#
+            }));
+            let mut event = serde_json::json!({
+                "type": "response.completed", "response": {"output": [
+                    {"type": "function_call", "call_id": "call_a", "name": "read_file"},
+                    {"type": "function_call", "call_id": "call_b", "name": "read_file"}
+                ]}
+            });
+            if let Some(arguments) = first_arguments {
+                event["response"]["output"][0]["arguments"] = arguments.into();
+            }
+            let mut expected = event.clone();
+            expected["response"]["output"][1]["arguments"] = r#"{"path":"second.txt"}"#.into();
+
+            state.normalize_event(&mut event);
+
+            assert_eq!(event, expected);
+        }
+    }
+
+    #[test]
+    fn open_responses_mode_matches_item_identity_in_sparse_completed_output() {
+        let mut state = OpenResponsesStreamState::default();
+        for (index, id, path) in [(1, "fc_a", "first.txt"), (3, "fc_b", "second.txt")] {
+            state.normalize_event(&mut serde_json::json!({
+                "type": "response.function_call_arguments.delta", "output_index": index,
+                "item_id": id, "delta": serde_json::json!({"path": path}).to_string()
+            }));
+        }
+        let mut event = serde_json::json!({
+            "type": "response.completed", "response": {"output": [
+                {"type": "function_call", "id": "fc_b", "call_id": "call_b", "name": "read_file"}
+            ]}
+        });
+        let mut expected = event.clone();
+        expected["response"]["output"][0]["arguments"] = r#"{"path":"second.txt"}"#.into();
+
+        state.normalize_event(&mut event);
+
+        assert_eq!(event, expected);
+    }
+
+    #[test]
+    fn open_responses_mode_matches_call_identity_from_output_item_events() {
+        let mut state = OpenResponsesStreamState::default();
+        state.normalize_event(&mut serde_json::json!({
+            "type": "response.output_item.added", "output_index": 2,
+            "item": {"type": "function_call", "id": "fc_b", "call_id": "call_b",
+                "name": "read_file", "arguments": "{}"}
+        }));
+        state.normalize_event(&mut serde_json::json!({
+            "type": "response.function_call_arguments.delta", "output_index": 2,
+            "item_id": "fc_b", "delta": r#"{"path":"second.txt"}"#
+        }));
+        let mut event = serde_json::json!({
+            "type": "response.completed", "response": {"output": [
+                {"type": "function_call", "call_id": "call_b", "name": "read_file"}
+            ]}
+        });
+        let mut expected = event.clone();
+        expected["response"]["output"][0]["arguments"] = r#"{"path":"second.txt"}"#.into();
+
+        state.normalize_event(&mut event);
+
+        assert_eq!(event, expected);
+    }
+
+    #[test]
     fn completed_stream_response_preserves_citations() {
         let full = LlmResponse {
             content: Some(Content::new("model").with_text("answer")),
@@ -826,7 +996,7 @@ mod tests {
 
 "#
             .as_slice(),
-            br#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","call_id":"call_1","name":"bash"}]}}
+            br#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"function_call","id":"fc_1","call_id":"call_1","name":"bash"}]}}
 
 "#
             .as_slice(),
@@ -854,6 +1024,68 @@ mod tests {
 
         assert_eq!(done["arguments"], r#"{"command":"pwd"}"#);
         assert_eq!(completed["response"]["output"][0]["arguments"], r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn open_responses_mode_preserves_deltas_after_blank_done_snapshots() {
+        for event_type in ["response.function_call_arguments.done", "response.output_item.done"] {
+            for blank_arguments in ["", " \t\r\n"] {
+                let mut state = OpenResponsesStreamState::default();
+                state.normalize_event(&mut serde_json::json!({
+                    "type": "response.function_call_arguments.delta", "output_index": 0,
+                    "item_id": "fc_a", "delta": r#"{"path":"first.txt"}"#
+                }));
+                let mut done = serde_json::json!({
+                    "type": event_type, "output_index": 0, "item_id": "fc_a",
+                    "arguments": blank_arguments,
+                    "item": {"type": "function_call", "id": "fc_a", "arguments": blank_arguments}
+                });
+                state.normalize_event(&mut done);
+                let restored_done_arguments =
+                    if event_type == "response.function_call_arguments.done" {
+                        &done["arguments"]
+                    } else {
+                        &done["item"]["arguments"]
+                    };
+                assert_eq!(
+                    restored_done_arguments, r#"{"path":"first.txt"}"#,
+                    "{event_type} should restore deltas into a whitespace-only done snapshot"
+                );
+                let mut completed = serde_json::json!({
+                    "type": "response.completed", "response": {"output": [
+                        {"type": "function_call", "id": "fc_a", "call_id": "call_a", "name": "read_file"}
+                    ]}
+                });
+                state.normalize_event(&mut completed);
+                assert_eq!(
+                    completed["response"]["output"][0]["arguments"], r#"{"path":"first.txt"}"#,
+                    "{event_type} should ignore a whitespace-only done snapshot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn open_responses_mode_never_restores_arguments_from_conflicting_ids() {
+        let mut state = OpenResponsesStreamState::default();
+        for (index, id, call_id, arguments) in
+            [(0, "fc_a", "call_a", "1"), (1, "fc_b", "call_b", "2")]
+        {
+            state.normalize_event(&mut serde_json::json!({
+                "type": "response.output_item.done", "output_index": index,
+                "item": {"type": "function_call", "id": id, "call_id": call_id, "arguments": arguments}
+            }));
+        }
+        for (id, call_id) in [("fc_b", "call_a"), ("fc_a", "call_b")] {
+            let mut event = serde_json::json!({
+                "type": "response.completed", "response": {"output": [
+                    {"type": "function_call", "id": id, "call_id": call_id, "name": "read_file"}
+                ]}
+            });
+            let expected = event.clone();
+            state.normalize_event(&mut event);
+            assert_eq!(event, expected);
+        }
     }
 
     #[test]

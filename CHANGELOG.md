@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **OpenAI Responses stream completion** (`adk-model`): completion events retain
+  model errors and usage metadata. Open Responses mode ignores empty SSE data
+  frames, restores missing arguments by tool identity or output index, and keeps
+  streamed arguments when a terminal snapshot is blank.
 - **OpenAI-compatible structured tool arguments** (`adk-model`): Chat
   Completions streaming now preserves structured JSON `function.arguments`
   emitted by compatible intermediaries, including repeated and empty snapshot

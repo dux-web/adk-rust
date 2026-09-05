@@ -480,7 +480,7 @@ fn append_tool_call_arguments(accumulator: &mut String, arguments: &serde_json::
         structured => {
             let empty_snapshot = matches!(structured, serde_json::Value::Object(fields) if fields.is_empty())
                 || matches!(structured, serde_json::Value::Array(items) if items.is_empty());
-            if accumulator.is_empty() || !empty_snapshot {
+            if !empty_snapshot {
                 accumulator.clear();
                 accumulator.push_str(&structured.to_string());
             }
@@ -990,6 +990,28 @@ mod tests {
                 .expect("a structured object should normalize"),
             serde_json::json!({"command": "pwd"})
         );
+    }
+
+    #[test]
+    fn streamed_empty_snapshot_before_string_fragments_is_ignored() {
+        for placeholder in [serde_json::json!({}), serde_json::json!([])] {
+            let mut arguments = String::new();
+            append_tool_call_arguments(&mut arguments, &placeholder);
+            assert_eq!(
+                parse_tool_call_arguments("compatible-provider", "no_args", &arguments)
+                    .expect("an empty snapshot should remain a no-argument call"),
+                serde_json::json!({})
+            );
+
+            append_tool_call_arguments(&mut arguments, &serde_json::json!(r#"{"command""#));
+            append_tool_call_arguments(&mut arguments, &serde_json::json!(r#": "pwd"}"#));
+
+            assert_eq!(
+                parse_tool_call_arguments("compatible-provider", "bash", &arguments)
+                    .expect("empty snapshots must not prefix string fragments"),
+                serde_json::json!({"command": "pwd"})
+            );
+        }
     }
 
     #[test]
