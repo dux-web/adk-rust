@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Overlapping and interrupted tool history** (`adk-runner`): model requests
+  retain actual tool results from overlapping turns and omit unresolved calls
+  from earlier turns without fabricating interruption results. Persisted events
+  remain unchanged.
 - **OpenAI Responses stream completion** (`adk-model`): completion events retain
   model errors and usage metadata. Open Responses mode ignores empty SSE data
   frames, restores missing arguments by tool identity or output index, and keeps
