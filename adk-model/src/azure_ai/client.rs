@@ -42,6 +42,7 @@ impl AzureAIClient {
     /// Create a new Azure AI Inference client from the given config.
     pub fn new(config: AzureAIConfig) -> Result<Self, AdkError> {
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| AdkError::model(format!("Failed to create HTTP client: {e}")))?;
 
@@ -164,7 +165,9 @@ impl Llm for AzureAIClient {
 
             if stream {
                 let mut byte_stream = response.bytes_stream();
-                let mut buffer = String::new();
+                let mut buffer = Vec::new();
+                let mut finished = false;
+                let mut terminal: Option<LlmResponse> = None;
 
                 // Accumulate tool calls across SSE chunks
                 let mut tool_call_accumulators: std::collections::HashMap<u32, (String, String, String)> =
@@ -174,11 +177,9 @@ impl Llm for AzureAIClient {
                     let chunk = chunk_result
                         .map_err(|e| AdkError::model(format!("Azure AI stream error: {e}")))?;
 
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    buffer.extend_from_slice(&chunk);
 
-                    while let Some(line_end) = buffer.find('\n') {
-                        let line = buffer[..line_end].trim().to_string();
-                        buffer = buffer[line_end + 1..].to_string();
+                    while let Some(line) = crate::sse::take_line(&mut buffer)? {
 
                         if line.is_empty() || line == "data: [DONE]" {
                             continue;
@@ -190,16 +191,29 @@ impl Llm for AzureAIClient {
                                     // Accumulate tool call deltas
                                     accumulate_tool_calls(&chunk_json, &mut tool_call_accumulators);
 
-                                    let llm_resp = convert::parse_sse_chunk(&chunk_json);
+                                    let mut llm_resp = convert::parse_sse_chunk(&chunk_json);
+                                    if finished {
+                                        if let Some(usage) = llm_resp.usage_metadata {
+                                            if let Some(response) = &mut terminal {
+                                                response.usage_metadata = Some(usage);
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    // Tool deltas are incomplete until the finish event.
+                                    if let Some(content) = &mut llm_resp.content {
+                                        content.parts.retain(|part| !matches!(part, Part::FunctionCall { .. }));
+                                    }
 
                                     if llm_resp.turn_complete {
+                                        finished = true;
                                         // Emit accumulated tool calls if any
                                         if !tool_call_accumulators.is_empty() {
                                             let mut sorted: Vec<_> =
                                                 tool_call_accumulators.drain().collect();
                                             sorted.sort_by_key(|(idx, _)| *idx);
 
-                                            let parts = sorted
+                                            let calls = sorted
                                                 .into_iter()
                                                 .map(|(_, (id, name, args_str))| {
                                                     let args = crate::tool_args::parse_streamed_tool_arguments(
@@ -217,30 +231,32 @@ impl Llm for AzureAIClient {
                                                 })
                                                 .collect::<Result<Vec<Part>, AdkError>>()?;
 
-                                            yield LlmResponse {
-                                                content: Some(adk_core::Content {
-                                                    role: "model".to_string(),
-                                                    parts,
-                                                }),
-                                                finish_reason: llm_resp.finish_reason,
-                                                partial: false,
-                                                turn_complete: true,
-                                                ..Default::default()
-                                            };
-                                            continue;
-                                        }
+                                            let mut parts = llm_resp.content.take().map(|content| content.parts).unwrap_or_default();
+                                            parts.extend(calls);
 
-                                        yield llm_resp;
-                                    } else if llm_resp.content.is_some() {
+                                            llm_resp.content = Some(adk_core::Content {
+                                                role: "model".to_string(),
+                                                parts,
+                                            });
+                                            llm_resp.turn_complete = false;
+                                        }
+                                        // Usage may arrive after the finish event. Do not let the
+                                        // runner stop polling before accounting and stream validation.
+                                        terminal = Some(llm_resp);
+                                    } else if llm_resp.content.is_some() || llm_resp.usage_metadata.is_some() {
                                         yield llm_resp;
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::warn!("failed to parse Azure AI chunk: {e} - {data}");
-                                }
+                                Err(_) => Err(AdkError::model("invalid Azure AI event data"))?,
                             }
                         }
                     }
+                }
+                if !finished || buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                    Err(AdkError::model("incomplete Azure AI event stream"))?;
+                }
+                if let Some(response) = terminal {
+                    yield response;
                 }
             } else {
                 let response_text = response.text().await

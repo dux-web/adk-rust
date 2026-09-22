@@ -92,6 +92,8 @@ pub enum ConversionError {
     UnsupportedMimeType(String),
     /// A provider-native tool declaration could not be deserialized.
     InvalidToolDeclaration(String),
+    /// Preserved native assistant content is malformed or inconsistent.
+    InvalidHistory(String),
 }
 
 impl std::fmt::Display for ConversionError {
@@ -101,6 +103,9 @@ impl std::fmt::Display for ConversionError {
                 write!(f, "unsupported MIME type for Anthropic API: {mime}")
             }
             ConversionError::InvalidToolDeclaration(message) => write!(f, "{message}"),
+            ConversionError::InvalidHistory(message) => {
+                write!(f, "invalid Anthropic history: {message}")
+            }
         }
     }
 }
