@@ -531,3 +531,47 @@ async fn a_matching_fingerprint_still_authorises_the_call() {
 
     assert!(approved, "a fingerprint matching the actual call must authorise it");
 }
+
+#[derive(Debug)]
+struct HoldSecondApproval {
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl ToolConfirmationHandler for HoldSecondApproval {
+    async fn decide(&self, request: &ToolConfirmationRequest) -> Result<ToolConfirmationDecision> {
+        if request.function_call_id.as_deref() == Some("call-sensitive") {
+            self.release.notified().await;
+        }
+        Ok(ToolConfirmationDecision::Approve)
+    }
+}
+
+#[tokio::test]
+async fn completed_result_is_visible_while_sibling_approval_waits() {
+    let handler = Arc::new(HoldSecondApproval { release: tokio::sync::Notify::new() });
+    let tool = Arc::new(CountingTool::new());
+    let calls = tool.calls.clone();
+    let agent = LlmAgentBuilder::new("test-agent")
+        .model(Arc::new(SequencedModel::new(vec![two_calls_to_same_tool()])))
+        .tool(tool)
+        .require_tool_confirmation("test_tool")
+        .build()
+        .unwrap();
+    let config = RunConfig::builder().tool_confirmation_handler(handler.clone()).build();
+    let mut stream = agent.run(Arc::new(MockContext::new(config))).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(event) = stream.next().await {
+            if event.unwrap().content().is_some_and(|content| content.parts.iter().any(|part| {
+                matches!(part, Part::FunctionResponse { id, .. } if id.as_deref() == Some("call-scratch"))
+            })) { return; }
+        }
+        panic!("first result was not emitted");
+    }).await.expect("first result must not wait for the sibling approval");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    handler.release.notify_one();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
