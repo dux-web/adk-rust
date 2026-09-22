@@ -203,9 +203,24 @@ pub struct GroundingMetadata {
     /// Web search queries used for grounding
     #[serde(skip_serializing_if = "Option::is_none")]
     pub web_search_queries: Option<Vec<String>>,
+    /// Provider-rendered Google Search suggestions and SDK data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_entry_point: Option<SearchEntryPoint>,
     /// Google Maps widget context token
     #[serde(skip_serializing_if = "Option::is_none")]
     pub google_maps_widget_context_token: Option<String>,
+}
+
+/// Google Search suggestions returned alongside a grounded answer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchEntryPoint {
+    /// HTML and CSS to display the provider's search suggestions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rendered_content: Option<String>,
+    /// Base64-encoded search term and URL tuples for native SDKs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdk_blob: Option<String>,
 }
 
 /// A chunk of grounding information from a source
@@ -261,6 +276,9 @@ pub struct GroundingSupport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct GroundingSegment {
+    /// Index of the Part within the candidate's Content.
+    #[serde(default)]
+    pub part_index: Option<u32>,
     /// Start index of the segment in the response text
     #[serde(default)]
     pub start_index: Option<u32>,
