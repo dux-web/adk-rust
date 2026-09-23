@@ -19,9 +19,6 @@ pub enum WebSearchErrorCode {
 
     /// The query provided to the web search tool is too long.
     QueryTooLong,
-
-    /// The search request exceeds the provider's size limit.
-    RequestTooLarge,
 }
 
 impl fmt::Display for WebSearchErrorCode {
@@ -32,7 +29,6 @@ impl fmt::Display for WebSearchErrorCode {
             WebSearchErrorCode::MaxUsesExceeded => write!(f, "max_uses_exceeded"),
             WebSearchErrorCode::TooManyRequests => write!(f, "too_many_requests"),
             WebSearchErrorCode::QueryTooLong => write!(f, "query_too_long"),
-            WebSearchErrorCode::RequestTooLarge => write!(f, "request_too_large"),
         }
     }
 }

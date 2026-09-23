@@ -197,10 +197,10 @@ impl Llm for AzureAIClient {
 
                                     let mut llm_resp = convert::parse_sse_chunk(&chunk_json);
                                     if finished {
-                                        if let Some(usage) = llm_resp.usage_metadata {
-                                            if let Some(response) = &mut terminal {
-                                                response.usage_metadata = Some(usage);
-                                            }
+                                        if let Some(usage) = llm_resp.usage_metadata
+                                            && let Some(response) = &mut terminal
+                                        {
+                                            response.usage_metadata = Some(usage);
                                         }
                                         continue;
                                     }

@@ -12,8 +12,8 @@ use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
     ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
     ChatCompletionRequestUserMessageContentPart, ChatCompletionTool, ChatCompletionTools,
-    CreateChatCompletionResponse, FileObject, FinishReason as OaiFinishReason, FunctionCall,
-    FunctionObject, ImageDetail, ImageUrl, InputAudio, InputAudioFormat,
+    CreateChatCompletionResponse, FinishReason as OaiFinishReason, FunctionCall, FunctionObject,
+    ImageDetail, ImageUrl, InputAudio, InputAudioFormat,
 };
 use std::collections::HashMap;
 
@@ -166,14 +166,15 @@ fn inline_data_part_to_openai(
     if mime_type == "application/pdf" {
         return ChatCompletionRequestUserMessageContentPart::File(
             ChatCompletionRequestMessageContentPartFile {
-                file: FileObject {
-                    file_data: Some(format!(
+                // async-openai 0.41.1 exposes this wire type through Deserialize only.
+                file: serde_json::from_value(serde_json::json!({
+                    "file_data": format!(
                         "data:{mime_type};base64,{}",
                         attachment::encode_base64(data)
-                    )),
-                    filename: Some("document.pdf".into()),
-                    file_id: None,
-                },
+                    ),
+                    "filename": "document.pdf",
+                }))
+                .expect("inline PDF uses the FileObject wire schema"),
             },
         );
     }
