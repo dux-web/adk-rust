@@ -1887,8 +1887,8 @@ struct ToolExecutor<'a> {
 }
 
 impl ToolExecutor<'_> {
-    async fn execute(&self, call: PendingToolCall) -> ToolExecutionResult {
-        let result = self.execute_inner(call).await;
+    async fn execute(&self, call: PendingToolCall) -> Result<ToolExecutionResult> {
+        let result = self.execute_inner(call).await?;
         let mut event = Event::new(self.invocation_id);
         event.author = self.ctx.agent_name().to_owned();
         event.branch = self.ctx.branch().to_owned();
@@ -1896,10 +1896,10 @@ impl ToolExecutor<'_> {
         event.llm_response.content = Some(result.content.clone());
         // Runner commits each result while other calls are still awaiting approval.
         let _ = self.progress_tx.send(event).await;
-        result
+        Ok(result)
     }
 
-    async fn execute_inner(&self, call: PendingToolCall) -> ToolExecutionResult {
+    async fn execute_inner(&self, call: PendingToolCall) -> Result<ToolExecutionResult> {
         let PendingToolCall { index, name, args, id, function_call_id, guardrail_denial } = call;
         let mut tool_actions = EventActions::default();
         let mut response_content: Option<Content> = None;
@@ -1922,12 +1922,12 @@ impl ToolExecutor<'_> {
                     annotations: None,
                 }],
             };
-            return ToolExecutionResult {
+            return Ok(ToolExecutionResult {
                 index,
                 content: denied_content,
                 actions: tool_actions,
                 escalate_or_skip: false,
-            };
+            });
         }
 
         // Acquire concurrency permit before tool execution.
@@ -1948,12 +1948,12 @@ impl ToolExecutor<'_> {
                         annotations: None,
                     }],
                 };
-                return ToolExecutionResult {
+                return Ok(ToolExecutionResult {
                     index,
                     content: error_content,
                     actions: tool_actions,
                     escalate_or_skip: false,
-                };
+                });
             }
         };
 
@@ -1977,27 +1977,7 @@ impl ToolExecutor<'_> {
                     function_call_id: Some(function_call_id.clone()),
                     args: args.clone(),
                 };
-                match handler.decide(&request).await {
-                    Ok(value) => decision = Some(value),
-                    Err(error) => {
-                        return ToolExecutionResult {
-                            index,
-                            content: Content {
-                                role: "function".into(),
-                                parts: vec![Part::FunctionResponse {
-                                    function_response: FunctionResponseData::new(
-                                        name.clone(),
-                                        serde_json::json!({"error": error.to_string()}),
-                                    ),
-                                    id: id.clone(),
-                                    annotations: None,
-                                }],
-                            },
-                            actions: tool_actions,
-                            escalate_or_skip: true,
-                        };
-                    }
-                }
+                decision = Some(handler.decide(&request).await?);
             }
             match decision {
                 Some(ToolConfirmationDecision::Approve) => {
@@ -2480,12 +2460,12 @@ impl ToolExecutor<'_> {
         }
 
         let escalate_or_skip = tool_actions.escalate || tool_actions.skip_summarization;
-        ToolExecutionResult {
+        Ok(ToolExecutionResult {
             index,
             content: response_content,
             actions: tool_actions,
             escalate_or_skip,
-        }
+        })
     }
 }
 
@@ -2919,6 +2899,12 @@ impl Agent for LlmAgent {
                             // deltas, so the last chunk alone is insufficient.
                             if !chunk.partial {
                                 event.llm_response.content = accumulated_content.clone();
+                                if let Some(metadata) = event.llm_response.provider_metadata
+                                    .get_or_insert_with(|| serde_json::json!({}))
+                                    .as_object_mut()
+                                {
+                                    metadata.insert("content_complete".into(), true.into());
+                                }
                             }
                             yield Ok(event);
                         }
@@ -3373,12 +3359,12 @@ impl Agent for LlmAgent {
                                 ToolDispatchMode::Sequential => {
                                     let mut results = Vec::with_capacity(fc_parts.len());
                                     for call in fc_parts {
-                                        results.push(executor.execute(call).await);
+                                        results.push(executor.execute(call).await?);
                                     }
                                     results
                                 }
                                 ToolDispatchMode::Parallel => {
-                                    use futures::StreamExt as _;
+                                    use futures::{StreamExt as _, TryStreamExt as _};
                                     // Parallel is an explicit caller override. Tool
                                     // safety metadata is intentionally not inspected.
                                     // All concurrency enforcement is handled by the
@@ -3390,11 +3376,11 @@ impl Agent for LlmAgent {
                                         fc_parts.into_iter().map(|call| executor.execute(call)),
                                     )
                                     .buffer_unordered(buffer_size)
-                                    .collect()
-                                    .await
+                                    .try_collect()
+                                    .await?
                                 }
                                 ToolDispatchMode::ParallelDelegations => {
-                                    use futures::StreamExt as _;
+                                    use futures::{StreamExt as _, TryStreamExt as _};
 
                                     let mut all_results = Vec::with_capacity(fc_parts.len());
                                     let mut calls = fc_parts.into_iter().peekable();
@@ -3403,7 +3389,7 @@ impl Agent for LlmAgent {
                                             .get(&call.name)
                                             .is_some_and(|tool| tool.is_agent_delegation());
                                         if !is_delegation {
-                                            all_results.push(executor.execute(call).await);
+                                            all_results.push(executor.execute(call).await?);
                                             continue;
                                         }
 
@@ -3426,8 +3412,8 @@ impl Agent for LlmAgent {
                                                     .map(|call| executor.execute(call)),
                                             )
                                             .buffer_unordered(buffer_size)
-                                            .collect::<Vec<_>>()
-                                            .await,
+                                            .try_collect::<Vec<_>>()
+                                            .await?,
                                         );
                                     }
                                     all_results
@@ -3446,7 +3432,7 @@ impl Agent for LlmAgent {
                                     // Concurrency enforcement is handled by the semaphore
                                     // inside ToolExecutor.
                                     if !concurrent_fcs.is_empty() {
-                                        use futures::StreamExt as _;
+                                        use futures::{StreamExt as _, TryStreamExt as _};
                                         let buffer_size = concurrent_fcs.len().max(1);
                                         all_results.extend(
                                             futures::stream::iter(
@@ -3455,19 +3441,19 @@ impl Agent for LlmAgent {
                                                     .map(|call| executor.execute(call)),
                                             )
                                             .buffer_unordered(buffer_size)
-                                            .collect::<Vec<_>>()
-                                            .await,
+                                            .try_collect::<Vec<_>>()
+                                            .await?,
                                         );
                                     }
 
                                     // Everything else runs one at a time.
                                     for call in sequential_fcs {
-                                        all_results.push(executor.execute(call).await);
+                                        all_results.push(executor.execute(call).await?);
                                     }
                                     all_results
                                 }
                             };
-                            results
+                            Ok::<_, adk_core::AdkError>(results)
                         };
 
                         // Drain tool progress concurrently with execution, yielding
@@ -3489,7 +3475,13 @@ impl Agent for LlmAgent {
                         while let Ok(progress_event) = progress_rx.try_recv() {
                             yield Ok(progress_event);
                         }
-                        results
+                        match results {
+                            Ok(results) => results,
+                            Err(error) => {
+                                yield Err(error);
+                                return;
+                            }
+                        }
                     };
                     // Preserve LLM-returned order even when tool futures finish out of order.
                     results.sort_by_key(|r| r.index);
