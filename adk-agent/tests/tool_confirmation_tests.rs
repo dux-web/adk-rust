@@ -575,3 +575,91 @@ async fn completed_result_is_visible_while_sibling_approval_waits() {
     }
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+
+#[derive(Debug)]
+struct FailedApproval;
+
+#[async_trait]
+impl ToolConfirmationHandler for FailedApproval {
+    async fn decide(&self, request: &ToolConfirmationRequest) -> Result<ToolConfirmationDecision> {
+        if request.function_call_id.as_deref() == Some("call-sensitive") {
+            std::future::pending().await
+        } else {
+            Err(adk_core::AdkError::tool("approval service unavailable"))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FailSecondApproval;
+
+#[async_trait]
+impl ToolConfirmationHandler for FailSecondApproval {
+    async fn decide(&self, request: &ToolConfirmationRequest) -> Result<ToolConfirmationDecision> {
+        if request.function_call_id.as_deref() == Some("call-sensitive") {
+            Err(adk_core::AdkError::tool("approval service unavailable"))
+        } else {
+            Ok(ToolConfirmationDecision::Approve)
+        }
+    }
+}
+
+#[tokio::test]
+async fn approval_failure_preserves_completed_sibling_results() {
+    let tool = Arc::new(CountingTool::new());
+    let calls = tool.calls.clone();
+    let agent = LlmAgentBuilder::new("test-agent")
+        .model(Arc::new(SequencedModel::new(vec![two_calls_to_same_tool()])))
+        .tool(tool)
+        .tool_execution_strategy(adk_core::ToolExecutionStrategy::Sequential)
+        .require_tool_confirmation("test_tool")
+        .build()
+        .unwrap();
+    let config =
+        RunConfig::builder().tool_confirmation_handler(Arc::new(FailSecondApproval)).build();
+    let stream = agent.run(Arc::new(MockContext::new(config))).await.unwrap();
+    let events = stream.collect::<Vec<_>>().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(events.last().unwrap().is_err());
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.as_ref().ok())
+        .flat_map(|event| event.tool_results())
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].call_id, Some("call-scratch"));
+}
+
+#[tokio::test]
+async fn approval_failure_terminates_dispatch_with_an_error() {
+    for strategy in [
+        adk_core::ToolExecutionStrategy::Sequential,
+        adk_core::ToolExecutionStrategy::Parallel,
+        adk_core::ToolExecutionStrategy::Auto,
+    ] {
+        let tool = Arc::new(CountingTool::new());
+        let calls = tool.calls.clone();
+        let agent = LlmAgentBuilder::new("test-agent")
+            .model(Arc::new(SequencedModel::new(vec![two_calls_to_same_tool()])))
+            .tool(tool)
+            .tool_execution_strategy(strategy)
+            .require_tool_confirmation("test_tool")
+            .build()
+            .unwrap();
+        let config =
+            RunConfig::builder().tool_confirmation_handler(Arc::new(FailedApproval)).build();
+        let stream = agent.run(Arc::new(MockContext::new(config))).await.unwrap();
+        let events =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.collect::<Vec<_>>())
+                .await
+                .expect("approval failure must not wait for another approval");
+        let error = events.last().expect("error event").as_ref().unwrap_err();
+        assert!(error.to_string().contains("approval service unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(events.iter().filter_map(|event| event.as_ref().ok()).all(|event| {
+            !event.content().is_some_and(|content| {
+                content.parts.iter().any(|part| matches!(part, Part::FunctionResponse { .. }))
+            })
+        }));
+    }
+}
