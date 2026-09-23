@@ -45,13 +45,16 @@ impl BrowserSession {
         Self::new(BrowserConfig::default())
     }
 
-    /// Start the browser session by connecting to WebDriver.
+    /// Start the browser session, replacing an unavailable WebDriver connection.
     pub async fn start(&self) -> Result<()> {
         let mut driver_guard = self.driver.write().await;
 
-        if driver_guard.is_some() {
-            return Ok(()); // Already started
+        if let Some(driver) = driver_guard.as_ref()
+            && driver.title().await.is_ok()
+        {
+            return Ok(());
         }
+        *driver_guard = None;
 
         let caps = self.build_capabilities()?;
         let driver = WebDriver::new(&self.config.webdriver_url, caps)
