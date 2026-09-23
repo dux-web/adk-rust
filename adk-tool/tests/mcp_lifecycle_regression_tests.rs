@@ -70,13 +70,19 @@ impl ServerHandler for InputServer {
         }
         if let Some(responses) = params.input_responses {
             assert_eq!(params.request_state.as_deref(), Some("round-1"));
+            if params.name == "batch" {
+                return Ok(
+                    CallToolResult::structured(serde_json::to_value(responses).unwrap()).into()
+                );
+            }
             return Ok(CallToolResult::structured(responses["answer"].clone()).into());
         }
-        Ok(InputRequiredResult::new(
-            Some([("answer".into(), input_request())].into()),
-            Some("round-1".into()),
-        )
-        .into())
+        let requests = if params.name == "batch" {
+            [("first".into(), input_request()), ("second".into(), input_request())].into()
+        } else {
+            [("answer".into(), input_request())].into()
+        };
+        Ok(InputRequiredResult::new(Some(requests), Some("round-1".into())).into())
     }
 
     async fn get_task(
@@ -113,6 +119,43 @@ async fn direct_calls_reuse_the_custom_handler_for_inline_and_task_input() {
         assert_eq!(value["output"]["content"]["name"], "Ferris", "{value}");
     }
     assert_eq!(handled.load(Ordering::SeqCst), 2);
+}
+
+struct BatchClient(tokio::sync::Barrier);
+
+impl ClientHandler for BatchClient {
+    fn get_info(&self) -> ClientInfo {
+        InputClient::default().get_info()
+    }
+
+    async fn create_elicitation(
+        &self,
+        _params: ElicitRequestParams,
+        context: RequestContext<RoleClient>,
+    ) -> Result<ElicitResult, ErrorData> {
+        // Each prompt must become visible before either answer is submitted.
+        self.0.wait().await;
+        Ok(ElicitResult::new(ElicitationAction::Accept).with_content(json!({"id": context.id})))
+    }
+}
+
+#[tokio::test]
+async fn input_batches_dispatch_custom_handlers_concurrently() {
+    let (server_io, client_io) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        InputServer::default().serve(server_io).await.unwrap().waiting().await.unwrap();
+    });
+    let client = BatchClient(tokio::sync::Barrier::new(2)).serve(client_io).await.unwrap();
+    let toolset = McpToolset::new(client);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        toolset.call_tool_value("batch", Default::default()),
+    )
+    .await
+    .expect("all prompts must be dispatched without waiting for earlier answers")
+    .unwrap();
+    assert_eq!(result["output"]["first"]["content"]["id"], "first");
+    assert_eq!(result["output"]["second"]["content"]["id"], "second");
 }
 
 #[derive(Clone, Default)]

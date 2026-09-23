@@ -1266,7 +1266,9 @@ where
                 }
                 TaskPayload::InputRequired { input_requests } => {
                     input_rounds += 1;
-                    if input_rounds > self.task_config.max_input_rounds || input_requests.is_empty()
+                    if input_rounds > self.task_config.max_input_rounds
+                        || input_requests.is_empty()
+                        || input_requests.len() > 64
                     {
                         return Err(TaskError::PollFailed("MCP task input limit exceeded".into()));
                     }
