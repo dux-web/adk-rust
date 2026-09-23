@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Preserve MCP task execution for direct tool calls and retain pending tasks until cancellation is confirmed.
+
 ### Added
+
+- **Integration branch provider data** (`adk-gemini`, `adk-anthropic`): retain Google Search entry points and grounding part indices, and the `request_too_large` search error. These source-level API extensions are confined to this integration branch.
+
+- **Browser session options** (`adk-browser`): optional explicit session startup and Chrome binary/preferences overrides. Chrome keeps its sandbox unless callers explicitly supply `--no-sandbox`.
 
 - **Automatic progressive-skill guidance** (`adk-skill`, `adk-agent`):
   `SkillToolset` now adds guidance for its currently available tools to each
@@ -16,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Agent event fidelity** (`adk-agent`): preserve citations and complete terminal content, continue provider-native paused turns, and emit individual tool results while sibling approvals are pending. Propagate approval failures and keep tool-start events from ending responses. Built-in streaming consumers avoid appending complete snapshots twice; `adk-core::EventTextDeltas` exposes the same text/thinking adapter to applications.
+- **Native provider fidelity** (`adk-model`, `adk-anthropic`, `adk-gemini`): retain streamed Unicode, tool images, PDF inputs, native search/reasoning blocks and usage; preserve commentary for application rendering and honor explicit request/retry configuration.
 
 - **OpenAI reasoning history** (`adk-model`): `Part::Thinking` is excluded
   from visible user, assistant, and system message content. By default,

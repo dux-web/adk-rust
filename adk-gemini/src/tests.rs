@@ -6,6 +6,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[test]
+fn grounding_preserves_search_suggestions_and_part_indices() {
+    let wire = json!({
+        "searchEntryPoint": {"renderedContent": "<p>Search</p>", "sdkBlob": "opaque"},
+        "groundingSupports": [{
+            "segment": {"partIndex": 2, "startIndex": 0, "endIndex": 6, "text": "Answer"},
+            "groundingChunkIndices": [0]
+        }]
+    });
+    let metadata: crate::GroundingMetadata = serde_json::from_value(wire.clone()).unwrap();
+    let entry: &crate::SearchEntryPoint = metadata.search_entry_point.as_ref().unwrap();
+    assert_eq!(entry.rendered_content.as_deref(), Some("<p>Search</p>"));
+    assert_eq!(metadata.grounding_supports.as_ref().unwrap()[0].segment.part_index, Some(2));
+    assert_eq!(serde_json::to_value(metadata).unwrap(), wire);
+}
+
+#[test]
 fn test_model_deserialization() {
     #[derive(Serialize, Deserialize)]
     struct Response {
