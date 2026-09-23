@@ -104,9 +104,9 @@ pub use generation::{
     model::GenerationConfig, model::GenerationResponse, model::GroundingChunk,
     model::GroundingMetadata, model::GroundingSegment, model::GroundingSupport,
     model::MultiSpeakerVoiceConfig, model::PrebuiltVoiceConfig, model::PromptFeedback,
-    model::PromptTokenDetails, model::SearchEntryPoint, model::SpeakerVoiceConfig,
-    model::SpeechConfig, model::ThinkingConfig, model::ThinkingLevel, model::UsageMetadata,
-    model::VoiceConfig, model::WebGroundingChunk,
+    model::PromptTokenDetails, model::SpeakerVoiceConfig, model::SpeechConfig,
+    model::ThinkingConfig, model::ThinkingLevel, model::UsageMetadata, model::VoiceConfig,
+    model::WebGroundingChunk,
 };
 
 // ========== Text Embeddings ==========

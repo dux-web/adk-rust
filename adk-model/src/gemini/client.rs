@@ -871,7 +871,7 @@ impl GeminiModel {
             });
 
         // Serialize grounding metadata into provider_metadata so consumers
-        // can display the supplied suggestions and sources without changing the answer.
+        // can display search queries and sources without changing the answer.
         let provider_metadata = resp
             .candidates
             .first()
