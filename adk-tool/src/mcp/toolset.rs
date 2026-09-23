@@ -33,6 +33,20 @@ use tracing::{debug, warn};
 /// Shared factory object used to recreate MCP connections for refresh/retry.
 type DynConnectionFactory<S> = Arc<dyn ConnectionFactory<S>>;
 
+async fn restore_subscriptions<S: rmcp::service::Service<RoleClient>>(
+    client: &RunningService<RoleClient, S>,
+    subscriptions: &RwLock<BTreeSet<String>>,
+) -> Result<()> {
+    for uri in subscriptions.read().await.iter() {
+        // Existing resource callbacks use the negotiated legacy subscription API.
+        #[allow(deprecated)]
+        client.subscribe(SubscribeRequestParams::new(uri.clone())).await.map_err(|error| {
+            AdkError::tool(format!("Failed to restore MCP resource subscription '{uri}': {error}"))
+        })?;
+    }
+    Ok(())
+}
+
 fn mcp_tool_safety(annotations: Option<&ToolAnnotations>) -> (bool, bool) {
     let read_only = annotations.and_then(|value| value.read_only_hint).unwrap_or(false);
     let idempotent = annotations.and_then(|value| value.idempotent_hint).unwrap_or(false);
@@ -444,6 +458,7 @@ where
             task_config: self.task_config.clone(),
             active_tasks: self.active_tasks.clone(),
             mrtr_handler: self.mrtr_handler.clone(),
+            resource_subscriptions: self.resource_subscriptions.clone(),
         }
         .execute_value(Value::Object(arguments))
         .await
@@ -492,19 +507,7 @@ where
             .await
             .map_err(|e| AdkError::tool(format!("Failed to refresh MCP connection: {e}")))?;
 
-        for uri in self.resource_subscriptions.read().await.iter() {
-            // `subscriptions/listen` replaces this in 2026-07-28, but we negotiate
-            // 2025-11-25, and `listen` also stops routing notifications through
-            // `ClientHandler`, which this crate's resource callbacks rely on.
-            #[allow(deprecated)]
-            new_client.subscribe(SubscribeRequestParams::new(uri.clone())).await.map_err(
-                |error| {
-                    AdkError::tool(format!(
-                        "Failed to restore MCP resource subscription '{uri}': {error}"
-                    ))
-                },
-            )?;
-        }
+        restore_subscriptions(&new_client, &self.resource_subscriptions).await?;
 
         let mut client = self.client.lock().await;
         let old_token = client.cancellation_token();
@@ -772,6 +775,7 @@ where
                 task_config: self.task_config.clone(),
                 active_tasks: self.active_tasks.clone(),
                 mrtr_handler: self.mrtr_handler.clone(),
+                resource_subscriptions: self.resource_subscriptions.clone(),
             };
 
             tools.push(Arc::new(adk_tool) as Arc<dyn Tool>);
@@ -966,6 +970,7 @@ where
     /// Task configuration
     task_config: McpTaskConfig,
     active_tasks: Arc<Mutex<BTreeSet<String>>>,
+    resource_subscriptions: Arc<RwLock<BTreeSet<String>>>,
     /// Policy bridge used to fulfil MRTR input without keeping server state.
     mrtr_handler: Option<super::elicitation::AdkClientHandler>,
 }
@@ -1043,6 +1048,7 @@ where
             .await
             .map_err(|e| AdkError::tool(format!("Failed to refresh MCP connection: {e}")))?;
 
+        restore_subscriptions(&new_client, &self.resource_subscriptions).await?;
         let mut client = self.client.lock().await;
         let old_token = client.cancellation_token();
         old_token.cancel();
@@ -1148,7 +1154,10 @@ where
     ) -> std::result::Result<rmcp::model::InputResponses, String> {
         match &self.mrtr_handler {
             Some(handler) => handler.fulfill_input_requests(requests).await,
-            None => Err("MCP input requires an elicitation handler".into()),
+            None => {
+                let client = self.client.lock().await;
+                super::input::fulfill(&client, requests).await
+            }
         }
     }
 
