@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Integration branch provider data** (`adk-gemini`, `adk-anthropic`): retain Google Search entry points and grounding part indices, and the `request_too_large` search error. These source-level API extensions are confined to this integration branch.
 
-- **OpenCode Go** (`adk-model`): optional model adapter routes documented models through Chat Completions, Responses, or Messages, preserving application and conversation headers. The existing clients expose additional default HTTP headers.
+- **OpenCode Go and Zen** (`adk-model`): optional model adapter routes documented models through Chat Completions, Responses, Messages, or Gemini GenerateContent, preserving application and conversation headers. The existing clients expose additional default HTTP headers, and Gemini honors its configured HTTP client builder.
 
 - **Browser session options** (`adk-browser`): optional explicit session startup and Chrome binary/preferences overrides. Chrome keeps its sandbox unless callers explicitly supply `--no-sandbox`.
 

@@ -270,8 +270,8 @@ pub mod ollama;
 pub mod openai;
 #[cfg(feature = "openai")]
 pub mod openai_compatible;
-#[cfg(feature = "opencode-go")]
-pub mod opencode_go;
+#[cfg(feature = "opencode")]
+pub mod opencode;
 #[cfg(feature = "openrouter")]
 pub mod openrouter;
 /// Conversion outcomes for content parts sent to a provider.
@@ -314,8 +314,8 @@ pub use ollama::{OllamaConfig, OllamaModel};
 pub use openai::{AzureConfig, AzureOpenAIClient, OpenAIClient, OpenAIConfig, ReasoningEffort};
 #[cfg(feature = "openai")]
 pub use openai_compatible::{OpenAICompatible, OpenAICompatibleConfig, ReasoningReplayField};
-#[cfg(feature = "opencode-go")]
-pub use opencode_go::{OpenCodeGoApi, OpenCodeGoClient, OpenCodeGoConfig};
+#[cfg(feature = "opencode")]
+pub use opencode::{OpenCodeApi, OpenCodeClient, OpenCodeConfig, OpenCodeService};
 #[cfg(feature = "openrouter")]
 pub use openrouter::{OpenRouterApiMode, OpenRouterClient, OpenRouterConfig};
 pub use provider::ModelProvider;
