@@ -12,7 +12,7 @@ LLM model integrations for Rust Agent Development Kit (ADK-Rust) with Gemini, Op
 
 - **Gemini** - Google's Gemini models (3 Pro, 3 Flash, 2.5 Pro, 2.5 Flash, etc.)
 - **OpenAI** - GPT-5.1, GPT-5, GPT-5 Mini, GPT-4o (legacy)
-- **OpenCode Go** - Per-model API routing with stable conversation headers (`opencode-go` feature)
+- **OpenCode Go and Zen** - Per-model API routing with stable conversation headers (`opencode` feature)
 - **OpenRouter** - Native chat, responses, routing, discovery, and credits APIs
 - **xAI** - Grok models through the OpenAI-compatible API
 - **Anthropic** - Claude Opus 4.8, Claude Opus 4.7, Claude Sonnet 4.6, Claude Haiku 4.5
@@ -756,4 +756,4 @@ Apache-2.0
 
 This crate is part of the [ADK-Rust](https://adk-rust.com) framework for building AI agents in Rust.
 
-See [OpenCode Go](../docs/official_docs/models/opencode-go.md) for configuration and the streaming example.
+See [OpenCode Go and Zen](../docs/official_docs/models/opencode.md) for configuration and the streaming example.

@@ -19,7 +19,10 @@ use google_cloud_aiplatform_v1::client::PredictionService;
 #[cfg(feature = "vertex")]
 use google_cloud_auth::credentials::{self, Credentials};
 use mime::Mime;
-use reqwest::{ClientBuilder, header::InvalidHeaderValue};
+use reqwest::{
+    ClientBuilder,
+    header::{HeaderMap, HeaderValue, InvalidHeaderValue},
+};
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::{
@@ -299,6 +302,13 @@ pub enum Error {
     InvalidApiKey {
         /// The underlying header value error.
         source: InvalidHeaderValue,
+    },
+
+    /// Failed to build the HTTP client.
+    #[snafu(display("failed to build HTTP client"))]
+    BuildHttpClient {
+        /// The underlying client configuration error.
+        source: reqwest::Error,
     },
 
     /// Failed to construct a request URL (likely an incorrect model name).
@@ -1129,8 +1139,14 @@ impl GeminiBuilder {
             return MissingApiKeySnafu.fail();
         }
 
+        let mut key = HeaderValue::from_str(&api_key).context(InvalidApiKeySnafu)?;
+        key.set_sensitive(true);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-goog-api-key", key);
+        let client =
+            self.client_builder.default_headers(headers).build().context(BuildHttpClientSnafu)?;
         let studio =
-            backend::studio::StudioBackend::new(&api_key, self.model.clone(), self.base_url)?;
+            backend::studio::StudioBackend::with_client(client, self.model.clone(), self.base_url);
 
         Ok(Gemini { client: Arc::new(GeminiClient::with_studio(self.model, studio)) })
     }

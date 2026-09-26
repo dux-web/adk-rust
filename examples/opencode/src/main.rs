@@ -1,12 +1,12 @@
 use adk_core::{Content, Llm, LlmRequest};
-use adk_model::opencode_go::{OpenCodeGoClient, OpenCodeGoConfig};
+use adk_model::opencode::{OpenCodeClient, OpenCodeConfig, OpenCodeService};
 use futures::TryStreamExt;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adk_core::ensure_crypto_provider();
-    let model = OpenCodeGoClient::new(
-        OpenCodeGoConfig::new(std::env::var("OPENCODE_API_KEY")?, "deepseek-v4.1-flash")
+    let model = OpenCodeClient::new(
+        OpenCodeConfig::new(OpenCodeService::Go, std::env::var("OPENCODE_API_KEY")?, "deepseek-v4.1-flash")
             .with_user_agent("adk-opencode-example/1.0")
             .with_session_id("example-conversation-1"),
     )?;
