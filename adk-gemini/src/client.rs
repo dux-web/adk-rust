@@ -304,13 +304,6 @@ pub enum Error {
         source: InvalidHeaderValue,
     },
 
-    /// Failed to build the HTTP client.
-    #[snafu(display("failed to build HTTP client"))]
-    BuildHttpClient {
-        /// The underlying client configuration error.
-        source: reqwest::Error,
-    },
-
     /// Failed to construct a request URL (likely an incorrect model name).
     #[snafu(display("failed to construct URL (probably incorrect model name): {suffix}"))]
     ConstructUrl {
@@ -1156,7 +1149,7 @@ impl GeminiBuilder {
         let mut headers = HeaderMap::new();
         headers.insert("x-goog-api-key", key);
         let client =
-            self.client_builder.default_headers(headers).build().context(BuildHttpClientSnafu)?;
+            self.client_builder.default_headers(headers).build().context(PerformRequestNewSnafu)?;
         let studio =
             backend::studio::StudioBackend::with_client(client, self.model.clone(), self.base_url);
 
