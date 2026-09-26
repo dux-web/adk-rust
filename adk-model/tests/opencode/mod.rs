@@ -1,5 +1,5 @@
 use adk_core::{Content, Llm, LlmRequest, Part};
-use adk_model::opencode_go::{OpenCodeGoApi, OpenCodeGoClient, OpenCodeGoConfig};
+use adk_model::opencode::{OpenCodeApi, OpenCodeClient, OpenCodeConfig, OpenCodeService};
 use adk_model::retry::RetryConfig;
 use futures::TryStreamExt;
 use serde_json::{Value, json};
@@ -9,11 +9,44 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod tools;
 mod validation;
 
-fn config(model: &str) -> OpenCodeGoConfig {
-    OpenCodeGoConfig::new("test-key", model)
+fn config(model: &str) -> OpenCodeConfig {
+    config_for(OpenCodeService::Go, model)
+}
+
+fn config_for(service: OpenCodeService, model: &str) -> OpenCodeConfig {
+    OpenCodeConfig::new(service, "test-key", model)
         .with_user_agent("test-coding-agent/1.0")
         .with_session_id("conversation-42")
         .with_retry_config(RetryConfig::disabled())
+}
+
+const CASES: &[(OpenCodeService, &str, OpenCodeApi, &str)] = &[
+    (OpenCodeService::Go, "deepseek-v4.1-flash", OpenCodeApi::ChatCompletions, "chat/completions"),
+    (OpenCodeService::Go, "minimax-m3", OpenCodeApi::Messages, "messages"),
+    (OpenCodeService::Go, "gpt-6-luna", OpenCodeApi::Responses, "responses"),
+    (OpenCodeService::Zen, "minimax-m3", OpenCodeApi::ChatCompletions, "chat/completions"),
+    (OpenCodeService::Zen, "qwen3.8-flash", OpenCodeApi::Messages, "messages"),
+    (OpenCodeService::Zen, "gpt-6-luna", OpenCodeApi::Responses, "responses"),
+    (
+        OpenCodeService::Zen,
+        "gemini-3.8-flash",
+        OpenCodeApi::GenerateContent,
+        "models/gemini-3.8-flash:generateContent",
+    ),
+];
+
+fn gemini() -> Value {
+    json!({"candidates":[{"index":0,"content":{"role":"model","parts":[{"text":"done"}]},"finishReason":"STOP"}],
+        "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"totalTokenCount":12}})
+}
+
+fn reply(api: OpenCodeApi, model: &str) -> Value {
+    match api {
+        OpenCodeApi::ChatCompletions => chat(model),
+        OpenCodeApi::Responses => response(model),
+        OpenCodeApi::Messages => message(model),
+        OpenCodeApi::GenerateContent => gemini(),
+    }
 }
 
 fn message(model: &str) -> Value {
@@ -48,33 +81,25 @@ fn sse(events: &[Value]) -> String {
 
 #[tokio::test]
 async fn routes_unary_requests_and_preserves_headers_across_turns() {
-    for (model, endpoint, api, reply) in [
-        (
-            "deepseek-v4.1-flash",
-            "chat/completions",
-            OpenCodeGoApi::ChatCompletions,
-            chat("deepseek-v4.1-flash"),
-        ),
-        ("gpt-6-luna", "responses", OpenCodeGoApi::Responses, response("gpt-6-luna")),
-        ("minimax-m3", "messages", OpenCodeGoApi::Messages, message("minimax-m3")),
-    ] {
+    for &(service, model, api, endpoint) in CASES {
         let server = MockServer::start().await;
-        let auth = if api == OpenCodeGoApi::Messages {
-            ("x-api-key", "test-key")
-        } else {
-            ("authorization", "Bearer test-key")
+        let auth = match api {
+            OpenCodeApi::Messages => ("x-api-key", "test-key"),
+            OpenCodeApi::GenerateContent => ("x-goog-api-key", "test-key"),
+            _ => ("authorization", "Bearer test-key"),
         };
+        let prefix = if service == OpenCodeService::Go { "/zen/go/v1" } else { "/zen/v1" };
         Mock::given(method("POST"))
-            .and(path(format!("/zen/go/v1/{endpoint}")))
+            .and(path(format!("{prefix}/{endpoint}")))
             .and(header("user-agent", "test-coding-agent/1.0"))
             .and(header("x-opencode-session", "conversation-42"))
             .and(header(auth.0, auth.1))
-            .respond_with(ResponseTemplate::new(200).set_body_json(reply))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reply(api, model)))
             .expect(2)
             .mount(&server)
             .await;
-        let client = OpenCodeGoClient::new(
-            config(model).with_base_url(format!("{}/zen/go/v1/", server.uri())),
+        let client = OpenCodeClient::new(
+            config_for(service, model).with_base_url(format!("{}{prefix}/", server.uri())),
         )
         .unwrap();
         assert_eq!((client.api(), client.name()), (api, model));
@@ -102,10 +127,12 @@ async fn routes_unary_requests_and_preserves_headers_across_turns() {
         }
         for request in server.received_requests().await.unwrap() {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
-            assert_eq!(body["model"], model);
+            if api != OpenCodeApi::GenerateContent {
+                assert_eq!(body["model"], model);
+            }
             assert!(body.get("user_agent").is_none());
             assert!(body.get("session_id").is_none());
-            if api == OpenCodeGoApi::Messages {
+            if api == OpenCodeApi::Messages {
                 assert_eq!(request.headers["anthropic-version"], "2023-06-01");
             }
         }
@@ -132,11 +159,15 @@ async fn routes_streams_with_conversation_headers_and_usage() {
         json!({"type":"response.output_text.delta","sequence_number":0,"item_id":"msg_test","output_index":0,"content_index":0,"delta":"done","logprobs":[]}),
         json!({"type":"response.completed","sequence_number":1,"response":response("gpt-6-luna")}),
     ]);
-    for (model, endpoint, body) in [
-        ("deepseek-v4.1-flash", "chat/completions", chat_events),
-        ("minimax-m3", "messages", messages),
-        ("gpt-6-luna", "responses", responses),
-    ] {
+    for &(service, model, api, endpoint) in CASES {
+        let (endpoint, body) = match api {
+            OpenCodeApi::ChatCompletions => (endpoint.to_owned(), chat_events.clone()),
+            OpenCodeApi::Messages => (endpoint.to_owned(), messages.clone()),
+            OpenCodeApi::Responses => (endpoint.to_owned(), responses.clone()),
+            OpenCodeApi::GenerateContent => {
+                (endpoint.replace(":generateContent", ":streamGenerateContent"), sse(&[gemini()]))
+            }
+        };
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(format!("/v1/{endpoint}")))
@@ -146,9 +177,10 @@ async fn routes_streams_with_conversation_headers_and_usage() {
             .expect(1)
             .mount(&server)
             .await;
-        let client =
-            OpenCodeGoClient::new(config(model).with_base_url(format!("{}/v1", server.uri())))
-                .unwrap();
+        let client = OpenCodeClient::new(
+            config_for(service, model).with_base_url(format!("{}/v1", server.uri())),
+        )
+        .unwrap();
         let replies = client
             .generate_content(
                 LlmRequest::new(model, vec![Content::new("user").with_text("inspect files")]),
@@ -173,6 +205,10 @@ async fn routes_streams_with_conversation_headers_and_usage() {
             "{model}: {replies:?}"
         );
         let requests = server.received_requests().await.unwrap();
-        assert_eq!(serde_json::from_slice::<Value>(&requests[0].body).unwrap()["stream"], true);
+        if api == OpenCodeApi::GenerateContent {
+            assert_eq!(requests[0].url.query(), Some("alt=sse"));
+        } else {
+            assert_eq!(serde_json::from_slice::<Value>(&requests[0].body).unwrap()["stream"], true);
+        }
     }
 }

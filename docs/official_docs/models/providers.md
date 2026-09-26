@@ -61,7 +61,7 @@ export DEEPSEEK_API_KEY="your-key"    # DeepSeek
 export GROQ_API_KEY="your-key"        # Groq
 ```
 
-For OpenCode Go, enable `opencode-go` and follow the [Go configuration guide](opencode-go.md).
+For OpenCode Go and Zen, enable `opencode` and follow the [OpenCode configuration guide](opencode.md).
 
 ## Schema Normalization
 
