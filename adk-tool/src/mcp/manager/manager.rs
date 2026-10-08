@@ -235,7 +235,8 @@ impl McpServerManager {
 
     /// Set the grace period reserved for managed-session shutdown.
     ///
-    /// Default: 5 seconds.
+    /// The period covers cancelling the server's pending MCP tasks and closing
+    /// its session. Default: 5 seconds.
     pub fn with_grace_period(mut self, period: Duration) -> Self {
         self.grace_period = period;
         self
@@ -390,8 +391,10 @@ impl McpServerManager {
 
     /// Stop a managed MCP server by ID.
     ///
-    /// Cancels the MCP session via the toolset's cancellation token, drops the
-    /// `McpToolset` connection, and sets the status to `Stopped`.
+    /// Cancels the server's pending MCP tasks (see
+    /// [`McpToolset::cancel_pending_tasks`]) and then its MCP session, both within
+    /// the grace period, drops the `McpToolset` connection, and sets the status
+    /// to `Stopped`.
     ///
     /// If the server is not running, this is a no-op and returns `Ok(())`.
     ///
@@ -428,11 +431,26 @@ impl McpServerManager {
             return;
         }
 
-        // Cancel the MCP session and drop the toolset
+        // Cancel remote tasks, then the MCP session, and drop the toolset
         if let Some(ref toolset) = entry.toolset {
+            // Task cleanup and session close share one grace period.
+            let deadline = tokio::time::Instant::now() + grace_period;
+            match tokio::time::timeout_at(deadline, toolset.cancel_pending_tasks()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    server.id = id,
+                    error = %error,
+                    "MCP tasks did not confirm cancellation before shutdown"
+                ),
+                Err(_) => tracing::warn!(
+                    server.id = id,
+                    shutdown.grace_ms = grace_period.as_millis(),
+                    "MCP task cancellation did not finish within the grace period"
+                ),
+            }
             let cancel_token = toolset.cancellation_token().await;
             cancel_token.cancel();
-            let closed = tokio::time::timeout(grace_period, async {
+            let closed = tokio::time::timeout_at(deadline, async {
                 while !toolset.is_closed().await {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -1090,8 +1108,9 @@ impl McpServerManager {
     /// Shut down all managed servers and stop health monitoring.
     ///
     /// This method first stops the health monitoring task, then stops all
-    /// running servers by cancelling their MCP sessions and dropping the child
-    /// transports. After shutdown, all server statuses are set to `Stopped`.
+    /// running servers by cancelling their pending MCP tasks and MCP sessions
+    /// and dropping the child transports. After shutdown, all server statuses
+    /// are set to `Stopped`.
     ///
     /// # Example
     ///
@@ -1805,5 +1824,104 @@ mod tests {
         let manager = McpServerManager::new(configs);
         // Drop happens here — should not panic
         drop(manager);
+    }
+
+    /// Materializes one task that never finishes and counts `tasks/get` and
+    /// `tasks/cancel` requests.
+    #[derive(Clone, Default)]
+    struct HeldTaskServer {
+        gets: Arc<std::sync::atomic::AtomicUsize>,
+        cancels: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl rmcp::ServerHandler for HeldTaskServer {
+        fn get_info(&self) -> rmcp::model::ServerInfo {
+            rmcp::model::ServerInfo::new(
+                rmcp::model::ServerCapabilities::builder().enable_tools().enable_tasks().build(),
+            )
+        }
+
+        async fn call_tool(
+            &self,
+            _params: rmcp::model::CallToolRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            Ok(rmcp::model::CreateTaskResult::new(held_task()).into())
+        }
+
+        async fn get_task(
+            &self,
+            _params: rmcp::model::GetTaskParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::GetTaskResult, rmcp::ErrorData> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            Ok(rmcp::model::GetTaskResult::new(rmcp::model::DetailedTask::new(
+                held_task(),
+                rmcp::model::TaskPayload::Working,
+            )))
+        }
+
+        async fn cancel_task(
+            &self,
+            _params: rmcp::model::CancelTaskParams,
+            _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<(), rmcp::ErrorData> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn held_task() -> rmcp::model::Task {
+        let now = "2026-10-08T00:00:00Z";
+        rmcp::model::Task::new("held", rmcp::model::TaskStatus::Working, now, now)
+    }
+
+    #[tokio::test]
+    async fn stop_server_cancels_pending_tasks_within_the_grace_period() {
+        use rmcp::ServiceExt;
+
+        let server = HeldTaskServer::default();
+        let (gets, cancels) = (server.gets.clone(), server.cancels.clone());
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            if let Ok(running) = server.serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = AdkClientHandler::new(Arc::new(AutoDeclineElicitationHandler))
+            .with_tasks()
+            .serve(client_io)
+            .await
+            .unwrap();
+        let toolset = McpToolset::new(client).with_task_support(
+            crate::mcp::McpTaskConfig::enabled().poll_interval(Duration::from_millis(1)),
+        );
+        // Dropping the call once it polls leaves its task tracked by the toolset.
+        tokio::select! {
+            result = toolset.call_tool_value("job", Default::default()) => {
+                panic!("a held task must not finish: {result:?}");
+            }
+            () = async {
+                while gets.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            } => {}
+        }
+
+        let manager = McpServerManager::new(HashMap::from([(
+            "tasks".to_string(),
+            McpServerConfig { command: "unused".to_string(), ..Default::default() },
+        )]))
+        .with_grace_period(Duration::from_secs(2));
+        {
+            let mut servers = manager.servers.write().await;
+            let entry = servers.get_mut("tasks").unwrap();
+            entry.status = ServerStatus::Running;
+            entry.toolset = Some(toolset);
+        }
+        manager.stop_server("tasks").await.unwrap();
+
+        assert_eq!(cancels.load(Ordering::SeqCst), 1, "shutdown must cancel the pending task");
+        assert_eq!(manager.server_status("tasks").await.unwrap(), ServerStatus::Stopped);
     }
 }

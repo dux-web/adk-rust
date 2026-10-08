@@ -9,10 +9,31 @@ use rmcp::{
     service::{RequestContext, RunningService, Service},
 };
 
+/// Answers MRTR input through the client's own handler.
+///
+/// Elicitation is always forwarded. Sampling and roots are forwarded only when
+/// the client declared those capabilities in its handshake, so a server cannot
+/// reach a handler the client never offered. The whole batch is checked before
+/// any request is dispatched.
 pub(super) async fn fulfill<S: Service<RoleClient>>(
     client: &RunningService<RoleClient, S>,
     requests: InputRequests,
 ) -> Result<InputResponses, String> {
+    let capabilities = client.service().get_info().capabilities;
+    for (key, input) in &requests {
+        let undeclared = match input {
+            InputRequest::Elicitation(_) => None,
+            InputRequest::CreateMessage(_) => capabilities.sampling.is_none().then_some("sampling"),
+            InputRequest::ListRoots(_) => capabilities.roots.is_none().then_some("roots"),
+            _ => return Err(format!("input request '{key}' has an unsupported MCP input type")),
+        };
+        if let Some(capability) = undeclared {
+            return Err(format!(
+                "input request '{key}' asks for {capability}, which this MCP client did not \
+                 declare; declare the capability in the client handler to allow it"
+            ));
+        }
+    }
     let responses =
         futures::future::try_join_all(requests.into_iter().map(|(key, input)| async move {
             let mut request = match &input {
@@ -23,7 +44,9 @@ pub(super) async fn fulfill<S: Service<RoleClient>>(
                 InputRequest::ListRoots(request) => {
                     ServerRequest::ListRootsRequest(request.clone())
                 }
-                _ => return Err("unsupported MCP input request".into()),
+                _ => {
+                    return Err(format!("input request '{key}' has an unsupported MCP input type"));
+                }
             };
             let mut context = RequestContext::new(
                 NumberOrString::String(key.clone().into()),
@@ -35,7 +58,7 @@ pub(super) async fn fulfill<S: Service<RoleClient>>(
                 .service()
                 .handle_request(request, context)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| format!("input request '{key}' failed: {error}"))?;
             let value = match (input, result) {
                 (InputRequest::Elicitation(_), ClientResult::ElicitResult(result)) => {
                     serde_json::to_value(result)
@@ -46,7 +69,11 @@ pub(super) async fn fulfill<S: Service<RoleClient>>(
                 (InputRequest::ListRoots(_), ClientResult::ListRootsResult(result)) => {
                     serde_json::to_value(result)
                 }
-                _ => return Err("unexpected MCP input response".into()),
+                _ => {
+                    return Err(format!(
+                        "input request '{key}' received a response of the wrong type"
+                    ));
+                }
             }
             .map_err(|error| error.to_string())?;
             Ok::<_, String>((key, value))
