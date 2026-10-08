@@ -64,7 +64,10 @@ for manifest in ${MANIFESTS[@]+"${MANIFESTS[@]}"}; do
     index+=1
 
     # --locked also catches a lockfile that no longer matches its manifest.
-    if cargo check --manifest-path "$manifest" --locked --quiet 2>"$ERR_FILE"; then
+    # Route through the pinned toolchain: hooks can run under a shadowing cargo
+    # (e.g. nix) that ignores rust-toolchain.toml. Transparent in CI, where the
+    # ambient cargo already matches the pin (falls back to plain cargo).
+    if bash "$ROOT/scripts/cargo-pinned.sh" check --manifest-path "$manifest" --locked --quiet 2>"$ERR_FILE"; then
         printf 'ok       %s\n' "$dir"
     else
         printf 'FAILED   %s\n' "$dir"

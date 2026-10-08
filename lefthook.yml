@@ -45,7 +45,7 @@ pre-commit:
         - "cargo-adk/*.rs"
         - "rustfmt.toml"
         - "rust-toolchain.toml"
-      run: cargo fmt --all -- --check
+      run: bash scripts/cargo-pinned.sh fmt --all -- --check
       fail_text: "Formatting check failed. Run `cargo fmt --all` to fix."
     clippy:
       tags: lint
@@ -63,7 +63,7 @@ pre-commit:
         - ".cargo/config.toml"
         - "rust-toolchain.toml"
         - ".clippy.toml"
-      run: cargo clippy --workspace --all-targets -- -D warnings
+      run: bash scripts/cargo-pinned.sh clippy --workspace --all-targets -- -D warnings
       fail_text: "Clippy found warnings. Fix them before committing (zero-warnings policy)."
     shellcheck:
       tags: lint
@@ -108,7 +108,7 @@ pre-push:
         - "Cargo.lock"
         - ".cargo/config.toml"
         - "rust-toolchain.toml"
-      run: cargo check --workspace
+      run: bash scripts/cargo-pinned.sh check --workspace
       fail_text: "Workspace failed to compile. Fix build errors before pushing."
 
     # The standalone examples are outside the workspace, so `cargo check
