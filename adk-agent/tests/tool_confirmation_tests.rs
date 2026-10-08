@@ -656,3 +656,226 @@ async fn runtime_required_confirmation_executes_after_approval() {
         event.actions.tool_confirmation_decision == Some(ToolConfirmationDecision::Approve)
     }));
 }
+
+#[derive(Debug)]
+struct HoldSecondApproval {
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl ToolConfirmationHandler for HoldSecondApproval {
+    async fn decide(&self, request: &ToolConfirmationRequest) -> Result<ToolConfirmationDecision> {
+        if request.function_call_id.as_deref() == Some("call-sensitive") {
+            self.release.notified().await;
+        }
+        Ok(ToolConfirmationDecision::Approve)
+    }
+}
+
+#[tokio::test]
+async fn completed_result_is_visible_while_sibling_approval_waits() {
+    let handler = Arc::new(HoldSecondApproval { release: tokio::sync::Notify::new() });
+    let tool = Arc::new(CountingTool::new());
+    let calls = tool.calls.clone();
+    let agent = LlmAgentBuilder::new("test-agent")
+        .model(Arc::new(SequencedModel::new(vec![two_calls_to_same_tool()])))
+        .tool(tool)
+        .require_tool_confirmation("test_tool")
+        .build()
+        .unwrap();
+    let config = RunConfig::builder().tool_confirmation_handler(handler.clone()).build();
+    let mut stream = agent.run(Arc::new(MockContext::new(config))).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(event) = stream.next().await {
+            if event.unwrap().content().is_some_and(|content| content.parts.iter().any(|part| {
+                matches!(part, Part::FunctionResponse { id, .. } if id.as_deref() == Some("call-scratch"))
+            })) { return; }
+        }
+        panic!("first result was not emitted");
+    }).await.expect("first result must not wait for the sibling approval");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    handler.release.notify_one();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[derive(Debug)]
+struct FailedApproval;
+
+#[async_trait]
+impl ToolConfirmationHandler for FailedApproval {
+    async fn decide(&self, request: &ToolConfirmationRequest) -> Result<ToolConfirmationDecision> {
+        if request.function_call_id.as_deref() == Some("call-sensitive") {
+            std::future::pending().await
+        } else {
+            Err(adk_core::AdkError::tool("approval service unavailable"))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FailSecondApproval;
+
+#[async_trait]
+impl ToolConfirmationHandler for FailSecondApproval {
+    async fn decide(&self, request: &ToolConfirmationRequest) -> Result<ToolConfirmationDecision> {
+        if request.function_call_id.as_deref() == Some("call-sensitive") {
+            Err(adk_core::AdkError::tool("approval service unavailable"))
+        } else {
+            Ok(ToolConfirmationDecision::Approve)
+        }
+    }
+}
+
+#[tokio::test]
+async fn approval_failure_preserves_completed_sibling_results() {
+    let tool = Arc::new(CountingTool::new());
+    let calls = tool.calls.clone();
+    let agent = LlmAgentBuilder::new("test-agent")
+        .model(Arc::new(SequencedModel::new(vec![two_calls_to_same_tool()])))
+        .tool(tool)
+        .tool_execution_strategy(adk_core::ToolExecutionStrategy::Sequential)
+        .require_tool_confirmation("test_tool")
+        .build()
+        .unwrap();
+    let config =
+        RunConfig::builder().tool_confirmation_handler(Arc::new(FailSecondApproval)).build();
+    let stream = agent.run(Arc::new(MockContext::new(config))).await.unwrap();
+    let events = stream.collect::<Vec<_>>().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(events.last().unwrap().is_err());
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.as_ref().ok())
+        .flat_map(|event| event.tool_results())
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].call_id, Some("call-scratch"));
+}
+
+#[tokio::test]
+async fn approval_failure_terminates_dispatch_with_an_error() {
+    for strategy in [
+        adk_core::ToolExecutionStrategy::Sequential,
+        adk_core::ToolExecutionStrategy::Parallel,
+        adk_core::ToolExecutionStrategy::Auto,
+    ] {
+        let tool = Arc::new(CountingTool::new());
+        let calls = tool.calls.clone();
+        let agent = LlmAgentBuilder::new("test-agent")
+            .model(Arc::new(SequencedModel::new(vec![two_calls_to_same_tool()])))
+            .tool(tool)
+            .tool_execution_strategy(strategy)
+            .require_tool_confirmation("test_tool")
+            .build()
+            .unwrap();
+        let config =
+            RunConfig::builder().tool_confirmation_handler(Arc::new(FailedApproval)).build();
+        let stream = agent.run(Arc::new(MockContext::new(config))).await.unwrap();
+        let events =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.collect::<Vec<_>>())
+                .await
+                .expect("approval failure must not wait for another approval");
+        let error = events.last().expect("error event").as_ref().unwrap_err();
+        assert!(error.to_string().contains("approval service unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(events.iter().filter_map(|event| event.as_ref().ok()).all(|event| {
+            !event.content().is_some_and(|content| {
+                content.parts.iter().any(|part| matches!(part, Part::FunctionResponse { .. }))
+            })
+        }));
+    }
+}
+
+/// Signals when it starts, then runs long enough for a sibling approval to fail mid-execution.
+struct SlowTool {
+    started: Arc<tokio::sync::Notify>,
+    finished: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool for SlowTool {
+    fn name(&self) -> &str {
+        "slow_tool"
+    }
+
+    fn description(&self) -> &str {
+        "Runs while a sibling approval fails"
+    }
+
+    async fn execute(&self, _ctx: Arc<dyn ToolContext>, _args: Value) -> Result<Value> {
+        self.started.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        self.finished.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "status": "slow-ok" }))
+    }
+}
+
+/// Fails the approval once the sibling tool is running.
+#[derive(Debug)]
+struct FailWhileSiblingRuns {
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl ToolConfirmationHandler for FailWhileSiblingRuns {
+    async fn decide(&self, _request: &ToolConfirmationRequest) -> Result<ToolConfirmationDecision> {
+        self.started.notified().await;
+        Err(adk_core::AdkError::tool("approval service unavailable"))
+    }
+}
+
+#[tokio::test]
+async fn parallel_approval_failure_lets_a_running_sibling_finish() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(AtomicUsize::new(0));
+    let calls = LlmResponse {
+        content: Some(Content {
+            role: "model".to_string(),
+            parts: vec![
+                Part::FunctionCall {
+                    name: "slow_tool".to_string(),
+                    args: json!({}),
+                    id: Some("call-slow".to_string()),
+                    thought_signature: None,
+                },
+                Part::FunctionCall {
+                    name: "test_tool".to_string(),
+                    args: json!({}),
+                    id: Some("call-sensitive".to_string()),
+                    thought_signature: None,
+                },
+            ],
+        }),
+        finish_reason: Some(FinishReason::Stop),
+        turn_complete: true,
+        ..Default::default()
+    };
+    let agent = LlmAgentBuilder::new("test-agent")
+        .model(Arc::new(SequencedModel::new(vec![calls])))
+        .tool(Arc::new(SlowTool { started: started.clone(), finished: finished.clone() }))
+        .tool(Arc::new(CountingTool::new()))
+        .tool_execution_strategy(adk_core::ToolExecutionStrategy::Parallel)
+        .require_tool_confirmation("test_tool")
+        .build()
+        .unwrap();
+    let config = RunConfig::builder()
+        .tool_confirmation_handler(Arc::new(FailWhileSiblingRuns { started }))
+        .build();
+
+    let events =
+        agent.run(Arc::new(MockContext::new(config))).await.unwrap().collect::<Vec<_>>().await;
+
+    assert_eq!(finished.load(Ordering::SeqCst), 1, "the running sibling must finish");
+    let error = events.last().expect("error event").as_ref().unwrap_err();
+    assert!(error.to_string().contains("approval service unavailable"));
+    let results: Vec<_> = events
+        .iter()
+        .filter_map(|event| event.as_ref().ok())
+        .flat_map(|event| event.tool_results())
+        .map(|result| result.call_id)
+        .collect();
+    assert_eq!(results, vec![Some("call-slow")]);
+}

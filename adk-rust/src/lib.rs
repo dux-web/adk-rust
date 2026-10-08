@@ -1286,8 +1286,10 @@ pub async fn run(instructions: &str, input: &str) -> Result<String> {
     let mut stream = runner.run(UserId::new("user")?, session_id, content).await?;
 
     let mut result = String::new();
+    let mut text_deltas = adk_core::EventTextDeltas::default();
     while let Some(event) = stream.next().await {
         let event = event?;
+        let event = text_deltas.push(&event);
         if let Some(content) = &event.llm_response.content {
             for part in &content.parts {
                 if let Some(text) = part.text() {
