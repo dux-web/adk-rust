@@ -32,7 +32,7 @@ fn preserves_native_blocks_and_unicode_citations() {
     let response = convert::from_anthropic_message(&original).0;
     let metadata = response.citation_metadata.unwrap();
     assert_eq!(metadata.citation_sources[0].end_index, Some(3));
-    let restored = restore(response.content.as_ref().unwrap()).unwrap().unwrap();
+    let restored = restore(response.content.as_ref().unwrap()).unwrap();
     assert_eq!(restored, original.content);
 }
 
@@ -41,12 +41,11 @@ fn respects_removed_calls_and_changed_arguments() {
     let mut content = convert::from_anthropic_message(&message()).0.content.unwrap();
     let Part::FunctionCall { args, .. } = &mut content.parts[1] else { panic!("call expected") };
     *args = json!({"path":"after.txt"});
-    let blocks = restore(&content).unwrap().unwrap();
+    let blocks = restore(&content).unwrap();
     assert!(matches!(&blocks[1], ContentBlock::ToolUse(tool) if tool.input["path"] == "after.txt"));
     content.parts.remove(1);
     assert!(
         restore(&content)
-            .unwrap()
             .unwrap()
             .iter()
             .all(|block| !matches!(block, ContentBlock::ToolUse(_)))
@@ -54,14 +53,36 @@ fn respects_removed_calls_and_changed_arguments() {
 }
 
 #[test]
-fn rejects_changed_text_and_malformed_carriers() {
+fn edited_text_falls_back_to_plain_conversion() {
     let mut content = convert::from_anthropic_message(&message()).0.content.unwrap();
-    content.parts[0] = Part::Text { text: "Changed".into() };
-    assert!(restore(&content).is_err());
+    // A guardrail that redacts the answer after the response, for example.
+    content.parts[0] = Part::Text { text: "[REDACTED]".into() };
+    assert_eq!(restore(&content), None);
+
+    let request = convert::content_to_message(&content, false).unwrap();
+    assert_eq!(
+        request.content,
+        adk_anthropic::MessageParamContent::Array(vec![
+            ContentBlock::Text(TextBlock::new("[REDACTED]".to_string())),
+            ContentBlock::ToolUse(ToolUseBlock::new(
+                "read",
+                "read_file",
+                json!({"path":"before.txt"}),
+            )),
+        ])
+    );
+}
+
+#[test]
+fn malformed_carriers_fall_back_to_plain_conversion() {
+    let mut content = convert::from_anthropic_message(&message()).0.content.unwrap();
     content.parts = vec![Part::ServerToolResponse {
         server_tool_response: json!({"type":KIND,"content":"invalid"}),
     }];
-    assert!(restore(&content).is_err());
+    assert_eq!(restore(&content), None);
+    content.role = "user".into();
+    content.parts = convert::from_anthropic_message(&message()).0.content.unwrap().parts;
+    assert_eq!(restore(&content), None);
 }
 
 #[test]

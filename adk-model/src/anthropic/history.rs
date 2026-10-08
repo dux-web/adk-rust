@@ -1,6 +1,5 @@
 //! Preserve provider-native blocks that ADK text parts cannot represent.
 
-use super::error::ConversionError;
 use adk_anthropic::{ContentBlock, Message, TextCitation};
 use adk_core::{CitationMetadata, CitationSource, Content, Part};
 use serde_json::json;
@@ -24,7 +23,12 @@ pub(super) fn preserve(message: &Message) -> Option<Part> {
     })
 }
 
-pub(super) fn restore(content: &Content) -> Result<Option<Vec<ContentBlock>>, ConversionError> {
+/// Returns the provider's native blocks for a preserved assistant turn.
+///
+/// Returns `None`, so the caller converts the ADK parts instead, when the turn
+/// carries no native copy or when the copy no longer matches the parts: a
+/// guardrail or callback that rewrote the text must not fail later requests.
+pub(super) fn restore(content: &Content) -> Option<Vec<ContentBlock>> {
     let mut saved = content.parts.iter().filter_map(|part| match part {
         Part::ServerToolResponse { server_tool_response }
             if server_tool_response["type"] == KIND =>
@@ -33,12 +37,19 @@ pub(super) fn restore(content: &Content) -> Result<Option<Vec<ContentBlock>>, Co
         }
         _ => None,
     });
-    let Some(saved_message) = saved.next() else { return Ok(None) };
+    let saved_message = saved.next()?;
     if content.role != "model" && content.role != "assistant" || saved.next().is_some() {
-        return Err(ConversionError::InvalidHistory("invalid native assistant history".into()));
+        tracing::debug!("native anthropic history is ambiguous; converting the adk parts");
+        return None;
     }
-    let mut blocks: Vec<ContentBlock> = serde_json::from_value(saved_message["content"].clone())
-        .map_err(|error| ConversionError::InvalidHistory(error.to_string()))?;
+    let mut blocks: Vec<ContentBlock> =
+        match serde_json::from_value(saved_message["content"].clone()) {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                tracing::debug!(error = %error, "native anthropic history is malformed; converting the adk parts");
+                return None;
+            }
+        };
     let original: String = blocks
         .iter()
         .filter_map(|block| match block {
@@ -55,7 +66,8 @@ pub(super) fn restore(content: &Content) -> Result<Option<Vec<ContentBlock>>, Co
         })
         .collect();
     if current != original {
-        return Err(ConversionError::InvalidHistory("native assistant text has changed".into()));
+        tracing::debug!("assistant text changed after the response; converting the adk parts");
+        return None;
     }
     // The runner removes interrupted calls from model history. Never resurrect
     // those calls from the provider copy or override a callback's changed input.
@@ -72,7 +84,7 @@ pub(super) fn restore(content: &Content) -> Result<Option<Vec<ContentBlock>>, Co
         tool.input.clone_from(args);
         true
     });
-    Ok(Some(blocks))
+    Some(blocks)
 }
 
 pub(super) fn citations(message: &Message) -> Option<CitationMetadata> {

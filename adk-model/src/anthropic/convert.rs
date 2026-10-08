@@ -42,7 +42,7 @@ pub fn content_to_message(
         _ => MessageRole::User,
     };
 
-    if let Some(blocks) = super::history::restore(content)? {
+    if let Some(blocks) = super::history::restore(content) {
         return Ok(MessageParam::new_with_blocks(blocks, role));
     }
 
