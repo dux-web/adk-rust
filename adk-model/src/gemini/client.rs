@@ -125,7 +125,7 @@ pub struct GeminiModel {
 }
 
 /// Convert a Gemini client error to a structured `AdkError` with proper category and retry hints.
-fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
+pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
     fn format_error_chain(e: &dyn std::error::Error) -> String {
         let mut msg = e.to_string();
         let mut source = e.source();

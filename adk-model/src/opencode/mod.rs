@@ -46,14 +46,28 @@ impl OpenCodeClient {
     ///
     /// # Errors
     ///
-    /// Returns an invalid-input error for missing client/session identity, invalid
-    /// HTTP headers or base URL, unknown models without an explicit API, or
-    /// reasoning settings for a different API.
+    /// Returns an `InvalidInput` error with code `model.opencode.invalid_config` for an
+    /// empty API key, missing client/session identity, invalid HTTP headers or base URL,
+    /// unknown models without an explicit API, or reasoning settings for a different
+    /// API. Errors from building the selected protocol client are returned unchanged.
     pub fn new(config: OpenCodeConfig) -> Result<Self, AdkError> {
-        let api = config.api.or_else(|| config.service.api(&config.model)).ok_or_else(|| {
+        let service = config.service;
+        let invalid = |message: &str| {
+            AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::InvalidInput,
+                "model.opencode.invalid_config",
+                message,
+            )
+            .with_provider(service.provider())
+        };
+        let api = config.api.or_else(|| service.api(&config.model)).ok_or_else(|| {
             invalid("unknown OpenCode model; select its documented API with with_api")
         })?;
-        let endpoint = reqwest::Url::parse(&config.base_url)
+        if config.api_key.trim().is_empty() {
+            return Err(invalid("OpenCode API key must not be empty"));
+        }
+        let mut endpoint = reqwest::Url::parse(&config.base_url)
             .map_err(|_| invalid("invalid OpenCode base URL"))?;
         let local = endpoint.host_str().is_some_and(|host| {
             host == "localhost"
@@ -62,17 +76,21 @@ impl OpenCodeClient {
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|ip| ip.is_loopback())
         });
-        if !(endpoint.scheme() == "https" || endpoint.scheme() == "http" && local)
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-            || !endpoint.path().trim_end_matches('/').ends_with("/v1")
-        {
+        // `Url::parse` silently drops surrounding whitespace and embedded tabs or
+        // newlines, so such input is rejected rather than reinterpreted.
+        let valid = !config.base_url.contains(|c: char| c.is_whitespace() || c.is_control())
+            && (endpoint.scheme() == "https" || endpoint.scheme() == "http" && local)
+            && endpoint.username().is_empty()
+            && endpoint.password().is_none()
+            && endpoint.query().is_none()
+            && endpoint.fragment().is_none();
+        endpoint.set_path(&format!("{}/", endpoint.path().trim_end_matches('/')));
+        let base_url = endpoint.as_str().trim_end_matches('/').to_owned();
+        let (true, Some(root)) = (valid, base_url.strip_suffix("/v1")) else {
             return Err(invalid(
-                "OpenCode base URL must use HTTPS (or loopback HTTP), end in /v1, and contain no credentials, query, or fragment",
+                "OpenCode base URL must use HTTPS (or loopback HTTP), end in /v1, and contain no whitespace, credentials, query, or fragment",
             ));
-        }
+        };
         let mut headers = HeaderMap::new();
         for (name, value) in [
             (USER_AGENT, &config.user_agent),
@@ -90,7 +108,6 @@ impl OpenCodeClient {
                 })?,
             );
         }
-        let base_url = config.base_url.trim_end_matches('/');
         let inner: Arc<dyn Llm> = match api {
             OpenCodeApi::ChatCompletions | OpenCodeApi::Responses => {
                 if config.thinking.is_some()
@@ -104,11 +121,11 @@ impl OpenCodeClient {
                         OpenAICompatible::new_with_reasoning_effort(
                             OpenAICompatibleConfig::new(config.api_key, config.model)
                                 .with_base_url(base_url)
-                                .with_provider_name(config.service.provider()),
+                                .with_provider_name(service.provider()),
                             config.reasoning_effort,
                         )?
                         .with_reasoning_replay(true)
-                        .with_default_headers(headers.clone())?
+                        .with_default_headers(headers)?
                         .with_retry_config(config.retry),
                     )
                 } else {
@@ -121,11 +138,7 @@ impl OpenCodeClient {
                         }
                         None => OpenAIResponsesClient::new(native),
                     }?;
-                    Arc::new(
-                        client
-                            .with_default_headers(headers.clone())?
-                            .with_retry_config(config.retry),
-                    )
+                    Arc::new(client.with_default_headers(headers)?.with_retry_config(config.retry))
                 }
             }
             OpenCodeApi::Messages => {
@@ -134,8 +147,8 @@ impl OpenCodeClient {
                         "Messages reasoning uses with_anthropic_effort or with_anthropic_thinking",
                     ));
                 }
-                let mut native = AnthropicConfig::new(config.api_key, config.model)
-                    .with_base_url(base_url.strip_suffix("/v1").expect("validated /v1 suffix"));
+                let mut native =
+                    AnthropicConfig::new(config.api_key, config.model).with_base_url(root);
                 if let Some(thinking) = config.thinking {
                     native = native.with_thinking_mode(thinking);
                 }
@@ -157,12 +170,10 @@ impl OpenCodeClient {
                 }
                 let client = adk_gemini::GeminiBuilder::new(config.api_key)
                     .with_model(adk_gemini::Model::Custom(format!("models/{}", config.model)))
-                    .with_base_url(
-                        reqwest::Url::parse(&format!("{base_url}/")).expect("validated URL"),
-                    )
+                    .with_base_url(endpoint)
                     .with_http_client(reqwest::Client::builder().default_headers(headers))
                     .build()
-                    .map_err(|_| invalid("failed to configure GenerateContent client"))?;
+                    .map_err(|err| crate::gemini::client::gemini_error_to_adk(&err))?;
                 let mut model =
                     GeminiModel::from_client(client, config.model).with_retry_config(config.retry);
                 if let Some(thinking) = config.gemini_thinking {
@@ -195,14 +206,4 @@ impl Llm for OpenCodeClient {
     ) -> Result<LlmResponseStream, AdkError> {
         self.inner.generate_content(request, stream).await
     }
-}
-
-fn invalid(message: &str) -> AdkError {
-    AdkError::new(
-        ErrorComponent::Model,
-        ErrorCategory::InvalidInput,
-        "model.opencode.invalid_config",
-        message,
-    )
-    .with_provider("opencode")
 }
