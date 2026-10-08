@@ -1837,3 +1837,35 @@ mod client_tests {
         assert_eq!(config.endpoint(), "https://europe-west4-aiplatform.googleapis.com");
     }
 }
+
+#[cfg(test)]
+mod builder_tests {
+    use super::GeminiBuilder;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn studio_builder_does_not_follow_redirects() {
+        let target = MockServer::start().await;
+        Mock::given(any()).respond_with(ResponseTemplate::new(200)).expect(0).mount(&target).await;
+        let origin = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/landing", target.uri())),
+            )
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let client = GeminiBuilder::new("test-key")
+            .with_base_url(format!("{}/v1beta/", origin.uri()).parse().unwrap())
+            .with_http_client(reqwest::ClientBuilder::new())
+            .build()
+            .unwrap();
+
+        let result = client.generate_content().with_user_message("hello").execute().await;
+
+        assert!(result.is_err());
+        assert_eq!(target.received_requests().await.unwrap().len(), 0);
+    }
+}

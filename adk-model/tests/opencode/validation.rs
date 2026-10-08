@@ -27,6 +27,33 @@ fn validates_identity_endpoint_and_reasoning_without_requests() {
     }
 }
 
+#[test]
+fn rejects_whitespace_base_urls_and_empty_keys_without_panicking() {
+    let cases = [
+        (config("minimax-m3").with_base_url("https://opencode.ai/zen/go/v1\n"), "opencode-go"),
+        (config("minimax-m3").with_base_url("https://opencode.ai/zen/go/v1 "), "opencode-go"),
+        (config("minimax-m3").with_base_url("https://opencode.ai/zen/go/\tv1"), "opencode-go"),
+        (
+            config_for(OpenCodeService::Zen, "gemini-3.8-flash")
+                .with_base_url(" https://opencode.ai/zen/v1"),
+            "opencode",
+        ),
+        (
+            OpenCodeConfig::new(OpenCodeService::Go, " ", "minimax-m3")
+                .with_user_agent("test-coding-agent/1.0")
+                .with_session_id("conversation-42"),
+            "opencode-go",
+        ),
+    ];
+    for (config, provider) in cases {
+        let error = OpenCodeClient::new(config).err().unwrap();
+        assert_eq!(
+            (error.category, error.code, error.details.provider.as_deref()),
+            (ErrorCategory::InvalidInput, "model.opencode.invalid_config", Some(provider)),
+        );
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
     #[test]

@@ -3,7 +3,7 @@ use adk_model::opencode::{OpenCodeApi, OpenCodeClient, OpenCodeConfig, OpenCodeS
 use adk_model::retry::RetryConfig;
 use futures::TryStreamExt;
 use serde_json::{Value, json};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{any, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 mod tools;
@@ -212,5 +212,35 @@ async fn routes_streams_with_conversation_headers_and_usage() {
         } else {
             assert_eq!(serde_json::from_slice::<Value>(&requests[0].body).unwrap()["stream"], true);
         }
+    }
+}
+
+#[tokio::test]
+async fn rejects_redirects_without_forwarding_credentials() {
+    for &(service, model, _api, _endpoint) in CASES {
+        let target = MockServer::start().await;
+        Mock::given(any()).respond_with(ResponseTemplate::new(200)).expect(0).mount(&target).await;
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/v1/landing", target.uri())),
+            )
+            .expect(2)
+            .mount(&origin)
+            .await;
+        let client = OpenCodeClient::new(
+            config_for(service, model).with_base_url(format!("{}/v1", origin.uri())),
+        )
+        .unwrap();
+        for stream in [false, true] {
+            let request = LlmRequest::new(model, vec![Content::new("user").with_text("hello")]);
+            let result = async {
+                client.generate_content(request, stream).await?.try_collect::<Vec<_>>().await
+            }
+            .await;
+            assert!(result.is_err(), "{model} (stream: {stream}) followed a redirect");
+        }
+        assert_eq!(target.received_requests().await.unwrap().len(), 0, "{model}");
     }
 }
