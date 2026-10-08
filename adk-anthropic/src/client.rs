@@ -232,15 +232,32 @@ impl Anthropic {
         Self::from_values(api_key, base_url)
     }
 
-    /// Create a client with a literal API key and an explicit base URL.
-    /// This constructor does not read environment variables or credential files.
+    /// Create a client with an explicit API key and base URL.
+    ///
+    /// Unlike [`Anthropic::new`], this constructor reads neither `ANTHROPIC_API_KEY`
+    /// nor `ANTHROPIC_BASE_URL`. A `file://` API key is read from that file, as in
+    /// [`Anthropic::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `base_url` is not `https://` and not
+    /// `http://` with a loopback host, or when a `file://` API key cannot be read.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_anthropic::Anthropic;
+    ///
+    /// let client = Anthropic::new_with_base_url("sk-ant-key", "https://proxy.example.com")?;
+    /// # Ok::<(), adk_anthropic::Error>(())
+    /// ```
     pub fn new_with_base_url(
         api_key: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Result<Self> {
         let base_url = base_url.into();
         validate_base_url(&base_url)?;
-        Self::from_values(api_key.into(), base_url)
+        Self::from_values(Self::resolve_api_key(&api_key.into())?, base_url)
     }
 
     fn from_values(api_key: String, base_url: String) -> Result<Self> {
@@ -1765,12 +1782,26 @@ mod tests {
             assert!(status.success());
             return;
         }
-        let key = "file:///adk-explicit-key-does-not-exist";
+        let key = "sk-explicit-key";
         let client = Anthropic::new_with_base_url(key, "http://127.0.0.1:12345").unwrap();
         assert_eq!(client.api_key, key);
         assert_eq!(client.cached_headers["x-api-key"], key);
         assert_eq!(client.base_url, "http://127.0.0.1:12345");
         assert!(Anthropic::new_with_base_url(key, "invalid-explicit-url").is_err());
+
+        let dir = std::env::temp_dir().join(format!("adk_anthropic_explicit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("key.txt");
+        std::fs::write(&file, "sk-from-file\n").unwrap();
+        let client =
+            Anthropic::new_with_base_url(format!("file://{}", file.display()), "https://a.example")
+                .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(client.api_key, "sk-from-file");
+        assert!(
+            Anthropic::new_with_base_url("file:///adk-missing-key-file", "https://a.example")
+                .is_err()
+        );
     }
 
     #[test]
