@@ -126,6 +126,13 @@ POST /api/run_sse
 }
 ```
 
+> **Note:** A streamed response arrives as partial events (`"partial": true`) followed by a
+> terminal event with the same `id`. When that terminal event carries
+> `"provider_metadata": {"content_complete": true}`, its `content` is the complete response,
+> including text the partial events already delivered. Replace the content rendered for that
+> `id` instead of appending it. See
+> [Complete response snapshots](../events/events.md#complete-response-snapshots).
+
 ### Run Agent (Non-Streaming)
 
 Execute an agent to completion and receive all events in a single JSON response:
