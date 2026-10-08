@@ -1,32 +1,74 @@
 # OpenCode Go and Zen
 
-Enable `adk-model`'s `opencode` feature, or the same feature on `adk-rust`.
+`OpenCodeClient` routes OpenCode Go and OpenCode Zen models through the existing Chat
+Completions, Responses, Anthropic Messages, and Gemini `generateContent` clients, and sends the
+application's identity headers with every request.
+
+## Installation
+
+Enable the `opencode` feature on `adk-model`, or the same feature on `adk-rust`:
+
+```toml
+[dependencies]
+adk-model = { version = "2.3.0", features = ["opencode"] }
+```
+
+## Usage
 
 ```rust
 use adk_model::opencode::{OpenCodeClient, OpenCodeConfig, OpenCodeService};
 
-let model = OpenCodeClient::new(
-    OpenCodeConfig::new(OpenCodeService::Go, std::env::var("OPENCODE_API_KEY")?, "deepseek-v4.1-flash")
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let model = OpenCodeClient::new(
+        OpenCodeConfig::new(
+            OpenCodeService::Go,
+            std::env::var("OPENCODE_API_KEY")?,
+            "deepseek-v4.1-flash",
+        )
         .with_user_agent("my-coding-agent/1.0")
         .with_session_id("conversation-42"),
-)?;
-# Ok::<(), Box<dyn std::error::Error>>(())
+    )?;
+    println!("{:?}", model.api());
+    Ok(())
+}
 ```
 
-`OpenCodeClient` implements `adk_core::Llm` and delegates to the existing protocol clients. Choose `OpenCodeService::Go` or `OpenCodeService::Zen` explicitly; the original OpenAI clients do not detect OpenCode endpoints.
+`OpenCodeClient` implements `adk_core::Llm` and delegates to the existing protocol clients. Choose
+`OpenCodeService::Go` or `OpenCodeService::Zen` explicitly; the OpenAI clients do not detect
+OpenCode endpoints.
 
 | Service | Base URL | Routing reference |
 | --- | --- | --- |
 | Go | `https://opencode.ai/zen/go/v1` | [Go endpoint table](https://opencode.ai/docs/go/#endpoints) |
 | Zen | `https://opencode.ai/zen/v1` | [Zen endpoint table](https://opencode.ai/docs/zen/#endpoints) |
 
-Routes include Chat Completions, Responses, Anthropic Messages, and Gemini GenerateContent. The service matters: MiniMax M3 and Qwen3.8 Max use Messages on Go but Chat Completions on Zen. Jev's structured System One API is outside the `Llm` conversation interface and is not supported.
+The service determines the route: MiniMax M3 and Qwen3.8 Max use Messages on Go but Chat
+Completions on Zen.
 
-- Supply the application's own `User-Agent` and a stable `x-opencode-session` value. Reuse the ID for main and auxiliary requests in the same conversation.
-- Unknown model IDs require `with_api(OpenCodeApi::...)`; the client does not guess a protocol or retry on another API.
+## Configuration
+
+| Method | Applies to | Effect |
+| --- | --- | --- |
+| `with_user_agent` | All APIs | Sets the application's `User-Agent` (required) |
+| `with_session_id` | All APIs | Sets `x-opencode-session` (required); reuse it for main and auxiliary requests in one conversation |
+| `with_api` | All APIs | Selects the API for a model missing from the routing table |
+| `with_reasoning_effort` | Chat Completions, Responses | Reasoning effort |
+| `with_anthropic_thinking`, `with_anthropic_effort` | Messages | Thinking mode and output effort |
+| `with_gemini_thinking` | GenerateContent | Thinking configuration |
+| `with_base_url` | All APIs | HTTPS proxy, or loopback HTTP for tests; must end in `/v1` |
+| `with_retry_config` | All APIs | Retry policy of the selected protocol client |
+
+- Unknown model IDs require `with_api(OpenCodeApi::...)`; the client does not guess a protocol or
+  retry on another API.
+- `OpenCodeClient::new` rejects an empty API key, missing identity headers, reasoning options for a
+  different API, and base URLs with whitespace, credentials, a query, or a fragment.
 - Chat Completions replays returned thinking through `reasoning_content` for tool continuations.
-- Chat Completions and Responses accept `with_reasoning_effort`. Messages uses `with_anthropic_thinking` and `with_anthropic_effort`. GenerateContent uses `with_gemini_thinking`. Choose options supported by the selected model.
-- `with_base_url` supports HTTPS proxies and loopback HTTP tests. Include the `/v1` suffix.
-- Use `LlmRequest.config` for sampling and output limits. `with_retry_config` configures the selected model client's retry policy.
+- Redirects are not followed, so credentials are only sent to the configured host.
+- Use `LlmRequest.config` for sampling and output limits.
 
-The standalone `examples/opencode` crate demonstrates streaming. Offline HTTP tests cover API routing, identity headers, usage conversion, tool continuations, and invalid configuration; they do not establish live account availability or quota.
+## Example
+
+The standalone [`examples/opencode`](../../../examples/opencode) crate streams one reply. Offline
+HTTP tests in `adk-model/tests/opencode/` cover API routing, identity headers, usage conversion,
+tool continuations, redirects, and invalid configuration; they do not establish live account
+availability or quota.

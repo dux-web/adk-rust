@@ -18,6 +18,7 @@ Welcome to the official documentation for ADK-Rust (Agent Development Kit for Ru
 ## Models
 
 - [Model Providers](models/providers.md) - LLM integrations: Gemini, OpenAI, Anthropic, DeepSeek, Groq, Ollama
+- [OpenCode Go and Zen](models/opencode.md) - Per-model routing across four wire APIs with conversation headers
 - [Ollama](models/ollama.md) - Local inference with Ollama
 - [mistral.rs Integration](models/mistralrs.md) - Native mistral.rs for high-performance local inference
 

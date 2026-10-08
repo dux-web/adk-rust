@@ -1353,6 +1353,11 @@ pub mod prelude {
         OpenRouterResponseTool,
     };
 
+    #[cfg(feature = "opencode")]
+    pub use crate::model::opencode::{
+        OpenCodeApi, OpenCodeClient, OpenCodeConfig, OpenCodeService,
+    };
+
     #[cfg(feature = "anthropic")]
     pub use crate::model::anthropic::{AnthropicClient, AnthropicConfig, Effort, ThinkingMode};
 

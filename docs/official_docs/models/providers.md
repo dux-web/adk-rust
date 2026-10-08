@@ -684,6 +684,7 @@ The generated projects are compiled in CI by `scripts/check-cargo-adk-templates.
 
 ## Related
 
+- [OpenCode Go and Zen](./opencode.md) - Per-model routing for OpenCode services
 - [Ollama (Local)](./ollama.md) - Run models locally with Ollama
 - [Local Models (mistral.rs)](./mistralrs.md) - Native Rust inference
 - [LlmAgent](../agents/llm-agent.md) - Using models with agents

@@ -384,6 +384,7 @@ docs/official_docs/    Comprehensive documentation site content
 - `gemini-vertex` — Gemini via Vertex AI (Studio + Vertex backends)
 - `gemini-interactions` — Gemini Interactions API (Beta); re-exports `adk_model::gemini::interactions` AND provides the runtime transport toggle on `GeminiModel` (`use_interactions_api`) that drives the standard `LlmAgent`/`Runner`/tool loop through the Interactions endpoint (allowlist, stateful continuity, `bypass_multi_tools_limit`)
 - `openrouter` — OpenRouter native chat, responses, routing, discovery, and credits APIs
+- `opencode` — OpenCode Go and Zen: `OpenCodeClient` routes each model through Chat Completions, Responses, Anthropic Messages, or Gemini `generateContent` with the application's identity headers (implies `openai`, `anthropic`, `gemini`)
 - `bedrock` — Amazon Bedrock via AWS SDK Converse API
 - `azure-ai` — Azure AI Inference endpoints
 - `all-providers` — enables all real feature flags
@@ -473,6 +474,7 @@ Specialist opt-in features:
 - `video-avatar` — HeyGen/D-ID avatar providers
 - `acp` — Agent Client Protocol integration
 - `openrouter` — OpenRouter native APIs
+- `opencode` — OpenCode Go and Zen per-model routing (`OpenCodeClient`)
 - Audio ONNX models: `whisper-onnx`, `distil-whisper`, `moonshine`, `kokoro`, `chatterbox`, `qwen3-tts`
 
 Individual features (`agents`, `models`, `tools`, `sessions`, `server`, `graph`, `realtime`, `eval`, `browser`, `auth`, `guardrail`, `plugin`, `telemetry`, `cli`, `skills`, `artifacts`, `memory`, `code`, `sandbox`, `audio`, `awp`, `acp`, `rag`, `payments`, etc.) can be selected independently.

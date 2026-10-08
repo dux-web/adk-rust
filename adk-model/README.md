@@ -109,6 +109,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### OpenCode
+
+Enable the `opencode` feature. The client picks Chat Completions, Responses, Anthropic Messages, or
+Gemini `generateContent` from the model ID and sends the application's `User-Agent` and
+`x-opencode-session` headers with every request.
+
+```rust
+use adk_model::opencode::{OpenCodeClient, OpenCodeConfig, OpenCodeService};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let api_key = std::env::var("OPENCODE_API_KEY")?;
+    let model = OpenCodeClient::new(
+        OpenCodeConfig::new(OpenCodeService::Go, api_key, "deepseek-v4.1-flash")
+            .with_user_agent("my-coding-agent/1.0")
+            .with_session_id("conversation-42"),
+    )?;
+    println!("{:?}", model.api());
+    Ok(())
+}
+```
+
+See the [OpenCode guide](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/models/opencode.md)
+for the routing table and configuration options.
+
 ### OpenRouter
 
 ```rust
@@ -773,5 +797,3 @@ Apache-2.0
 ## Part of ADK-Rust
 
 This crate is part of the [ADK-Rust](https://adk-rust.com) framework for building AI agents in Rust.
-
-See [OpenCode Go and Zen](../docs/official_docs/models/opencode.md) for configuration and the streaming example.
