@@ -204,7 +204,7 @@ jobs:
   #
   # To cover another feature-gated module, add ONE line to the pairs file.
   feature-coverage:
-    name: feature-coverage (${{ matrix.shard }}/7)
+    name: feature-coverage (${{ matrix.shard }}/8)
     needs: [fmt, scope]
     if: needs.scope.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
@@ -212,7 +212,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -247,7 +247,9 @@ jobs:
   # ── Docs: documentation coverage for Stable-tier crates ──────
   docs:
     needs: [fmt, scope]
-    if: needs.scope.outputs.docs_only != 'true'
+    # Rustdoc and doctests cannot break through a merge that clippy and the tests
+    # accept, so the queue build leaves them to the pull request run.
+    if: needs.scope.outputs.docs_only != 'true' && github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -461,9 +463,9 @@ jobs:
   # Shards and matrix entries remain individually visible for diagnosis, while
   # branch protection only needs this stable aggregate context (plus `semver`).
   # A skipped job passes the gate only when `scope` or the event skipped it:
-  # docs-only changes skip every Rust job, and merge-queue builds skip the
+  # docs-only changes skip every Rust job, and merge-queue builds skip docs, the
   # standalone-example shards and the macOS/Windows builds, which the pull
-  # request already passed.
+  # request already passed and a merge cannot break on its own.
   pr-gate:
     name: pr-gate
     if: always()
@@ -494,7 +496,7 @@ jobs:
           skippable="clippy test feature-coverage docs examples-compile macos windows"
         fi
         if [[ "$EVENT" == "merge_group" ]]; then
-          skippable="$skippable examples-compile macos windows"
+          skippable="$skippable docs examples-compile macos windows"
         fi
         failed_jobs="$(jq -r --arg skippable "$skippable" '
           ($skippable | split(" ") | map(select(. != ""))) as $ok

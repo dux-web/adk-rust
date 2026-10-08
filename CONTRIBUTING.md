@@ -397,7 +397,7 @@ Require exactly these stable contexts in the `main` ruleset:
 > so the feature-coverage pairs and the example shards can change without a ruleset
 > edit.
 
-`pr-gate` covers `fmt`, `webui`, `clippy`, Linux workspace tests, the seven
+`pr-gate` covers `fmt`, `webui`, `clippy`, Linux workspace tests, the eight
 `feature-coverage` shards driven by `scripts/feature-coverage-pairs.txt`, docs and
 doctests, the four standalone-example shards, `templates`, the macOS build, and the
 Windows build plus sandbox portability smokes. `semver` stays separate because its
@@ -411,7 +411,7 @@ skipped job only when the scope or the event skipped it:
 |-----|---------------|
 | Pull request that touches code | every job |
 | Pull request that touches only `docs/`, Markdown, or `LICENSE*` | `fmt`, `webui`, `templates` (the documentation gates) |
-| Merge-queue build | every job except the standalone-example shards and the macOS and Windows builds, which the pull request already passed |
+| Merge-queue build | every job except `docs`, the standalone-example shards and the macOS and Windows builds, which the pull request already passed and a merge cannot break on its own |
 
 ### NOT required (informational tiers)
 
