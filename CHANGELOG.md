@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is also applied to invocation-scoped toolsets.
 ### Fixed
 
+- **Agent synchronization** (`adk-agent`, `adk-core`, `adk-runner`): apply upstream #713 fixes for shared-state notifications, zero-iteration loops, validated output keys, runtime confirmation, and per-run cancellation while preserving streamed lifecycle events.
+- **Sandbox enforcement** (`adk-sandbox`): apply upstream #710 fixes for bounded child I/O, process cleanup, Seatbelt read confinement, Linux syscall restrictions, and execution limits.
+
 - **Agent event fidelity** (`adk-agent`): preserve citations and complete terminal content, continue provider-native paused turns, and emit individual tool results while sibling approvals are pending. Propagate approval failures and keep tool-start events from ending responses. Built-in streaming consumers avoid appending complete snapshots twice; `adk-core::EventTextDeltas` exposes the same text/thinking adapter to applications.
 - **Native provider fidelity** (`adk-model`, `adk-anthropic`, `adk-gemini`): retain streamed Unicode, tool images, PDF inputs, native search/reasoning blocks and usage; preserve commentary for application rendering and honor explicit request/retry configuration.
 

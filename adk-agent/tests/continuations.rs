@@ -91,6 +91,51 @@ async fn retains_text_and_server_parts_before_continuing() {
 }
 
 #[tokio::test]
+async fn stores_output_after_the_completed_response() {
+    for mode in [StreamingMode::None, StreamingMode::SSE, StreamingMode::Bidi] {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let agent = LlmAgentBuilder::new("assistant")
+            .model(Arc::new(Model { requests: requests.clone(), endless: false, complete: true }))
+            .max_iterations(2)
+            .output_key("result")
+            .build()
+            .unwrap();
+        let events = agent
+            .run(Arc::new(TestContext::new("Search").with_streaming_mode(mode)))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<adk_core::Result<Vec<_>>>()
+            .unwrap();
+        let responses: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| !event.llm_response.partial && event.content().is_some())
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert!(!responses[0].1.llm_response.turn_complete);
+        assert!(responses[1].1.llm_response.turn_complete);
+        let updates: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.actions.state_delta.contains_key("result"))
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].0 > responses[1].0);
+        assert_eq!(
+            updates[0].1.actions.state_delta,
+            std::collections::HashMap::from([(
+                "result".to_owned(),
+                serde_json::json!("Partial text")
+            )])
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
 async fn stops_repeated_pauses_at_the_agent_iteration_limit() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let agent = LlmAgentBuilder::new("assistant")
