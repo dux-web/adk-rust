@@ -5,6 +5,7 @@ use adk_anthropic::{AccumulatingStream, ContentBlock, ContentBlockDelta, Message
 use adk_core::{AdkError, LlmResponseStream};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Span;
@@ -24,6 +25,8 @@ where
             }
         });
         let (mut events, _) = AccumulatingStream::new(events);
+        // Client tool calls by block index: id, name and the streamed argument JSON.
+        let mut tool_calls: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
         while let Some(event) = events.next().await {
             let event = match event {
                 Ok(event) => event,
@@ -50,6 +53,9 @@ where
             };
             match event {
                 MessageStreamEvent::ContentBlockStart(start) => match start.content_block {
+                    ContentBlock::ToolUse(tool) => {
+                        tool_calls.insert(start.index, (tool.id, tool.name, String::new()));
+                    }
                     ContentBlock::Text(text) if !text.text.is_empty() => {
                         yield convert::from_text_delta(&text.text);
                     }
@@ -59,6 +65,11 @@ where
                     _ => {}
                 },
                 MessageStreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                    ContentBlockDelta::InputJsonDelta(json) => {
+                        if let Some((_, _, arguments)) = tool_calls.get_mut(&delta.index) {
+                            arguments.push_str(&json.partial_json);
+                        }
+                    }
                     ContentBlockDelta::TextDelta(text) if !text.text.is_empty() => {
                         yield convert::from_text_delta(&text.text);
                     }
@@ -71,6 +82,21 @@ where
                     let mut message = events.finalize_partial().map_err(convert_anthropic_error)?;
                     if message.stop_reason.is_none() {
                         Err(AdkError::model("Anthropic stream ended without a stop reason"))?;
+                    }
+                    // The accumulator drops a call that `max_tokens` cut off; report it
+                    // instead of answering as though the model never asked for the tool.
+                    for (id, name, arguments) in tool_calls.values() {
+                        let kept = message.content.iter().any(
+                            |block| matches!(block, ContentBlock::ToolUse(tool) if &tool.id == id),
+                        );
+                        if !kept {
+                            crate::tool_args::parse_streamed_tool_arguments(
+                                "anthropic",
+                                "model.anthropic.invalid_tool_arguments",
+                                name,
+                                arguments,
+                            )?;
+                        }
                     }
                     // The accumulator keeps malformed streamed arguments as a JSON
                     // string; a truncated call must never run with substituted input.

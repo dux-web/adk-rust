@@ -27,6 +27,7 @@ fn input_json_delta(partial_json: &str) -> String {
 
 const BLOCK_STOP: &str =
     "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n";
+const MAX_TOKENS_DELTA: &str = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":5}}\n\n";
 const TOOL_USE_DELTA: &str = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":5}}\n\n";
 const MESSAGE_STOP: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
 
@@ -88,6 +89,21 @@ async fn rate_limit_error_event_maps_to_rate_limited() {
 async fn truncated_tool_arguments_fail_instead_of_becoming_empty() {
     let body = format!(
         "{MESSAGE_START}{}{}{BLOCK_STOP}{TOOL_USE_DELTA}{MESSAGE_STOP}",
+        tool_use_start("get_weather"),
+        input_json_delta("{\"city\": \"Nai"),
+    );
+
+    let items = stream_items(body).await;
+
+    let error = items.last().expect("stream yields items").as_ref().unwrap_err();
+    assert_eq!(error.code, "model.anthropic.invalid_tool_arguments");
+    assert!(error.message.contains("'get_weather'"));
+}
+
+#[tokio::test]
+async fn tool_call_cut_off_by_max_tokens_fails_instead_of_being_dropped() {
+    let body = format!(
+        "{MESSAGE_START}{}{}{BLOCK_STOP}{MAX_TOKENS_DELTA}{MESSAGE_STOP}",
         tool_use_start("get_weather"),
         input_json_delta("{\"city\": \"Nai"),
     );
