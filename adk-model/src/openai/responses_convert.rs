@@ -118,7 +118,7 @@ fn content_to_input_items(content: &Content) -> Vec<InputItem> {
                 )));
             }
 
-            Part::InlineData { mime_type, data, .. } => {
+            Part::InlineData { mime_type, data, uri, .. } => {
                 let data = if mime_type.starts_with("image/") {
                     InputContent::InputImage(InputImageContent {
                         image_url: Some(format!(
@@ -134,7 +134,7 @@ fn content_to_input_items(content: &Content) -> Vec<InputItem> {
                             "data:{mime_type};base64,{}",
                             attachment::encode_base64(data)
                         )),
-                        filename: Some("document.pdf".into()),
+                        filename: Some(attachment::pdf_filename(uri.as_deref())),
                         ..Default::default()
                     })
                 } else {

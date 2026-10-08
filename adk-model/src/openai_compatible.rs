@@ -482,16 +482,25 @@ fn inject_assistant_reasoning(
     }
 }
 
+/// Provider capabilities that shape a Chat Completions request body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChatCapabilities {
+    /// Value of `parallel_tool_calls` sent with tool declarations.
+    pub(crate) parallel_tool_calls: bool,
+    /// Send inline PDFs as `file` parts. Only OpenAI and Azure OpenAI accept them,
+    /// so every other compatible provider keeps the text fallback.
+    pub(crate) native_pdf: bool,
+}
+
 /// Build the serialized JSON request body from an `LlmRequest`.
 ///
 /// This is shared between the streaming and non-streaming paths so that
 /// request parameter construction is identical regardless of mode.
-/// Also used by `AzureOpenAIClient` for consistent request building.
 pub(crate) fn build_request_json(
     model: &str,
     request: &LlmRequest,
     reasoning_effort: &Option<OpenAIReasoningEffort>,
-    parallel_tool_calls: bool,
+    capabilities: ChatCapabilities,
     reasoning_replay_field: Option<ReasoningReplayField>,
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
@@ -513,7 +522,10 @@ pub(crate) fn build_request_json(
         .with_provider("gemini"));
     }
     let contents = crate::tool_result::with_images(&request.contents);
-    let messages: Vec<_> = contents.iter().map(convert::content_to_message).collect();
+    let messages: Vec<_> = contents
+        .iter()
+        .map(|content| convert::content_to_message(content, capabilities.native_pdf))
+        .collect();
 
     let mut request_builder = CreateChatCompletionRequestArgs::default();
     request_builder.model(model).messages(messages);
@@ -522,7 +534,7 @@ pub(crate) fn build_request_json(
         let tools = convert::convert_tools(&request.tools, adapter, cache);
         request_builder.tools(tools);
         // OpenAI defaults parallel_tool_calls to true.
-        request_builder.parallel_tool_calls(parallel_tool_calls);
+        request_builder.parallel_tool_calls(capabilities.parallel_tool_calls);
     }
 
     if let Some(effort) = reasoning_effort.and_then(to_oai_reasoning_effort) {
@@ -768,7 +780,10 @@ impl Llm for OpenAICompatible {
             &model,
             &request,
             &reasoning_effort,
-            self.parallel_tool_calls,
+            ChatCapabilities {
+                parallel_tool_calls: self.parallel_tool_calls,
+                native_pdf: matches!(provider_name.as_str(), "openai" | "azure-openai"),
+            },
             reasoning_replay_field,
             adapter,
             &SCHEMA_CACHE,
@@ -1296,7 +1311,7 @@ mod tests {
                 crate::catalog::OPENAI_DEFAULT,
                 &request,
                 &configured_effort,
-                true,
+                ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
                 None,
                 &adapter,
                 &cache,
@@ -1323,7 +1338,7 @@ mod tests {
             crate::catalog::OPENAI_DEFAULT,
             &request,
             &None,
-            true,
+            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
             None,
             &adapter,
             &cache,
@@ -1349,7 +1364,7 @@ mod tests {
             crate::catalog::OPENAI_DEFAULT,
             &request,
             &Some(OpenAIReasoningEffort::Max),
-            true,
+            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
             None,
             &adapter,
             &cache,
@@ -1370,7 +1385,7 @@ mod tests {
             "gemini-3.7-flash",
             &request,
             &None,
-            true,
+            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
             None,
             &GenericSchemaAdapter,
             &cache,
