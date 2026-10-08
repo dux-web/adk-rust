@@ -23,12 +23,12 @@ use std::{borrow::Cow, collections::HashMap};
 /// let output = deltas.push(&terminal);
 /// assert_eq!(output.content().unwrap().parts[0].text(), Some(" world"));
 /// ```
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct EventTextDeltas {
     pending: HashMap<(String, String), EmittedText>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct EmittedText {
     text: String,
     thinking: String,

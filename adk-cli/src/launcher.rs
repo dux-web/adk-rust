@@ -655,7 +655,8 @@ impl StreamPrinter {
                 self.handle_text_chunk(text);
             }
             Part::Thinking { thinking, .. } => {
-                if matches!(self.thinking_mode, ThinkingDisplayMode::Hide) {
+                // A snapshot reduced to its unseen suffix can leave an empty thinking part.
+                if thinking.is_empty() || matches!(self.thinking_mode, ThinkingDisplayMode::Hide) {
                     return;
                 }
                 if !self.in_thinking_part_stream {
@@ -987,6 +988,14 @@ mod tests {
         let mut printer = StreamPrinter::new(ThinkingDisplayMode::Auto);
         printer.handle_text_chunk("just plain text with no tags");
         assert!(!printer.in_think_block);
+        assert!(printer.think_buffer.is_empty());
+    }
+
+    #[test]
+    fn stream_printer_ignores_an_empty_thinking_part() {
+        let mut printer = StreamPrinter::new(ThinkingDisplayMode::Auto);
+        printer.handle_part(&Part::Thinking { thinking: String::new(), signature: None });
+        assert!(!printer.in_thinking_part_stream);
         assert!(printer.think_buffer.is_empty());
     }
 
