@@ -57,7 +57,6 @@ impl BedrockClient {
         let prompt_caching = config.prompt_caching.clone();
 
         let mut sdk_config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .retry_config(aws_smithy_types::retry::RetryConfig::standard().with_max_attempts(1))
             .region(aws_config::Region::new(config.region.clone()));
 
         if let Some(endpoint_url) = &config.endpoint_url {
@@ -77,7 +76,6 @@ impl BedrockClient {
         let mut sdk = aws_sdk_bedrockruntime::Config::builder()
             .behavior_version_latest()
             .region(aws_sdk_bedrockruntime::config::Region::new(config.region.clone()))
-            .retry_config(aws_smithy_types::retry::RetryConfig::standard().with_max_attempts(1))
             .bearer_token(aws_sdk_bedrockruntime::config::Token::new(api_key, None));
         if let Some(endpoint) = &config.endpoint_url {
             sdk = sdk.endpoint_url(endpoint);
