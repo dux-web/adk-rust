@@ -4,15 +4,12 @@
 #
 # Format: <shard> <package> <features>. Features are comma-separated with no spaces.
 # To cover another feature-gated module, add ONE line and pick the shard whose crates it
-# already depends on. Shards are numbered 0 to 6; `ci.yml` lists the same range.
+# already depends on. Shards are numbered 0 to 7; `ci.yml` lists the same range.
 
 # Shard 0 — adk-rag backends. lancedb pulls the whole lance/datafusion tree and is the
 # slowest pair; it stays in the PR tier because an arrow version mismatch once sat broken
 # on main for weeks with nothing compiling the LanceDB backend.
 0 adk-rag lancedb
-# A surrealdb 3.2 parser change broke create_collection while every required check stayed
-# green; tests run on the embedded kv-mem engine.
-0 adk-rag surrealdb
 # sqlx-backed backend: a second sqlx major entering the graph through pgvector went unnoticed.
 0 adk-rag pgvector
 0 adk-rag vertex-rag
@@ -108,3 +105,9 @@
 # Linux-only and feature-gated: nothing built it until a container run found the
 # bubblewrap probe could never succeed and its property tests did not compile.
 6 adk-sandbox sandbox-linux
+
+# Shard 7 — adk-rag's SurrealDB backend on its own: it and lancedb each compile for about
+# fifteen minutes, and together they made shard 0 the longest job in the tier.
+# A surrealdb 3.2 parser change broke create_collection while every required check stayed
+# green; tests run on the embedded kv-mem engine.
+7 adk-rag surrealdb
