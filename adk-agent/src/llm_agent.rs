@@ -1882,6 +1882,11 @@ struct ToolExecutor<'a> {
     tool_timeout: std::time::Duration,
     confirmation_decisions: &'a std::collections::HashMap<String, ToolConfirmationDecision>,
     confirmation_fingerprints: &'a std::collections::HashMap<String, String>,
+    /// Serializes `ToolConfirmationHandler::decide`, so prompts stay one at a time while
+    /// approved siblings run.
+    confirmation_lock: tokio::sync::Mutex<()>,
+    /// Set when an approval fails, so calls still waiting for theirs stop waiting.
+    approval_failed: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "enhanced-plugins")]
     enhanced_plugin_manager: &'a Option<Arc<EnhancedPluginManager>>,
 }
@@ -1930,33 +1935,6 @@ impl ToolExecutor<'_> {
             });
         }
 
-        // Acquire concurrency permit before tool execution.
-        // The permit is held for the entire duration of this tool call
-        // and released on drop when this async block completes.
-        let _concurrency_permit = match self.concurrency_manager.acquire(&name).await {
-            Ok(permit) => Some(permit),
-            Err(e) => {
-                // Concurrency limit reached with Fail policy — return error
-                let error_content = Content {
-                    role: "function".to_string(),
-                    parts: vec![Part::FunctionResponse {
-                        function_response: FunctionResponseData::new(
-                            name.clone(),
-                            serde_json::json!({ "error": e.to_string() }),
-                        ),
-                        id: id.clone(),
-                        annotations: None,
-                    }],
-                };
-                return Ok(ToolExecutionResult {
-                    index,
-                    content: error_content,
-                    actions: tool_actions,
-                    escalate_or_skip: false,
-                });
-            }
-        };
-
         // Live confirmation belongs to this dispatch, not the entire model batch. Runtime-injected
         // requirements such as team relationship approval gate execution exactly like the policy.
         if self.tool_confirmation_policy.requires_confirmation(&name)
@@ -1977,7 +1955,27 @@ impl ToolExecutor<'_> {
                     function_call_id: Some(function_call_id.clone()),
                     args: args.clone(),
                 };
-                decision = Some(handler.decide(&request).await?);
+                let mut approval_failed = self.approval_failed.subscribe();
+                // One prompt at a time; a failed approval releases calls still waiting for theirs.
+                let decided = tokio::select! {
+                    biased;
+                    _ = approval_failed.wait_for(|failed| *failed) => {
+                        Err(adk_core::AdkError::tool(format!(
+                            "approval for tool '{name}' was abandoned because another approval in the same batch failed"
+                        )))
+                    }
+                    decided = async {
+                        let _prompt = self.confirmation_lock.lock().await;
+                        handler.decide(&request).await
+                    } => decided,
+                };
+                match decided {
+                    Ok(value) => decision = Some(value),
+                    Err(error) => {
+                        self.approval_failed.send_replace(true);
+                        return Err(error);
+                    }
+                }
             }
             match decision {
                 Some(ToolConfirmationDecision::Approve) => {
@@ -2019,6 +2017,38 @@ impl ToolExecutor<'_> {
                 }
             }
         }
+
+        // Acquire concurrency permit after confirmation, so an approval waiting on a person
+        // does not hold the tool's slot, and a call that will not run takes none.
+        // The permit is held for the entire duration of this tool call
+        // and released on drop when this async block completes.
+        let _concurrency_permit = if response_content.is_some() {
+            None
+        } else {
+            match self.concurrency_manager.acquire(&name).await {
+                Ok(permit) => Some(permit),
+                Err(e) => {
+                    // Concurrency limit reached with Fail policy — return error
+                    let error_content = Content {
+                        role: "function".to_string(),
+                        parts: vec![Part::FunctionResponse {
+                            function_response: FunctionResponseData::new(
+                                name.clone(),
+                                serde_json::json!({ "error": e.to_string() }),
+                            ),
+                            id: id.clone(),
+                            annotations: None,
+                        }],
+                    };
+                    return Ok(ToolExecutionResult {
+                        index,
+                        content: error_content,
+                        actions: tool_actions,
+                        escalate_or_skip: false,
+                    });
+                }
+            }
+        };
 
         // Before-tool callbacks
         // Track potentially modified args for enhanced plugin after-hook
@@ -3338,6 +3368,8 @@ impl Agent for LlmAgent {
                         tool_timeout,
                         confirmation_decisions: &confirmation_decisions,
                         confirmation_fingerprints: &confirmation_fingerprints,
+                        confirmation_lock: tokio::sync::Mutex::new(()),
+                        approval_failed: tokio::sync::watch::channel(false).0,
                         #[cfg(feature = "enhanced-plugins")]
                         enhanced_plugin_manager: &enhanced_plugin_manager,
                     };
@@ -3364,7 +3396,7 @@ impl Agent for LlmAgent {
                                     results
                                 }
                                 ToolDispatchMode::Parallel => {
-                                    use futures::{StreamExt as _, TryStreamExt as _};
+                                    use futures::StreamExt as _;
                                     // Parallel is an explicit caller override. Tool
                                     // safety metadata is intentionally not inspected.
                                     // All concurrency enforcement is handled by the
@@ -3376,11 +3408,14 @@ impl Agent for LlmAgent {
                                         fc_parts.into_iter().map(|call| executor.execute(call)),
                                     )
                                     .buffer_unordered(buffer_size)
-                                    .try_collect()
-                                    .await?
+                                    // Running tools finish before an approval error ends the turn.
+                                    .collect::<Vec<_>>()
+                                    .await
+                                    .into_iter()
+                                    .collect::<Result<Vec<_>>>()?
                                 }
                                 ToolDispatchMode::ParallelDelegations => {
-                                    use futures::{StreamExt as _, TryStreamExt as _};
+                                    use futures::StreamExt as _;
 
                                     let mut all_results = Vec::with_capacity(fc_parts.len());
                                     let mut calls = fc_parts.into_iter().peekable();
@@ -3412,8 +3447,10 @@ impl Agent for LlmAgent {
                                                     .map(|call| executor.execute(call)),
                                             )
                                             .buffer_unordered(buffer_size)
-                                            .try_collect::<Vec<_>>()
-                                            .await?,
+                                            .collect::<Vec<_>>()
+                                            .await
+                                            .into_iter()
+                                            .collect::<Result<Vec<_>>>()?,
                                         );
                                     }
                                     all_results
@@ -3432,7 +3469,7 @@ impl Agent for LlmAgent {
                                     // Concurrency enforcement is handled by the semaphore
                                     // inside ToolExecutor.
                                     if !concurrent_fcs.is_empty() {
-                                        use futures::{StreamExt as _, TryStreamExt as _};
+                                        use futures::StreamExt as _;
                                         let buffer_size = concurrent_fcs.len().max(1);
                                         all_results.extend(
                                             futures::stream::iter(
@@ -3441,8 +3478,10 @@ impl Agent for LlmAgent {
                                                     .map(|call| executor.execute(call)),
                                             )
                                             .buffer_unordered(buffer_size)
-                                            .try_collect::<Vec<_>>()
-                                            .await?,
+                                            .collect::<Vec<_>>()
+                                            .await
+                                            .into_iter()
+                                            .collect::<Result<Vec<_>>>()?,
                                         );
                                     }
 

@@ -997,6 +997,11 @@ pub struct ToolConfirmationRequest {
 /// invocation while a person or an external policy service reviews the exact
 /// tool call. When no handler is configured, agents preserve the existing
 /// behavior and emit an interrupted confirmation event for a later run.
+///
+/// `LlmAgent` asks for each call as it is dispatched, one `decide` at a time,
+/// while calls that need no approval keep running. An error from `decide` ends the
+/// turn after running tools finish; `decide` calls still waiting in the same batch
+/// are dropped.
 #[async_trait]
 pub trait ToolConfirmationHandler: std::fmt::Debug + Send + Sync {
     /// Approve or deny one pending tool call.
