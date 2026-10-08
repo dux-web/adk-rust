@@ -1218,9 +1218,13 @@ mod tests {
 
     #[test]
     fn streamed_tool_arguments_require_valid_json() {
-        let parsed =
-            parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "bash", r#"{"command":"pwd"}"#)
-                .expect("valid arguments should parse");
+        let parsed = parse_tool_call_arguments(
+            "compatible-provider",
+            ErrorCodes::COMPATIBLE,
+            "bash",
+            r#"{"command":"pwd"}"#,
+        )
+        .expect("valid arguments should parse");
         assert_eq!(parsed["command"], "pwd");
 
         assert_eq!(
@@ -1229,25 +1233,45 @@ mod tests {
             serde_json::json!({})
         );
         assert_eq!(
-            parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "no_args", "   ")
-                .expect("a whitespace-only compatible payload should normalize"),
+            parse_tool_call_arguments(
+                "compatible-provider",
+                ErrorCodes::COMPATIBLE,
+                "no_args",
+                "   "
+            )
+            .expect("a whitespace-only compatible payload should normalize"),
             serde_json::json!({})
         );
         assert_eq!(
-            parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "no_args", "[]")
-                .expect("an empty array compatible payload should normalize"),
+            parse_tool_call_arguments(
+                "compatible-provider",
+                ErrorCodes::COMPATIBLE,
+                "no_args",
+                "[]"
+            )
+            .expect("an empty array compatible payload should normalize"),
             serde_json::json!({})
         );
 
-        let error = parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "bash", r#"{"command":"#)
-            .expect_err("truncated arguments must remain invalid");
+        let error = parse_tool_call_arguments(
+            "compatible-provider",
+            ErrorCodes::COMPATIBLE,
+            "bash",
+            r#"{"command":"#,
+        )
+        .expect_err("truncated arguments must remain invalid");
         assert_eq!(error.component, ErrorComponent::Model);
         assert_eq!(error.category, ErrorCategory::Internal);
         assert_eq!(error.code, "model.openai_compat.invalid_tool_arguments");
         assert_eq!(error.details.provider.as_deref(), Some("compatible-provider"));
 
-        let error = parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "bash", r#"["pwd"]"#)
-            .expect_err("non-empty array arguments must remain invalid");
+        let error = parse_tool_call_arguments(
+            "compatible-provider",
+            ErrorCodes::COMPATIBLE,
+            "bash",
+            r#"["pwd"]"#,
+        )
+        .expect_err("non-empty array arguments must remain invalid");
         assert_eq!(error.code, "model.openai_compat.invalid_tool_arguments");
     }
 
@@ -1257,8 +1281,13 @@ mod tests {
         append_tool_call_arguments(&mut arguments, &serde_json::json!({"command": "pwd"}));
 
         assert_eq!(
-            parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "bash", &arguments)
-                .expect("a structured object should normalize"),
+            parse_tool_call_arguments(
+                "compatible-provider",
+                ErrorCodes::COMPATIBLE,
+                "bash",
+                &arguments
+            )
+            .expect("a structured object should normalize"),
             serde_json::json!({"command": "pwd"})
         );
     }
@@ -1269,8 +1298,13 @@ mod tests {
             let mut arguments = String::new();
             append_tool_call_arguments(&mut arguments, &placeholder);
             assert_eq!(
-                parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "no_args", &arguments)
-                    .expect("an empty snapshot should remain a no-argument call"),
+                parse_tool_call_arguments(
+                    "compatible-provider",
+                    ErrorCodes::COMPATIBLE,
+                    "no_args",
+                    &arguments
+                )
+                .expect("an empty snapshot should remain a no-argument call"),
                 serde_json::json!({})
             );
 
@@ -1278,8 +1312,13 @@ mod tests {
             append_tool_call_arguments(&mut arguments, &serde_json::json!(r#": "pwd"}"#));
 
             assert_eq!(
-                parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "bash", &arguments)
-                    .expect("empty snapshots must not prefix string fragments"),
+                parse_tool_call_arguments(
+                    "compatible-provider",
+                    ErrorCodes::COMPATIBLE,
+                    "bash",
+                    &arguments
+                )
+                .expect("empty snapshots must not prefix string fragments"),
                 serde_json::json!({"command": "pwd"})
             );
         }

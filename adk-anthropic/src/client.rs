@@ -1789,7 +1789,8 @@ mod tests {
         assert_eq!(client.base_url, "http://127.0.0.1:12345");
         assert!(Anthropic::new_with_base_url(key, "invalid-explicit-url").is_err());
 
-        let dir = std::env::temp_dir().join(format!("adk_anthropic_explicit_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("adk_anthropic_explicit_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("key.txt");
         std::fs::write(&file, "sk-from-file\n").unwrap();

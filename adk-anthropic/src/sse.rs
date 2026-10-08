@@ -173,7 +173,9 @@ where
                         Err(e) if e.error_len().is_none() => {
                             let valid = e.valid_up_to();
                             // The prefix is valid UTF-8, so the lossy decode copies it exactly.
-                            state.buffer.push_str(&String::from_utf8_lossy(&state.pending[..valid]));
+                            state
+                                .buffer
+                                .push_str(&String::from_utf8_lossy(&state.pending[..valid]));
                             // Retain the incomplete character for the next network chunk.
                             state.pending.drain(..valid);
                         }

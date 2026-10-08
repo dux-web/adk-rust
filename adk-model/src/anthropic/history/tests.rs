@@ -45,10 +45,7 @@ fn respects_removed_calls_and_changed_arguments() {
     assert!(matches!(&blocks[1], ContentBlock::ToolUse(tool) if tool.input["path"] == "after.txt"));
     content.parts.remove(1);
     assert!(
-        restore(&content)
-            .unwrap()
-            .iter()
-            .all(|block| !matches!(block, ContentBlock::ToolUse(_)))
+        restore(&content).unwrap().iter().all(|block| !matches!(block, ContentBlock::ToolUse(_)))
     );
 }
 

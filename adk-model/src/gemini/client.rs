@@ -141,7 +141,8 @@ fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
     // Vertex no longer replays a failed request over REST, so a transport failure
     // is left to the configured retry policy instead.
     #[cfg(feature = "gemini-vertex")]
-    let transport_failure = adk_gemini::backend::vertex::VertexBackend::is_transport_error(&message);
+    let transport_failure =
+        adk_gemini::backend::vertex::VertexBackend::is_transport_error(&message);
     #[cfg(not(feature = "gemini-vertex"))]
     let transport_failure = false;
 
@@ -2765,9 +2766,8 @@ mod vertex_transport_tests {
             (ErrorCategory::Unavailable, "model.gemini.unavailable", true)
         );
 
-        let denied = adk_gemini::ClientError::Io {
-            source: std::io::Error::other("permission denied"),
-        };
+        let denied =
+            adk_gemini::ClientError::Io { source: std::io::Error::other("permission denied") };
         assert_eq!(gemini_error_to_adk(&denied).category, ErrorCategory::Internal);
     }
 }

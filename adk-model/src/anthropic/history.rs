@@ -42,14 +42,15 @@ pub(super) fn restore(content: &Content) -> Option<Vec<ContentBlock>> {
         tracing::debug!("native anthropic history is ambiguous; converting the adk parts");
         return None;
     }
-    let mut blocks: Vec<ContentBlock> =
-        match serde_json::from_value(saved_message["content"].clone()) {
-            Ok(blocks) => blocks,
-            Err(error) => {
-                tracing::debug!(error = %error, "native anthropic history is malformed; converting the adk parts");
-                return None;
-            }
-        };
+    let mut blocks: Vec<ContentBlock> = match serde_json::from_value(
+        saved_message["content"].clone(),
+    ) {
+        Ok(blocks) => blocks,
+        Err(error) => {
+            tracing::debug!(error = %error, "native anthropic history is malformed; converting the adk parts");
+            return None;
+        }
+    };
     let original: String = blocks
         .iter()
         .filter_map(|block| match block {
