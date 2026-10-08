@@ -4,18 +4,46 @@ use super::{client::convert_anthropic_error, convert};
 use adk_anthropic::{AccumulatingStream, ContentBlock, ContentBlockDelta, MessageStreamEvent};
 use adk_core::{AdkError, LlmResponseStream};
 use futures::{Stream, StreamExt};
+use serde_json::Value;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::Span;
 
 pub(super) fn responses<S>(events: S) -> LlmResponseStream
 where
     S: Stream<Item = Result<MessageStreamEvent, adk_anthropic::Error>> + Send + 'static,
 {
     Box::pin(async_stream::try_stream! {
+        // The accumulator turns a mid-stream `error` event into an `Err` item, the
+        // same shape as a transport failure; this flag tells the two apart.
+        let saw_error_event = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&saw_error_event);
+        let events = events.inspect(move |event| {
+            if matches!(event, Ok(MessageStreamEvent::StreamError { .. })) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        });
         let (mut events, _) = AccumulatingStream::new(events);
         while let Some(event) = events.next().await {
             let event = match event {
                 Ok(event) => event,
+                // A mid-stream `error` event (for example `overloaded_error`) aborts
+                // the message; it fails the stream with the category the same error
+                // gets as an HTTP response, so retry policy can act on it.
+                Err(error) if saw_error_event.load(Ordering::Relaxed) => {
+                    Err(convert_anthropic_error(error))?
+                }
                 Err(error) => {
                     let error = super::client::to_anthropic_api_error(&error);
+                    if let Some(request_id) = &error.request_id {
+                        Span::current().record("anthropic.request_id", request_id.as_str());
+                    }
+                    tracing::error!(
+                        error.type_ = %error.error_type,
+                        error.message = %error.message,
+                        error.status_code = error.status_code,
+                        "anthropic stream error"
+                    );
                     yield convert::from_stream_error(&error.error_type, &error.message);
                     return;
                 }
@@ -40,9 +68,27 @@ where
                     _ => {}
                 },
                 MessageStreamEvent::MessageStop(_) => {
-                    let message = events.finalize_partial().map_err(convert_anthropic_error)?;
+                    let mut message = events.finalize_partial().map_err(convert_anthropic_error)?;
                     if message.stop_reason.is_none() {
                         Err(AdkError::model("Anthropic stream ended without a stop reason"))?;
+                    }
+                    // The accumulator keeps malformed streamed arguments as a JSON
+                    // string; a truncated call must never run with substituted input.
+                    for block in &mut message.content {
+                        if let ContentBlock::ToolUse(tool) = block
+                            && !tool.input.is_object()
+                        {
+                            let raw = match &tool.input {
+                                Value::String(raw) => raw.clone(),
+                                other => other.to_string(),
+                            };
+                            tool.input = crate::tool_args::parse_streamed_tool_arguments(
+                                "anthropic",
+                                "model.anthropic.invalid_tool_arguments",
+                                &tool.name,
+                                &raw,
+                            )?;
+                        }
                     }
                     let mut response = convert::from_anthropic_message(&message).0;
                     // Replace deltas with the SDK's complete, ordered blocks.
@@ -51,9 +97,6 @@ where
                         ["content_complete"] = serde_json::json!(true);
                     yield response;
                     return;
-                }
-                MessageStreamEvent::StreamError { .. } => {
-                    Err(AdkError::model("Anthropic stream reported an error"))?;
                 }
                 _ => {}
             }
