@@ -146,7 +146,7 @@ let agent = LlmAgentBuilder::new("web_agent")
     .build()?;
 ```
 
-Browser sessions auto-start and auto-recover from stale WebDriver connections. You no longer need to call `browser.start()` before using tools — the session starts transparently on first use.
+Browser sessions auto-start and auto-recover from stale WebDriver connections, so `browser.start()` is optional. A host that manages the browser itself sets `BrowserConfig::require_explicit_start(true)`: tools then return an error until the host calls `start()`, and again after the session is lost.
 
 ## Available Tools (46 Total, 45 by Default)
 
