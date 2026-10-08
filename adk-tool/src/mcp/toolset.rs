@@ -12,15 +12,16 @@ use super::{ConnectionFactory, RefreshConfig, should_refresh_connection};
 use adk_core::{AdkError, ReadonlyContext, Result, Tool, ToolContext, Toolset};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use futures::StreamExt;
 use rmcp::{
     RoleClient,
     model::{
-        CallToolRequestParams, CallToolResponse, CancelTaskParams, CancelTaskRequest,
-        ClientRequest, CompletionContext, CompletionInfo, ContentBlock, ErrorCode,
-        GetPromptRequestParams, GetPromptResult, GetTaskParams, GetTaskRequest, InputRequest,
-        InputRequests, InputResponses, Prompt, ReadResourceRequestParams, Resource,
-        ResourceContents, ResourceTemplate, ServerResult, SubscribeRequestParams, TaskPayload,
-        ToolAnnotations, UnsubscribeRequestParams, UpdateTaskParams, UpdateTaskRequest,
+        CallToolRequestParams, CallToolResponse, CancelTaskParams, ClientRequest,
+        CompletionContext, CompletionInfo, ContentBlock, ErrorCode, GetPromptRequestParams,
+        GetPromptResult, GetTaskParams, GetTaskRequest, InputRequest, InputRequests,
+        InputResponses, Prompt, ReadResourceRequestParams, Resource, ResourceContents,
+        ResourceTemplate, ServerResult, SubscribeRequestParams, TaskPayload, ToolAnnotations,
+        UnsubscribeRequestParams, UpdateTaskParams, UpdateTaskRequest,
     },
     service::RunningService,
 };
@@ -43,6 +44,13 @@ const MAX_TASK_ID_BYTES: usize = 16 * 1024;
 
 /// Most input requests answered in one MRTR or in-task input round.
 const MAX_INPUT_REQUESTS_PER_ROUND: usize = 64;
+
+/// Most tasks `cancel_pending_tasks` checks or cancels at once.
+const MAX_CONCURRENT_TASK_CLEANUPS: usize = 16;
+
+/// Longest wait for a `tasks/cancel` acknowledgement, so an unresponsive
+/// server cannot hold a call far past its own deadline.
+const TASK_CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Returns `true` when a task request failed because the server no longer
 /// tracks the task, or (for `tasks/cancel`) because it already finished.
@@ -267,6 +275,11 @@ where
     /// The client should already be connected and initialized.
     /// Use `adk_tool::mcp::rmcp::ServiceExt::serve()` to create the client.
     ///
+    /// MRTR and in-task input requests follow ADK's input policy when the client
+    /// runs on [`AdkClientHandler`](super::AdkClientHandler), which rejects
+    /// sampling and roots. Any other handler receives elicitation requests, and
+    /// sampling or roots requests only when it declared those capabilities.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -280,6 +293,11 @@ where
     /// let toolset = McpToolset::new(client);
     /// ```
     pub fn new(client: RunningService<RoleClient, S>) -> Self {
+        // A client served on ADK's own handler keeps ADK's MRTR input policy, however
+        // it was built, so a configured sampling handler stays unreachable through MRTR.
+        let mrtr_handler = (client.service() as &dyn std::any::Any)
+            .downcast_ref::<super::elicitation::AdkClientHandler>()
+            .cloned();
         Self {
             client: Arc::new(Mutex::new(Arc::new(client))),
             tool_filter: None,
@@ -290,7 +308,7 @@ where
             refresh_config: RefreshConfig::default(),
             retry_tool_calls: DEFAULT_RETRY_TOOL_CALLS,
             resource_subscriptions: Arc::new(RwLock::new(BTreeSet::new())),
-            mrtr_handler: None,
+            mrtr_handler,
         }
     }
 
@@ -500,6 +518,10 @@ where
     /// `tasks/get`. A task stays tracked until a terminal status or an
     /// unknown-task response confirms it, so calling this again re-checks it.
     ///
+    /// Nothing else prunes the set: every task whose call ended before it saw a
+    /// terminal status stays tracked until this runs, so a long-lived toolset
+    /// that drops calls should call it periodically as well as at shutdown.
+    ///
     /// Cancellation is cooperative on the server side, so bound this call
     /// with the shutdown deadline. [`McpServerManager`](super::McpServerManager)
     /// runs it within its grace period before closing a managed session.
@@ -529,6 +551,9 @@ where
     /// ```
     pub async fn cancel_pending_tasks(&self) -> Result<()> {
         let ids: Vec<_> = self.active_tasks.lock().await.iter().cloned().collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
         let client = self.client.lock().await.peer().clone();
         let settled = |id: String| {
             let client = client.clone();
@@ -546,30 +571,33 @@ where
                 }
             }
         };
-        let results = futures::future::join_all(ids.into_iter().map(|id| {
-            let client = &client;
-            let settled = &settled;
-            async move {
-                if !settled(id.clone()).await? {
-                    if let Err(error) = client.cancel_task(CancelTaskParams::new(&id)).await
-                        && !is_unknown_or_finished_task(&error)
-                    {
-                        return Err(AdkError::tool(format!(
-                            "MCP task '{id}' cancellation outcome is unknown: {error}"
-                        )));
-                    }
+        let results: Vec<Result<()>> = futures::stream::iter(ids)
+            .map(|id| {
+                let client = &client;
+                let settled = &settled;
+                async move {
                     if !settled(id.clone()).await? {
-                        return Err(AdkError::tool(format!(
-                            "MCP task '{id}' has not confirmed termination after tasks/cancel; \
+                        if let Err(error) = client.cancel_task(CancelTaskParams::new(&id)).await
+                            && !is_unknown_or_finished_task(&error)
+                        {
+                            return Err(AdkError::tool(format!(
+                                "MCP task '{id}' cancellation outcome is unknown: {error}"
+                            )));
+                        }
+                        if !settled(id.clone()).await? {
+                            return Err(AdkError::tool(format!(
+                                "MCP task '{id}' has not confirmed termination after tasks/cancel; \
                              call cancel_pending_tasks again to re-check it"
-                        )));
+                            )));
+                        }
                     }
+                    self.active_tasks.lock().await.remove(&id);
+                    Ok(())
                 }
-                self.active_tasks.lock().await.remove(&id);
-                Ok(())
-            }
-        }))
-        .await;
+            })
+            .buffer_unordered(MAX_CONCURRENT_TASK_CLEANUPS)
+            .collect()
+            .await;
         for result in results {
             result?;
         }
@@ -919,11 +947,10 @@ impl McpToolset<super::elicitation::AdkClientHandler> {
         use rmcp::ServiceExt;
         let adk_handler = super::elicitation::AdkClientHandler::new(handler);
         let client = adk_handler
-            .clone()
             .serve(transport)
             .await
             .map_err(|e| AdkError::tool(format!("failed to connect MCP server: {e}")))?;
-        Ok(Self::new(client).with_mrtr_handler(adk_handler))
+        Ok(Self::new(client))
     }
 
     /// Create an MCP toolset with elicitation and resource notification handlers.
@@ -944,11 +971,11 @@ impl McpToolset<super::elicitation::AdkClientHandler> {
         use rmcp::ServiceExt;
         let adk_handler = super::elicitation::AdkClientHandler::new(elicitation_handler)
             .with_resource_notification_handler(resource_notification_handler);
-        let client =
-            adk_handler.clone().serve(transport).await.map_err(|error| {
-                AdkError::tool(format!("failed to connect MCP server: {error}"))
-            })?;
-        Ok(Self::new(client).with_mrtr_handler(adk_handler))
+        let client = adk_handler
+            .serve(transport)
+            .await
+            .map_err(|error| AdkError::tool(format!("failed to connect MCP server: {error}")))?;
+        Ok(Self::new(client))
     }
 
     /// Create a McpToolset with MCP sampling support from a transport.
@@ -996,11 +1023,10 @@ impl McpToolset<super::elicitation::AdkClientHandler> {
         let adk_handler = super::elicitation::AdkClientHandler::new(elicitation_handler)
             .with_sampling_handler(sampling_handler);
         let client = adk_handler
-            .clone()
             .serve(transport)
             .await
             .map_err(|e| AdkError::tool(format!("failed to connect MCP server: {e}")))?;
-        Ok(Self::new(client).with_mrtr_handler(adk_handler))
+        Ok(Self::new(client))
     }
 
     /// Create a toolset with elicitation, sampling, and resource notifications.
@@ -1021,11 +1047,11 @@ impl McpToolset<super::elicitation::AdkClientHandler> {
         let adk_handler = super::elicitation::AdkClientHandler::new(elicitation_handler)
             .with_sampling_handler(sampling_handler)
             .with_resource_notification_handler(resource_notification_handler);
-        let client =
-            adk_handler.clone().serve(transport).await.map_err(|error| {
-                AdkError::tool(format!("failed to connect MCP server: {error}"))
-            })?;
-        Ok(Self::new(client).with_mrtr_handler(adk_handler))
+        let client = adk_handler
+            .serve(transport)
+            .await
+            .map_err(|error| AdkError::tool(format!("failed to connect MCP server: {error}")))?;
+        Ok(Self::new(client))
     }
 }
 
@@ -1301,12 +1327,23 @@ where
         client.send_request(request).await.map_err(|error| TaskError::PollFailed(error.to_string()))
     }
 
+    /// Requests cancellation once; the pending-task set keeps the task until a
+    /// status confirms it.
     async fn cancel_task(&self, task_id: &str) {
-        let request = ClientRequest::CancelTaskRequest(CancelTaskRequest::new(
-            CancelTaskParams::new(task_id),
-        ));
-        if let Err(error) = self.send_task_request(request).await {
-            warn!(task_id, error = %error, "failed to cancel MCP task");
+        let cancel = async {
+            let peer = self.client.lock().await.peer().clone();
+            peer.cancel_task(CancelTaskParams::new(task_id)).await
+        };
+        match tokio::time::timeout(TASK_CANCEL_TIMEOUT, cancel).await {
+            Ok(Ok(())) => {}
+            // The task already finished or the server dropped it; nothing to cancel.
+            Ok(Err(error)) if is_unknown_or_finished_task(&error) => {}
+            Ok(Err(error)) => warn!(task_id, error = %error, "failed to cancel MCP task"),
+            Err(_) => warn!(
+                task_id,
+                timeout_ms = TASK_CANCEL_TIMEOUT.as_millis(),
+                "MCP server did not acknowledge tasks/cancel"
+            ),
         }
     }
 

@@ -448,15 +448,29 @@ impl McpServerManager {
                     "MCP task cancellation did not finish within the grace period"
                 ),
             }
-            let cancel_token = toolset.cancellation_token().await;
-            cancel_token.cancel();
-            let closed = tokio::time::timeout_at(deadline, async {
-                while !toolset.is_closed().await {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+            // A call blocked on the server holds the connection lock, so even
+            // reaching the session's token is bounded by the grace period.
+            let closed = match tokio::time::timeout_at(deadline, toolset.cancellation_token()).await
+            {
+                Ok(cancel_token) => {
+                    cancel_token.cancel();
+                    tokio::time::timeout_at(deadline, async {
+                        while !toolset.is_closed().await {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .is_ok()
                 }
-            })
-            .await
-            .is_ok();
+                Err(_) => {
+                    tracing::warn!(
+                        server.id = id,
+                        shutdown.grace_ms = grace_period.as_millis(),
+                        "MCP connection lock was still held at the end of the grace period"
+                    );
+                    false
+                }
+            };
             if !closed {
                 tracing::warn!(
                     server.id = id,
@@ -1843,9 +1857,12 @@ mod tests {
 
         async fn call_tool(
             &self,
-            _params: rmcp::model::CallToolRequestParams,
+            params: rmcp::model::CallToolRequestParams,
             _context: rmcp::service::RequestContext<rmcp::RoleServer>,
         ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+            if params.name == "hang" {
+                std::future::pending::<()>().await;
+            }
             Ok(rmcp::model::CreateTaskResult::new(held_task()).into())
         }
 
@@ -1923,5 +1940,43 @@ mod tests {
 
         assert_eq!(cancels.load(Ordering::SeqCst), 1, "shutdown must cancel the pending task");
         assert_eq!(manager.server_status("tasks").await.unwrap(), ServerStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn stop_server_is_bounded_while_a_call_holds_the_connection() {
+        use rmcp::ServiceExt;
+
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            if let Ok(running) = HeldTaskServer::default().serve(server_io).await {
+                let _ = running.waiting().await;
+            }
+        });
+        let client = AdkClientHandler::new(Arc::new(AutoDeclineElicitationHandler))
+            .serve(client_io)
+            .await
+            .unwrap();
+        let toolset = McpToolset::new(client);
+        // The server never answers, so this call keeps the connection lock.
+        let hung = toolset.clone();
+        tokio::spawn(async move { hung.call_tool_value("hang", Default::default()).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let manager = McpServerManager::new(HashMap::from([(
+            "hung".to_string(),
+            McpServerConfig { command: "unused".to_string(), ..Default::default() },
+        )]))
+        .with_grace_period(Duration::from_millis(100));
+        {
+            let mut servers = manager.servers.write().await;
+            let entry = servers.get_mut("hung").unwrap();
+            entry.status = ServerStatus::Running;
+            entry.toolset = Some(toolset);
+        }
+        tokio::time::timeout(Duration::from_secs(5), manager.stop_server("hung"))
+            .await
+            .expect("stopping a server must not wait on a hung call")
+            .unwrap();
+        assert_eq!(manager.server_status("hung").await.unwrap(), ServerStatus::Stopped);
     }
 }

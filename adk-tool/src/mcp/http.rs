@@ -27,16 +27,6 @@ struct HttpElicitationConnectionFactory {
 
 #[cfg(feature = "http-transport")]
 impl HttpElicitationConnectionFactory {
-    fn client_handler(&self) -> super::elicitation::AdkClientHandler {
-        let handler = super::elicitation::AdkClientHandler::new(self.handler.clone());
-        match &self.resource_notification_handler {
-            Some(resource_handler) => {
-                handler.with_resource_notification_handler(Arc::clone(resource_handler))
-            }
-            None => handler,
-        }
-    }
-
     async fn connect_once(
         &self,
     ) -> std::result::Result<
@@ -46,7 +36,11 @@ impl HttpElicitationConnectionFactory {
         use rmcp::ServiceExt;
 
         let transport = self.builder.build_transport().await.map_err(|error| error.to_string())?;
-        self.client_handler()
+        let mut handler = super::elicitation::AdkClientHandler::new(self.handler.clone());
+        if let Some(resource_handler) = &self.resource_notification_handler {
+            handler = handler.with_resource_notification_handler(Arc::clone(resource_handler));
+        }
+        handler
             .serve(transport)
             .await
             .map_err(|error| format!("failed to connect to MCP server: {error}"))
@@ -355,11 +349,8 @@ impl McpHttpClientBuilder {
             resource_notification_handler,
         });
         let client = factory.connect_once().await.map_err(AdkError::tool)?;
-        let input_handler = factory.client_handler();
 
-        Ok(super::McpToolset::new(client)
-            .with_connection_factory(factory)
-            .with_mrtr_handler(input_handler))
+        Ok(super::McpToolset::new(client).with_connection_factory(factory))
     }
 
     /// Connect with elicitation support (stub when http-transport feature is disabled).

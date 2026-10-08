@@ -2,7 +2,9 @@
 //! remote task lifecycle.
 #![cfg(feature = "mcp")]
 
-use adk_tool::mcp::{AutoDeclineElicitationHandler, ConnectionFactory, McpTaskConfig, McpToolset};
+use adk_tool::mcp::{
+    AdkClientHandler, AutoDeclineElicitationHandler, ConnectionFactory, McpTaskConfig, McpToolset,
+};
 use rmcp::model::*;
 use rmcp::service::{RequestContext, RunningService};
 use rmcp::transport::{IntoTransport, Transport};
@@ -259,6 +261,8 @@ struct ScriptedTaskServer {
     gets: Arc<AtomicUsize>,
     cancels: Arc<AtomicUsize>,
     updates: Arc<AtomicUsize>,
+    /// Never answers `tasks/cancel`.
+    cancel_hangs: bool,
 }
 
 impl ScriptedTaskServer {
@@ -268,6 +272,7 @@ impl ScriptedTaskServer {
             gets: Arc::default(),
             cancels: Arc::default(),
             updates: Arc::default(),
+            cancel_hangs: false,
         }
     }
 }
@@ -321,6 +326,9 @@ impl ServerHandler for ScriptedTaskServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
         self.cancels.fetch_add(1, Ordering::SeqCst);
+        if self.cancel_hangs {
+            std::future::pending::<()>().await;
+        }
         *self.statuses.lock().unwrap() = [Some(completed())].into();
         Err(ErrorData::invalid_params(format!("task {} is already terminal", params.task_id), None))
     }
@@ -376,6 +384,23 @@ async fn a_task_returned_without_task_support_is_cancelled() {
 
     toolset.cancel_pending_tasks().await.unwrap();
     assert_eq!(server.cancels.load(Ordering::SeqCst), 1, "a finished task needs no second cancel");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_the_server_never_acknowledges_does_not_hang_the_call() {
+    let server = ScriptedTaskServer {
+        cancel_hangs: true,
+        ..ScriptedTaskServer::new([Some(TaskPayload::Working)])
+    };
+    let client = InputClient::default().serve(spawn_server(server.clone())).await.unwrap();
+    let toolset = McpToolset::new(client);
+    let call = toolset.call_tool_value("job", Default::default());
+    let error = tokio::time::timeout(Duration::from_secs(30), call)
+        .await
+        .expect("an unanswered tasks/cancel must not hold the call")
+        .unwrap_err();
+    assert!(error.to_string().contains("was cancelled because"), "{error}");
+    assert_eq!(server.cancels.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -619,7 +644,31 @@ async fn a_sampling_handler_is_not_reachable_through_mrtr() {
     .unwrap();
     let error = toolset.call_tool_value("job", Default::default()).await.unwrap_err().to_string();
     assert!(error.contains("MRTR sampling is deprecated and not enabled by ADK"), "{error}");
+
+    // The documented `serve_with_lifecycle` path builds the client first.
+    let client = AdkClientHandler::new(Arc::new(AutoDeclineElicitationHandler))
+        .with_sampling_handler(Arc::new(CountingSampler(sampled.clone())))
+        .serve(spawn_hostile_server("sample", sampling_request()))
+        .await
+        .unwrap();
+    let error = McpToolset::new(client)
+        .call_tool_value("job", Default::default())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("MRTR sampling is deprecated and not enabled by ADK"), "{error}");
     assert_eq!(sampled.load(Ordering::SeqCst), 0, "the sampling handler must not run");
+}
+
+#[tokio::test]
+async fn caller_built_adk_handler_toolsets_apply_the_adk_input_policy() {
+    let client = AdkClientHandler::new(Arc::new(AutoDeclineElicitationHandler))
+        .serve(spawn_hostile_server("roots", roots_request()))
+        .await
+        .unwrap();
+    let toolset = McpToolset::new(client);
+    let error = toolset.call_tool_value("job", Default::default()).await.unwrap_err().to_string();
+    assert!(error.contains("MRTR roots are deprecated and not enabled by ADK"), "{error}");
 }
 
 #[tokio::test]
