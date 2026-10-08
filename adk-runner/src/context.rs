@@ -143,6 +143,12 @@ impl MutableSession {
                 continue;
             }
 
+            // Streamed deltas are superseded by their terminal event, which carries the
+            // complete response; the persisted session holds only that terminal event.
+            if event.llm_response.partial {
+                continue;
+            }
+
             // Skip events that were already compacted
             if let Some(boundary) = compaction_boundary
                 && event.timestamp <= boundary
