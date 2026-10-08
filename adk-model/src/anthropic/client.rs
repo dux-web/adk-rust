@@ -94,9 +94,24 @@ impl AnthropicClient {
 
     /// Adds default HTTP headers while preserving authentication and automatic beta headers.
     ///
-    /// Headers with the same name replace the existing default value.
+    /// Headers with the same name replace the existing default value. This method only
+    /// stores the headers on the existing client, so unlike the OpenAI clients'
+    /// `with_default_headers` it cannot fail and returns `Self`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_anthropic::{HeaderMap, HeaderValue};
+    /// use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("x-session-id", HeaderValue::from_static("conversation-1"));
+    /// let client = AnthropicClient::new(AnthropicConfig::new("api-key", "claude-sonnet-4-6"))?
+    ///     .with_default_headers(headers);
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
     #[must_use]
-    pub fn with_default_headers(mut self, headers: http::HeaderMap) -> Self {
+    pub fn with_default_headers(mut self, headers: adk_anthropic::HeaderMap) -> Self {
         self.client = self.client.with_default_headers(headers);
         self
     }

@@ -28,6 +28,7 @@ async fn continues_tool_calls_with_the_same_identity() {
                 reply["stop_reason"] = json!("tool_use");
                 reply
             }
+            other => panic!("no tool-call fixture for {other:?}"),
         };
         Mock::given(method("POST"))
             .and(path(format!("/v1/{endpoint}")))
@@ -111,6 +112,7 @@ async fn continues_tool_calls_with_the_same_identity() {
                     })
                 }))
             }
+            other => panic!("no tool-result assertion for {other:?}"),
         }
     }
 }

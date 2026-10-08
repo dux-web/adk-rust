@@ -486,7 +486,9 @@ impl Anthropic {
     /// Adds default HTTP headers, replacing defaults with the same name.
     ///
     /// Per-request replacement headers still take precedence. Automatically
-    /// selected beta headers continue to be derived from message parameters.
+    /// selected beta headers continue to be derived from message parameters. The
+    /// headers are stored on the existing client rather than rebuilding it, so this
+    /// method cannot fail and returns `Self`.
     ///
     /// # Example
     ///

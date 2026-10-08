@@ -6,6 +6,7 @@ use crate::retry::RetryConfig;
 
 /// Wire API accepted by an OpenCode model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OpenCodeApi {
     /// OpenAI-compatible Chat Completions.
     ChatCompletions,

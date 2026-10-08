@@ -46,6 +46,7 @@ fn reply(api: OpenCodeApi, model: &str) -> Value {
         OpenCodeApi::Responses => response(model),
         OpenCodeApi::Messages => message(model),
         OpenCodeApi::GenerateContent => gemini(),
+        other => panic!("no reply fixture for {other:?}"),
     }
 }
 
@@ -167,6 +168,7 @@ async fn routes_streams_with_conversation_headers_and_usage() {
             OpenCodeApi::GenerateContent => {
                 (endpoint.replace(":generateContent", ":streamGenerateContent"), sse(&[gemini()]))
             }
+            other => panic!("no stream fixture for {other:?}"),
         };
         let server = MockServer::start().await;
         Mock::given(method("POST"))
