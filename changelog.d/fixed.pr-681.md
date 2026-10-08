@@ -1,0 +1,1 @@
+- Preserve MCP task execution for direct tool calls and retain pending tasks until cancellation is confirmed.
