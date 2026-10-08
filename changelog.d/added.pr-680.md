@@ -1,0 +1,1 @@
+- **Browser session options** (`adk-browser`): optional explicit session startup and Chrome binary/preferences overrides. Chrome keeps its sandbox unless callers explicitly supply `--no-sandbox`.
