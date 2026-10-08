@@ -28,6 +28,7 @@ This crate provides 46 browser automation tools (45 enabled by default) as ADK `
 |---------|---------|
 | `browser_evaluate_js`, which runs model-written JavaScript in the page, is not included in any toolset or profile | `.with_evaluate_js(true)` (or `.with_js(true)`) |
 | `browser_navigate`, `browser_new_tab`, and `browser_new_window` accept only `http` and `https` URLs, so `file:`, `javascript:`, `data:`, and `chrome:` URLs are refused | `.with_allowed_schemes(["https", "file"])` |
+| Chrome runs with its sandbox on; `--no-sandbox` is never added, and `chrome_options` cannot replace the argument list | `BrowserConfig::new().add_arg("--no-sandbox")` for containers that run Chrome as root |
 
 ```rust,ignore
 use adk_browser::{BrowserConfig, BrowserSession, BrowserToolset};
@@ -172,6 +173,8 @@ pool.cleanup_all().await;
 ## Session Lifecycle
 
 `BrowserSession` automatically starts or reconnects the WebDriver when any browser method is called. You do not need to call `start()` manually — all public methods that access the WebDriver go through an internal `live_driver()` path that calls `ensure_started()` first.
+
+A host that manages the browser itself sets `require_explicit_start(true)`: tools then return an error until the host calls `start()`, and again after the session is lost. `start()` keeps a session that still responds and replaces one that does not. `chrome_option(name, value)` passes Chrome options such as `binary` and `prefs`; command-line flags go through `add_arg`, and an `args` option is rejected.
 
 ```rust,ignore
 let browser = Arc::new(BrowserSession::new(config));
@@ -450,11 +453,3 @@ Apache-2.0
 ## Part of ADK-Rust
 
 This crate is part of the [ADK-Rust](https://github.com/zavora-ai/adk-rust) framework for building AI agents in Rust.
-
-### Host-managed browser sessions
-
-Set `BrowserConfig::require_explicit_start` to require `BrowserSession::start`
-before tools connect or recreate a lost session. The default remains automatic
-startup. `chrome_options` supplies Chrome options such as `binary` and `prefs`.
-Chrome's sandbox is enabled by default; environments that require disabling it
-must explicitly add `--no-sandbox` to `browser_args`.
