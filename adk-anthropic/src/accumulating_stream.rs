@@ -332,6 +332,50 @@ mod tests {
     };
     use futures::stream;
 
+    #[tokio::test]
+    async fn server_inputs_preserve_initial_values_and_indexed_deltas() {
+        use futures::StreamExt;
+        use serde_json::json;
+        for fragments in [false, true] {
+            let mut values = vec![
+                json!({"type":"message_start","message":{"id":"fixture","type":"message",
+                    "role":"assistant","model":"fixture","content":[],"stop_reason":null,
+                    "stop_sequence":null,"usage":{"input_tokens":8,"output_tokens":0}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{
+                    "type":"server_tool_use","id":"search","name":"web_search",
+                    "input":if fragments { json!({}) } else { json!({"query":"source 🙂"}) }}}),
+                json!({"type":"content_block_start","index":1,"content_block":{
+                    "type":"tool_use","id":"read","name":"read_file","input":{}}}),
+            ];
+            if fragments {
+                values.push(json!({"type":"content_block_delta","index":0,
+                    "delta":{"type":"input_json_delta","partial_json":"{\"query\":\"source "}}));
+            }
+            values.push(json!({"type":"content_block_delta","index":1,
+                "delta":{"type":"input_json_delta","partial_json":"{\"path\":\"file.txt\"}"}}));
+            if fragments {
+                values.push(json!({"type":"content_block_delta","index":0,
+                    "delta":{"type":"input_json_delta","partial_json":"🙂\"}"}}));
+            }
+            values.push(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},
+                "usage":{"output_tokens":4}}));
+            values.push(json!({"type":"message_stop"}));
+            let events: Vec<_> = values
+                .into_iter()
+                .map(|value| Ok(serde_json::from_value(value).unwrap()))
+                .collect();
+            let (mut stream, result) = AccumulatingStream::new(stream::iter(events));
+            while let Some(event) = stream.next().await {
+                event.unwrap();
+            }
+            let message = result.await.unwrap().unwrap();
+            assert!(matches!(&message.content[0], ContentBlock::ServerToolUse(tool)
+                if tool.id == "search" && tool.input == json!({"query":"source 🙂"})));
+            assert!(matches!(&message.content[1], ContentBlock::ToolUse(tool)
+                if tool.id == "read" && tool.input == json!({"path":"file.txt"})));
+        }
+    }
+
     /// Verifies that cache tokens from message_start are preserved through streaming.
     #[tokio::test]
     async fn cache_tokens_from_message_start_preserved() {

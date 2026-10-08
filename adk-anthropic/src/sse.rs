@@ -26,14 +26,20 @@ const MAX_EVENT_SIZE: usize = 64 * 1024;
 /// Longest wait for the next chunk from the server before the stream fails (30 seconds).
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(test)]
+#[path = "sse/unicode.rs"]
+mod unicode;
+
 /// State for SSE processing with production hardening
 struct SseState {
     buffer: String,
+    /// Trailing bytes of a UTF-8 character split across network chunks.
+    pending: Vec<u8>,
     total_bytes_processed: usize,
     start: Instant,
     first_byte: Option<Instant>,
     /// Set once a terminal error (inactivity timeout, transport failure, buffer
-    /// overflow) has been reported; the stream then ends.
+    /// overflow, invalid UTF-8) has been reported; the stream then ends.
     finished: bool,
 }
 
@@ -89,6 +95,7 @@ where
     // Initialize state with production hardening
     let state = SseState {
         buffer: String::new(),
+        pending: Vec::new(),
         total_bytes_processed: 0,
         start: Instant::now(),
         first_byte: None,
@@ -157,21 +164,23 @@ where
                         STREAM_TTFB.add(now.duration_since(state.start).as_secs_f64());
                     }
 
-                    match String::from_utf8(bytes.to_vec()) {
+                    state.pending.extend_from_slice(&bytes);
+                    match std::str::from_utf8(&state.pending) {
                         Ok(text) => {
-                            state.buffer.push_str(&text);
+                            state.buffer.push_str(text);
+                            state.pending.clear();
+                        }
+                        Err(e) if e.error_len().is_none() => {
+                            let valid = e.valid_up_to();
+                            // The prefix is valid UTF-8, so the lossy decode copies it exactly.
+                            state
+                                .buffer
+                                .push_str(&String::from_utf8_lossy(&state.pending[..valid]));
+                            // Retain the incomplete character for the next network chunk.
+                            state.pending.drain(..valid);
                         }
                         Err(e) => {
-                            // Try to recover partial UTF-8 sequences
-                            let valid_up_to = e.utf8_error().valid_up_to();
-                            if valid_up_to > 0
-                                && let Ok(partial) =
-                                    String::from_utf8(bytes[..valid_up_to].to_vec())
-                            {
-                                state.buffer.push_str(&partial);
-                                // Log invalid bytes but continue processing
-                                continue;
-                            }
+                            state.finished = true;
                             return Some((
                                 Err(Error::encoding(
                                     format!("Invalid UTF-8 in stream: {e}"),
@@ -190,6 +199,16 @@ where
                     return Some((Err(e), (stream, state)));
                 }
                 None => {
+                    if !state.pending.is_empty() {
+                        state.finished = true;
+                        return Some((
+                            Err(Error::encoding(
+                                "SSE stream ended inside a UTF-8 character".to_string(),
+                                None,
+                            )),
+                            (stream, state),
+                        ));
+                    }
                     // End of stream - try to process any remaining buffered events
                     if !state.buffer.is_empty()
                         && let Ok(Some((event, _))) = extract_event(&state.buffer, parser)

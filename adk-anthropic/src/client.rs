@@ -141,6 +141,7 @@ impl Anthropic {
     ) -> Result<ReqwestClient> {
         let mut builder = ReqwestClient::builder()
             .connect_timeout(connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .pool_max_idle_per_host(10) // Connection pooling optimization
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60));
@@ -227,17 +228,45 @@ impl Anthropic {
             }
         };
 
+        let base_url = Self::resolve_base_url(env::var("ANTHROPIC_BASE_URL").ok())?;
+        Self::from_values(api_key, base_url)
+    }
+
+    /// Create a client with an explicit API key and base URL.
+    ///
+    /// Unlike [`Anthropic::new`], this constructor reads neither `ANTHROPIC_API_KEY`
+    /// nor `ANTHROPIC_BASE_URL`. A `file://` API key is read from that file, as in
+    /// [`Anthropic::new`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when `base_url` is not `https://` and not
+    /// `http://` with a loopback host, or when a `file://` API key cannot be read.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_anthropic::Anthropic;
+    ///
+    /// let client = Anthropic::new_with_base_url("sk-ant-key", "https://proxy.example.com")?;
+    /// # Ok::<(), adk_anthropic::Error>(())
+    /// ```
+    pub fn new_with_base_url(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Result<Self> {
+        let base_url = base_url.into();
+        validate_base_url(&base_url)?;
+        Self::from_values(Self::resolve_api_key(&api_key.into())?, base_url)
+    }
+
+    fn from_values(api_key: String, base_url: String) -> Result<Self> {
         let timeout = DEFAULT_TIMEOUT;
         let client = Self::build_http_client(Some(timeout), timeout)?;
         let stream_client = Self::build_http_client(None, timeout)?;
 
         // Pre-build headers for performance
         let cached_headers = Arc::new(Self::build_default_headers(&api_key)?);
-
-        // Resolve base URL from environment variable, defaulting to the API URL.
-        // An env-provided value is validated here so the cleartext path closed on
-        // `with_base_url` cannot be reopened through the environment.
-        let base_url = Self::resolve_base_url(env::var("ANTHROPIC_BASE_URL").ok())?;
 
         Ok(Self {
             api_key,
@@ -1739,6 +1768,41 @@ mod tests {
         // Test that rate_limit error (which 529 now maps to) is also retryable
         let rate_limit_error = Error::rate_limit("Overloaded", Some(5));
         assert!(rate_limit_error.is_retryable());
+    }
+
+    #[test]
+    fn explicit_configuration() {
+        if std::env::var_os("ADK_EXPLICIT_CONFIG_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "client::tests::explicit_configuration"])
+                .env("ADK_EXPLICIT_CONFIG_CHILD", "1")
+                .env("ANTHROPIC_BASE_URL", "invalid-environment-url")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let key = "sk-explicit-key";
+        let client = Anthropic::new_with_base_url(key, "http://127.0.0.1:12345").unwrap();
+        assert_eq!(client.api_key, key);
+        assert_eq!(client.cached_headers["x-api-key"], key);
+        assert_eq!(client.base_url, "http://127.0.0.1:12345");
+        assert!(Anthropic::new_with_base_url(key, "invalid-explicit-url").is_err());
+
+        let dir =
+            std::env::temp_dir().join(format!("adk_anthropic_explicit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("key.txt");
+        std::fs::write(&file, "sk-from-file\n").unwrap();
+        let client =
+            Anthropic::new_with_base_url(format!("file://{}", file.display()), "https://a.example")
+                .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(client.api_key, "sk-from-file");
+        assert!(
+            Anthropic::new_with_base_url("file:///adk-missing-key-file", "https://a.example")
+                .is_err()
+        );
     }
 
     #[test]

@@ -281,6 +281,7 @@ where
                     attempt = attempt,
                     max_retries = retry_config.max_retries,
                     delay_ms = effective_delay.as_millis(),
+                    error.code = error.code,
                     error = %error,
                     "Provider request failed with retryable error; retrying"
                 );

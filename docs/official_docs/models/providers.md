@@ -591,6 +591,8 @@ OpenAI-compatible, Azure OpenAI, Azure AI Inference, Anthropic, DeepSeek, Groq).
 | Text-encoded tool calls | Recognised only when the request declares the named tool; a ` ```json ` fence also needs an `arguments` or `parameters` object |
 | Tool order | Anthropic and Bedrock send tool definitions sorted by name, so the prompt-cache prefix is stable |
 | API keys | Provider configs redact the key in `Debug` output and omit it when serialized |
+| Redirects | Anthropic, Gemini, OpenAI, OpenAI-compatible, Azure OpenAI, Azure AI Inference and DeepSeek clients return a 3xx response as an error instead of following it |
+| Inline PDFs | OpenAI and Azure OpenAI receive a `file` part; other OpenAI-compatible providers receive the text fallback |
 
 ```rust
 use std::time::Duration;
@@ -603,6 +605,36 @@ fn build() -> Result<GroqClient, adk_core::AdkError> {
     let api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
     let retry = RetryConfig::default().with_max_delay(Duration::from_secs(30));
     Ok(GroqClient::new(GroqConfig::new(api_key, GROQ_DEFAULT))?.with_retry_config(retry))
+}
+```
+
+### Request Adapters and Explicit Endpoints
+
+`OpenAICompatible` (and so every OpenAI-compatible preset) and `OpenAIResponsesClient`
+accept a `RequestAdapter` that edits the JSON body and headers of each generation
+request, retries included. Constructors that take the endpoint explicitly avoid ambient
+configuration when the application owns authentication:
+
+| Constructor | Provider | Reads environment |
+|-------------|----------|-------------------|
+| `Anthropic::new_with_base_url` | Anthropic | No |
+| `GeminiModel::new_with_base_url` | Gemini API | No |
+| `GeminiModel::new_google_cloud_endpoint` | Vertex AI (`gemini-vertex`) | Only ADC when no key is given |
+| `BedrockClient::new_with_api_key`, `BedrockClient::from_client` | Amazon Bedrock | No |
+
+```rust
+use std::sync::Arc;
+
+use adk_model::openai::{OpenAICompatible, OpenAICompatibleConfig, RequestAdapter};
+
+fn build(api_key: String) -> Result<OpenAICompatible, adk_core::AdkError> {
+    let adapter: RequestAdapter = Arc::new(|body, headers| {
+        body["metadata"] = serde_json::json!({"application": "support-bot"});
+        headers.insert("x-request-source", "support-bot".parse().expect("valid header"));
+        Ok(())
+    });
+    Ok(OpenAICompatible::new(OpenAICompatibleConfig::new(api_key, "gpt-5-mini"))?
+        .with_request_adapter(adapter))
 }
 ```
 

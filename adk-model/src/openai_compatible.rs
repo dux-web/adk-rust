@@ -2,6 +2,7 @@
 
 use crate::openai::{OpenAIReasoningEffort, convert};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
+use crate::sse::take_line;
 use adk_core::{
     AdkError, Content, ErrorCategory, ErrorComponent, FinishReason, GenericSchemaAdapter, Llm,
     LlmRequest, LlmResponse, LlmResponseStream, Part, SchemaAdapter, SchemaCache, UsageMetadata,
@@ -265,9 +266,47 @@ impl OpenAICompatibleConfig {
     }
 }
 
+/// Error codes a compatible client reports.
+///
+/// Native services routed through [`OpenAICompatible`] keep the codes their
+/// dedicated clients reported, because error codes are part of the public contract.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ErrorCodes {
+    /// Transport failure before a response arrived.
+    pub(crate) request: &'static str,
+    /// Non-success HTTP status without a status-specific code.
+    pub(crate) api_error: &'static str,
+    /// Response body that is not valid JSON.
+    pub(crate) parse: &'static str,
+    /// Tool-call arguments that are not a JSON object.
+    pub(crate) invalid_tool_arguments: &'static str,
+    /// Status-specific codes that take precedence over `api_error`.
+    pub(crate) status: &'static [(u16, &'static str)],
+}
+
+impl ErrorCodes {
+    /// Codes for providers reached through the generic compatible client.
+    pub(crate) const COMPATIBLE: Self = Self {
+        request: "model.openai_compat.request",
+        api_error: "model.openai_compat.api_error",
+        parse: "model.openai_compat.parse",
+        invalid_tool_arguments: "model.openai_compat.invalid_tool_arguments",
+        status: &[],
+    };
+
+    fn for_status(&self, status: u16) -> &'static str {
+        self.status
+            .iter()
+            .find_map(|(candidate, code)| (*candidate == status).then_some(*code))
+            .unwrap_or(self.api_error)
+    }
+}
+
 /// Shared OpenAI-compatible client implementation.
 pub struct OpenAICompatible {
+    completion_url: Option<String>,
     http: reqwest::Client,
+    request_adapter: Option<crate::openai::RequestAdapter>,
     api_key: String,
     base_url: String,
     model: String,
@@ -277,6 +316,7 @@ pub struct OpenAICompatible {
     organization_id: Option<String>,
     parallel_tool_calls: bool,
     reasoning_replay_field: Option<ReasoningReplayField>,
+    error_codes: ErrorCodes,
 }
 
 impl OpenAICompatible {
@@ -305,7 +345,12 @@ impl OpenAICompatible {
         let base_url = config.base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
         Ok(Self {
-            http: reqwest::Client::new(),
+            completion_url: None,
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| AdkError::model("failed to initialize compatible HTTP transport"))?,
+            request_adapter: None,
             api_key: config.api_key,
             base_url,
             model: config.model,
@@ -315,6 +360,7 @@ impl OpenAICompatible {
             organization_id: config.organization_id,
             parallel_tool_calls: config.parallel_tool_calls,
             reasoning_replay_field: None,
+            error_codes: ErrorCodes::COMPATIBLE,
         })
     }
 
@@ -322,6 +368,33 @@ impl OpenAICompatible {
     #[must_use]
     pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
         self.retry_config = retry_config;
+        self
+    }
+
+    /// Customize generation request fields and headers before each HTTP attempt.
+    ///
+    /// The adapter runs under this client's [`RetryConfig`]; see
+    /// [`RequestAdapter`](crate::openai::RequestAdapter) for an example.
+    #[must_use]
+    pub fn with_request_adapter(mut self, adapter: crate::openai::RequestAdapter) -> Self {
+        self.request_adapter = Some(adapter);
+        self
+    }
+
+    /// Use a native service's fully qualified Chat Completions route.
+    pub(crate) fn with_completion_url(mut self, url: String) -> Self {
+        self.completion_url = Some(url);
+        self
+    }
+
+    pub(crate) fn with_reasoning_effort(mut self, effort: Option<OpenAIReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    /// Report a native service's error codes instead of the compatible ones.
+    pub(crate) fn with_error_codes(mut self, error_codes: ErrorCodes) -> Self {
+        self.error_codes = error_codes;
         self
     }
 
@@ -413,16 +486,25 @@ fn inject_assistant_reasoning(
     }
 }
 
+/// Provider capabilities that shape a Chat Completions request body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ChatCapabilities {
+    /// Value of `parallel_tool_calls` sent with tool declarations.
+    pub(crate) parallel_tool_calls: bool,
+    /// Send inline PDFs as `file` parts. Only OpenAI and Azure OpenAI accept them,
+    /// so every other compatible provider keeps the text fallback.
+    pub(crate) native_pdf: bool,
+}
+
 /// Build the serialized JSON request body from an `LlmRequest`.
 ///
 /// This is shared between the streaming and non-streaming paths so that
 /// request parameter construction is identical regardless of mode.
-/// Also used by `AzureOpenAIClient` for consistent request building.
 pub(crate) fn build_request_json(
     model: &str,
     request: &LlmRequest,
     reasoning_effort: &Option<OpenAIReasoningEffort>,
-    parallel_tool_calls: bool,
+    capabilities: ChatCapabilities,
     reasoning_replay_field: Option<ReasoningReplayField>,
     adapter: &dyn SchemaAdapter,
     cache: &SchemaCache,
@@ -443,7 +525,11 @@ pub(crate) fn build_request_json(
         )
         .with_provider("gemini"));
     }
-    let messages: Vec<_> = request.contents.iter().map(convert::content_to_message).collect();
+    let contents = crate::tool_result::with_images(&request.contents);
+    let messages: Vec<_> = contents
+        .iter()
+        .map(|content| convert::content_to_message(content, capabilities.native_pdf))
+        .collect();
 
     let mut request_builder = CreateChatCompletionRequestArgs::default();
     request_builder.model(model).messages(messages);
@@ -452,7 +538,7 @@ pub(crate) fn build_request_json(
         let tools = convert::convert_tools(&request.tools, adapter, cache);
         request_builder.tools(tools);
         // OpenAI defaults parallel_tool_calls to true.
-        request_builder.parallel_tool_calls(parallel_tool_calls);
+        request_builder.parallel_tool_calls(capabilities.parallel_tool_calls);
     }
 
     if let Some(effort) = reasoning_effort.and_then(to_oai_reasoning_effort) {
@@ -496,7 +582,7 @@ pub(crate) fn build_request_json(
         body["reasoning_effort"] = serde_json::Value::String("max".to_string());
     }
 
-    inject_assistant_reasoning(&mut body, &request.contents, reasoning_replay_field);
+    inject_assistant_reasoning(&mut body, &contents, reasoning_replay_field);
 
     // Merge provider-specific extensions from config.extensions["openai"] into
     // the request body.  This allows users to pass provider-specific fields
@@ -526,6 +612,17 @@ fn to_oai_reasoning_effort(effort: OpenAIReasoningEffort) -> Option<OaiReasoning
     }
 }
 
+/// Destination, credentials and error codes of one generation request.
+#[derive(Clone)]
+struct RequestTarget {
+    url: String,
+    api_key: String,
+    organization_id: Option<String>,
+    provider_name: String,
+    adapter: Option<crate::openai::RequestAdapter>,
+    error_codes: ErrorCodes,
+}
+
 /// Send an HTTP POST and handle error status codes.
 ///
 /// Returns the raw `reqwest::Response` on success so the caller can decide
@@ -533,13 +630,23 @@ fn to_oai_reasoning_effort(effort: OpenAIReasoningEffort) -> Option<OaiReasoning
 /// stream (streaming).
 async fn send_request(
     http: &reqwest::Client,
-    url: &str,
-    api_key: &str,
-    organization_id: &Option<String>,
+    target: &RequestTarget,
     body: &serde_json::Value,
-    provider_name: &str,
 ) -> Result<reqwest::Response, AdkError> {
-    let mut http_req = http.post(url).bearer_auth(api_key).json(body);
+    let RequestTarget { url, api_key, organization_id, provider_name, adapter, error_codes } =
+        target;
+    let mut http_req = http.post(url);
+    if !api_key.is_empty() {
+        http_req = http_req.bearer_auth(api_key);
+    }
+    if let Some(adapter) = adapter {
+        let mut body = body.clone();
+        let mut headers = reqwest::header::HeaderMap::new();
+        adapter(&mut body, &mut headers)?;
+        http_req = http_req.headers(headers).json(&body);
+    } else {
+        http_req = http_req.json(body);
+    }
 
     if let Some(org_id) = organization_id {
         http_req = http_req.header("OpenAI-Organization", org_id);
@@ -549,7 +656,7 @@ async fn send_request(
         AdkError::new(
             ErrorComponent::Model,
             ErrorCategory::Unavailable,
-            "model.openai_compat.request",
+            error_codes.request,
             format!("{provider_name} request error: {e}"),
         )
         .with_provider(provider_name)
@@ -567,7 +674,7 @@ async fn send_request(
         let error = AdkError::new(
             ErrorComponent::Model,
             crate::retry::category_for_status_code(status_code),
-            "model.openai_compat.api_error",
+            error_codes.for_status(status_code),
             format!("{provider_name} API error (HTTP {status}): {body}"),
         )
         .with_upstream_status(status_code)
@@ -608,12 +715,13 @@ fn append_tool_call_arguments(accumulator: &mut String, arguments: &serde_json::
 
 fn parse_tool_call_arguments(
     provider_name: &str,
+    error_codes: ErrorCodes,
     tool_name: &str,
     arguments: &str,
 ) -> Result<serde_json::Value, AdkError> {
     crate::tool_args::parse_streamed_tool_arguments(
         provider_name,
-        "model.openai_compat.invalid_tool_arguments",
+        error_codes.invalid_tool_arguments,
         tool_name,
         arguments,
     )
@@ -648,12 +756,21 @@ impl Llm for OpenAICompatible {
         let model = self.model.clone();
         let provider_name = self.provider_name.clone();
         let http = self.http.clone();
-        let api_key = self.api_key.clone();
-        let base_url = self.base_url.clone();
         let retry_config = self.retry_config.clone();
         let reasoning_effort = self.reasoning_effort;
         let reasoning_replay_field = self.reasoning_replay_field;
-        let organization_id = self.organization_id.clone();
+        let error_codes = self.error_codes;
+        let target = RequestTarget {
+            url: self
+                .completion_url
+                .clone()
+                .unwrap_or_else(|| format!("{}/chat/completions", self.base_url)),
+            api_key: self.api_key.clone(),
+            organization_id: self.organization_id.clone(),
+            provider_name: provider_name.clone(),
+            adapter: self.request_adapter.clone(),
+            error_codes,
+        };
         // Text-encoded tool calls are honoured only for tools this request declared.
         let declared_tools: std::collections::HashSet<String> =
             request.tools.keys().cloned().collect();
@@ -667,7 +784,10 @@ impl Llm for OpenAICompatible {
             &model,
             &request,
             &reasoning_effort,
-            self.parallel_tool_calls,
+            ChatCapabilities {
+                parallel_tool_calls: self.parallel_tool_calls,
+                native_pdf: matches!(provider_name.as_str(), "openai" | "azure-openai"),
+            },
             reasoning_replay_field,
             adapter,
             &SCHEMA_CACHE,
@@ -688,25 +808,18 @@ impl Llm for OpenAICompatible {
                     );
                 }
 
-                let url = format!("{base_url}/chat/completions");
-
                 // Retry covers only the initial HTTP request, not stream consumption.
                 let response = execute_with_retry(&retry_config, is_retryable_model_error, || {
                     let http = http.clone();
-                    let url = url.clone();
-                    let api_key = api_key.clone();
-                    let organization_id = organization_id.clone();
+                    let target = target.clone();
                     let body = body.clone();
-                    let provider_name = provider_name.clone();
-                    async move {
-                        send_request(&http, &url, &api_key, &organization_id, &body, &provider_name).await
-                    }
+                    async move { send_request(&http, &target, &body).await }
                 })
                 .await?;
 
                 // Process SSE byte stream (following DeepSeekClient pattern).
                 let mut byte_stream = response.bytes_stream();
-                let mut buffer = String::new();
+                let mut buffer = Vec::new();
                 let mut tool_call_accumulators: HashMap<u32, (String, String, String)> =
                     HashMap::new();
                 let mut text_tool_buffer =
@@ -718,12 +831,10 @@ impl Llm for OpenAICompatible {
                         AdkError::model(format!("stream read error: {e}"))
                     })?;
 
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    buffer.extend_from_slice(&chunk);
 
                     // Process complete SSE lines.
-                    while let Some(line_end) = buffer.find('\n') {
-                        let line = buffer[..line_end].trim().to_string();
-                        buffer = buffer[line_end + 1..].to_string();
+                    while let Some(line) = take_line(&mut buffer)? {
 
                         if line.is_empty() {
                             continue;
@@ -816,6 +927,7 @@ impl Llm for OpenAICompatible {
                                         .map(|(_, (id, name, args_str))| {
                                             let args = parse_tool_call_arguments(
                                                 &provider_name,
+                                                error_codes,
                                                 &name,
                                                 &args_str,
                                             )?;
@@ -985,21 +1097,16 @@ impl Llm for OpenAICompatible {
                     let model = model.clone();
                     let provider_name = provider_name.clone();
                     let http = http.clone();
-                    let api_key = api_key.clone();
-                    let base_url = base_url.clone();
+                    let target = target.clone();
                     let body = request_body.clone();
-                    let organization_id = organization_id.clone();
                     async move {
-                        let url = format!("{base_url}/chat/completions");
-                        let http_resp =
-                            send_request(&http, &url, &api_key, &organization_id, &body, &provider_name)
-                                .await?;
+                        let http_resp = send_request(&http, &target, &body).await?;
 
                         let raw_json: serde_json::Value = http_resp.json().await.map_err(|e| {
                             AdkError::new(
                                 ErrorComponent::Model,
                                 ErrorCategory::Internal,
-                                "model.openai_compat.parse",
+                                error_codes.parse,
                                 format!("{provider_name} response parse error: {e}"),
                             )
                             .with_provider(&provider_name)
@@ -1023,7 +1130,7 @@ impl Llm for OpenAICompatible {
                     AdkError::new(
                         ErrorComponent::Model,
                         ErrorCategory::Internal,
-                        "model.openai_compat.invalid_tool_arguments",
+                        error_codes.invalid_tool_arguments,
                         format!("{provider_name} returned {error}"),
                     )
                     .with_provider(&provider_name)
@@ -1041,6 +1148,52 @@ mod tests {
     use super::*;
     use adk_core::{GenericSchemaAdapter, LlmRequest, SchemaCache};
     use std::sync::Arc;
+
+    mod sse_lines {
+        use super::take_line;
+
+        #[test]
+        fn preserves_every_split() {
+            let expected = r#"data: {"text":"é中文🙂�","arguments":"{\"path\":\"资料.txt\",\"text\":\"改动🙂\"}"}"#;
+            let framed = format!("{expected}\r\n");
+            for split in 0..framed.len() {
+                let mut buffer = framed.as_bytes()[..split].to_vec();
+                assert_eq!(take_line(&mut buffer).unwrap(), None);
+                buffer.extend_from_slice(&framed.as_bytes()[split..]);
+                assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some(expected));
+                assert!(buffer.is_empty());
+            }
+        }
+
+        #[test]
+        fn accepts_bytewise_delivery() {
+            let expected = "data: 中文🙂é";
+            let mut buffer = Vec::new();
+            for byte in expected.as_bytes() {
+                buffer.push(*byte);
+                assert_eq!(take_line(&mut buffer).unwrap(), None);
+            }
+            buffer.push(b'\n');
+            assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some(expected));
+            assert!(buffer.is_empty());
+        }
+
+        #[test]
+        fn leaves_following_lines() {
+            let mut buffer = "data: 第一行\r\n\r\ndata: 第二行🙂\n".as_bytes().to_vec();
+            assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some("data: 第一行"));
+            assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some(""));
+            assert_eq!(take_line(&mut buffer).unwrap().as_deref(), Some("data: 第二行🙂"));
+            assert_eq!(take_line(&mut buffer).unwrap(), None);
+        }
+
+        #[test]
+        fn rejects_invalid_utf8() {
+            for invalid in [b"data: \xc3(\n".as_slice(), b"data: \xf0\x9f\n".as_slice()] {
+                assert!(take_line(&mut invalid.to_vec()).is_err());
+            }
+        }
+    }
 
     #[test]
     fn test_parallel_tool_calls_config() {
@@ -1065,36 +1218,60 @@ mod tests {
 
     #[test]
     fn streamed_tool_arguments_require_valid_json() {
-        let parsed =
-            parse_tool_call_arguments("compatible-provider", "bash", r#"{"command":"pwd"}"#)
-                .expect("valid arguments should parse");
+        let parsed = parse_tool_call_arguments(
+            "compatible-provider",
+            ErrorCodes::COMPATIBLE,
+            "bash",
+            r#"{"command":"pwd"}"#,
+        )
+        .expect("valid arguments should parse");
         assert_eq!(parsed["command"], "pwd");
 
         assert_eq!(
-            parse_tool_call_arguments("compatible-provider", "no_args", "")
+            parse_tool_call_arguments("compatible-provider", ErrorCodes::COMPATIBLE, "no_args", "")
                 .expect("an empty compatible payload should normalize"),
             serde_json::json!({})
         );
         assert_eq!(
-            parse_tool_call_arguments("compatible-provider", "no_args", "   ")
-                .expect("a whitespace-only compatible payload should normalize"),
+            parse_tool_call_arguments(
+                "compatible-provider",
+                ErrorCodes::COMPATIBLE,
+                "no_args",
+                "   "
+            )
+            .expect("a whitespace-only compatible payload should normalize"),
             serde_json::json!({})
         );
         assert_eq!(
-            parse_tool_call_arguments("compatible-provider", "no_args", "[]")
-                .expect("an empty array compatible payload should normalize"),
+            parse_tool_call_arguments(
+                "compatible-provider",
+                ErrorCodes::COMPATIBLE,
+                "no_args",
+                "[]"
+            )
+            .expect("an empty array compatible payload should normalize"),
             serde_json::json!({})
         );
 
-        let error = parse_tool_call_arguments("compatible-provider", "bash", r#"{"command":"#)
-            .expect_err("truncated arguments must remain invalid");
+        let error = parse_tool_call_arguments(
+            "compatible-provider",
+            ErrorCodes::COMPATIBLE,
+            "bash",
+            r#"{"command":"#,
+        )
+        .expect_err("truncated arguments must remain invalid");
         assert_eq!(error.component, ErrorComponent::Model);
         assert_eq!(error.category, ErrorCategory::Internal);
         assert_eq!(error.code, "model.openai_compat.invalid_tool_arguments");
         assert_eq!(error.details.provider.as_deref(), Some("compatible-provider"));
 
-        let error = parse_tool_call_arguments("compatible-provider", "bash", r#"["pwd"]"#)
-            .expect_err("non-empty array arguments must remain invalid");
+        let error = parse_tool_call_arguments(
+            "compatible-provider",
+            ErrorCodes::COMPATIBLE,
+            "bash",
+            r#"["pwd"]"#,
+        )
+        .expect_err("non-empty array arguments must remain invalid");
         assert_eq!(error.code, "model.openai_compat.invalid_tool_arguments");
     }
 
@@ -1104,8 +1281,13 @@ mod tests {
         append_tool_call_arguments(&mut arguments, &serde_json::json!({"command": "pwd"}));
 
         assert_eq!(
-            parse_tool_call_arguments("compatible-provider", "bash", &arguments)
-                .expect("a structured object should normalize"),
+            parse_tool_call_arguments(
+                "compatible-provider",
+                ErrorCodes::COMPATIBLE,
+                "bash",
+                &arguments
+            )
+            .expect("a structured object should normalize"),
             serde_json::json!({"command": "pwd"})
         );
     }
@@ -1116,8 +1298,13 @@ mod tests {
             let mut arguments = String::new();
             append_tool_call_arguments(&mut arguments, &placeholder);
             assert_eq!(
-                parse_tool_call_arguments("compatible-provider", "no_args", &arguments)
-                    .expect("an empty snapshot should remain a no-argument call"),
+                parse_tool_call_arguments(
+                    "compatible-provider",
+                    ErrorCodes::COMPATIBLE,
+                    "no_args",
+                    &arguments
+                )
+                .expect("an empty snapshot should remain a no-argument call"),
                 serde_json::json!({})
             );
 
@@ -1125,8 +1312,13 @@ mod tests {
             append_tool_call_arguments(&mut arguments, &serde_json::json!(r#": "pwd"}"#));
 
             assert_eq!(
-                parse_tool_call_arguments("compatible-provider", "bash", &arguments)
-                    .expect("empty snapshots must not prefix string fragments"),
+                parse_tool_call_arguments(
+                    "compatible-provider",
+                    ErrorCodes::COMPATIBLE,
+                    "bash",
+                    &arguments
+                )
+                .expect("empty snapshots must not prefix string fragments"),
                 serde_json::json!({"command": "pwd"})
             );
         }
@@ -1160,7 +1352,7 @@ mod tests {
                 crate::catalog::OPENAI_DEFAULT,
                 &request,
                 &configured_effort,
-                true,
+                ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
                 None,
                 &adapter,
                 &cache,
@@ -1187,7 +1379,7 @@ mod tests {
             crate::catalog::OPENAI_DEFAULT,
             &request,
             &None,
-            true,
+            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
             None,
             &adapter,
             &cache,
@@ -1213,7 +1405,7 @@ mod tests {
             crate::catalog::OPENAI_DEFAULT,
             &request,
             &Some(OpenAIReasoningEffort::Max),
-            true,
+            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
             None,
             &adapter,
             &cache,
@@ -1234,7 +1426,7 @@ mod tests {
             "gemini-3.7-flash",
             &request,
             &None,
-            true,
+            ChatCapabilities { parallel_tool_calls: true, native_pdf: false },
             None,
             &GenericSchemaAdapter,
             &cache,

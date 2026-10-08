@@ -63,6 +63,11 @@ Unlike regular function tools, `GoogleSearchTool` operates differently:
 2. **Automatic invocation**: The model decides when to search based on the query
 3. **Integrated results**: Search results are incorporated directly into the model's response
 
+> **Note:** The answer text contains only what the model wrote. The search queries,
+> sources and supports are in the response's `provider_metadata` (`webSearchQueries`,
+> `groundingChunks`, `groundingSupports`); display them as your application's grounding
+> requirements specify.
+
 The tool implementation returns an error if called directly because the actual search happens within the Gemini API:
 
 ```rust

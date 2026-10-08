@@ -212,6 +212,30 @@ let client = OpenAIResponsesClient::new(config)?
 ```
 
 Retries are automatic for rate limits (429), server errors (500/502/503/504), and network failures.
+`RetryConfig` is the only retry policy: the client does not add async-openai's own retry
+layer, so `RetryConfig::disabled()` sends each request once.
+
+### Request Adapters
+
+`with_request_adapter` edits the JSON body and headers of every generation request before
+it is sent, including each retry attempt. The adapter must not perform I/O or change the
+response mode:
+
+```rust
+use std::sync::Arc;
+
+use adk_model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig, RequestAdapter};
+
+let adapter: RequestAdapter = Arc::new(|body, headers| {
+    body["metadata"] = serde_json::json!({"application": "support-bot"});
+    headers.insert("x-request-source", "support-bot".parse().expect("valid header"));
+    Ok(())
+});
+let client = OpenAIResponsesClient::new(OpenAIResponsesConfig::new(api_key, "gpt-5"))?
+    .with_request_adapter(adapter);
+```
+
+The client does not follow HTTP redirects on generation requests.
 
 ---
 
@@ -358,6 +382,11 @@ The Responses API client streams text and reasoning deltas in real-time:
 - The final event has `turn_complete: true` with usage metadata and finish reason
 
 This means you see text appearing token-by-token while the model generates, and function calls arrive as complete objects ready for execution.
+
+When the model emits commentary (phase-tagged progress messages), the deltas arrive as
+`Part::ServerToolCall` messages with `"phase": "commentary"`, and the final response sets
+`provider_metadata.content_complete` to `true`: it carries the complete output, so replace
+the earlier deltas with it.
 
 ---
 

@@ -85,6 +85,29 @@ else is rejected as a validation error rather than silently sending the key in
 cleartext. The same rule applies to `AnthropicConfig::with_base_url`, which is
 validated when `AnthropicClient::new` builds the underlying client.
 
+### Explicit key and endpoint
+
+`Anthropic::new_with_base_url` builds a client from a key and an endpoint without
+reading `ANTHROPIC_API_KEY` or `ANTHROPIC_BASE_URL`. A `file://` key is read from
+that file, as with `Anthropic::new`. `AnthropicClient::new` uses this constructor
+whenever `AnthropicConfig::with_base_url` is set:
+
+```rust
+use adk_anthropic::Anthropic;
+
+let client = Anthropic::new_with_base_url(api_key, "https://gateway.internal/anthropic")?;
+```
+
+## Retries and Streaming
+
+| Behaviour | Rule |
+|-----------|------|
+| Retries | `AnthropicClient` sets the SDK's own retries to zero; `RetryConfig` on the `adk-model` client is the only retry policy |
+| Redirects | The client returns a 3xx response as an error instead of following it |
+| Stream end | A stream must end with `message_stop` and a stop reason; otherwise it fails |
+| Final snapshot | The last streamed response carries the complete message with `provider_metadata.content_complete` set to `true`; replace the earlier text and thinking deltas with it |
+| Server tools and citations | Web search calls, results and citations are kept with the assistant turn and replayed natively on the next request; if the turn's text was edited afterwards, the turn is converted from its ADK parts instead |
+
 ## Key Features
 
 ### Adaptive Thinking

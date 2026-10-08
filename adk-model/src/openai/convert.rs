@@ -7,18 +7,20 @@ use adk_core::{
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestMessageContentPartAudio, ChatCompletionRequestMessageContentPartImage,
-    ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessageArgs,
-    ChatCompletionRequestToolMessageArgs, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionTool, ChatCompletionTools, CreateChatCompletionResponse,
-    FinishReason as OaiFinishReason, FunctionCall, FunctionObject, ImageDetail, ImageUrl,
-    InputAudio, InputAudioFormat,
+    ChatCompletionRequestMessageContentPartAudio, ChatCompletionRequestMessageContentPartFile,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessageArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestUserMessageContent,
+    ChatCompletionRequestUserMessageContentPart, ChatCompletionTool, ChatCompletionTools,
+    CreateChatCompletionResponse, FinishReason as OaiFinishReason, FunctionCall, FunctionObject,
+    ImageDetail, ImageUrl, InputAudio, InputAudioFormat,
 };
 use std::collections::{HashMap, HashSet};
 
 /// Convert ADK Content to OpenAI ChatCompletionRequestMessage.
-pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
+///
+/// `native_pdf` sends inline PDFs as `file` parts; without it they become text.
+pub fn content_to_message(content: &Content, native_pdf: bool) -> ChatCompletionRequestMessage {
     match content.role.as_str() {
         "user" => {
             let has_attachments = content
@@ -35,9 +37,9 @@ pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
                                 ChatCompletionRequestMessageContentPartText { text: text.clone() },
                             ))
                         }
-                        Part::InlineData { mime_type, data, .. } => {
-                            Some(inline_data_part_to_openai(mime_type, data))
-                        }
+                        Part::InlineData { mime_type, data, uri, .. } => Some(
+                            inline_data_part_to_openai(mime_type, data, uri.as_deref(), native_pdf),
+                        ),
                         Part::FileData { mime_type, file_uri, .. } => {
                             if mime_type.starts_with("image/") {
                                 Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
@@ -151,6 +153,8 @@ pub fn content_to_message(content: &Content) -> ChatCompletionRequestMessage {
 fn inline_data_part_to_openai(
     mime_type: &str,
     data: &[u8],
+    uri: Option<&str>,
+    native_pdf: bool,
 ) -> ChatCompletionRequestUserMessageContentPart {
     if mime_type.starts_with("image/") {
         let data_uri = format!("data:{mime_type};base64,{}", attachment::encode_base64(data));
@@ -161,6 +165,24 @@ fn inline_data_part_to_openai(
                 image_url: ImageUrl { url: data_uri, detail: Some(ImageDetail::Auto) },
             },
         );
+    }
+
+    if native_pdf && mime_type == "application/pdf" {
+        // async-openai 0.41.1 exposes this wire type through Deserialize only.
+        let file = serde_json::from_value(serde_json::json!({
+            "file_data": format!("data:{mime_type};base64,{}", attachment::encode_base64(data)),
+            "filename": attachment::pdf_filename(uri),
+        }));
+        match file {
+            Ok(file) => {
+                return ChatCompletionRequestUserMessageContentPart::File(
+                    ChatCompletionRequestMessageContentPartFile { file },
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "inline pdf could not be encoded as a file part; sending it as text");
+            }
+        }
     }
 
     if let Some(audio_format) = input_audio_format(mime_type) {
@@ -545,7 +567,7 @@ mod tests {
             ],
         };
 
-        let message = serde_json::to_value(content_to_message(&content)).unwrap();
+        let message = serde_json::to_value(content_to_message(&content, false)).unwrap();
         assert_eq!(message["content"], "visible answer");
         assert!(!message.to_string().contains("private reasoning"));
     }
@@ -559,7 +581,7 @@ mod tests {
                 Part::inline_data("image/png", vec![0x89, 0x50, 0x4E, 0x47]), // PNG magic bytes
             ],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         // Should produce a user message with Array content (not Text)
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
@@ -598,7 +620,7 @@ mod tests {
                 Part::inline_data("image/png", vec![0x89, 0x50, 0x4E, 0x47]),
             ],
         };
-        let message = content_to_message(&content);
+        let message = content_to_message(&content, false);
 
         let ChatCompletionRequestMessage::User(user_message) = message else {
             panic!("Expected User message");
@@ -629,7 +651,7 @@ mod tests {
                 Part::inline_data("image/png", vec![0x89, 0x50]),
             ],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -651,7 +673,7 @@ mod tests {
                 Part::inline_data("audio/wav", vec![0x52, 0x49, 0x46, 0x46]),
             ],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -669,28 +691,55 @@ mod tests {
     }
 
     #[test]
-    fn test_user_message_with_pdf_inline_data_falls_back_to_text_part() {
+    fn pdf_inline_data_uses_file_part_for_openai() {
+        let content = Content {
+            role: "user".to_string(),
+            parts: vec![
+                Part::inline_data("application/pdf", b"%PDF".to_vec()),
+                Part::InlineData {
+                    mime_type: "application/pdf".to_string(),
+                    data: b"%PDF".to_vec(),
+                    uri: Some("https://example.com/files/q3-report.pdf?sig=abc".to_string()),
+                    annotations: None,
+                },
+            ],
+        };
+        let message = serde_json::to_value(content_to_message(&content, true)).unwrap();
+        assert_eq!(
+            message["content"],
+            serde_json::json!([
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "document.pdf",
+                        "file_data": "data:application/pdf;base64,JVBERg=="
+                    }
+                },
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "q3-report.pdf",
+                        "file_data": "data:application/pdf;base64,JVBERg=="
+                    }
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn pdf_inline_data_falls_back_to_text_for_other_compatible_providers() {
         let content = Content {
             role: "user".to_string(),
             parts: vec![Part::inline_data("application/pdf", b"%PDF".to_vec())],
         };
-        let msg = content_to_message(&content);
-
-        if let ChatCompletionRequestMessage::User(user_msg) = &msg {
-            if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
-                assert_eq!(parts.len(), 1);
-                if let ChatCompletionRequestUserMessageContentPart::Text(text_part) = &parts[0] {
-                    assert!(text_part.text.contains("application/pdf"));
-                    assert!(text_part.text.contains("encoding=\"base64\""));
-                } else {
-                    panic!("Expected fallback text part for pdf inline data");
-                }
-            } else {
-                panic!("Expected Array content");
-            }
-        } else {
-            panic!("Expected User message");
-        }
+        let message = serde_json::to_value(content_to_message(&content, false)).unwrap();
+        assert_eq!(
+            message["content"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "<attachment mime_type=\"application/pdf\" encoding=\"base64\">JVBERg==</attachment>"
+            }])
+        );
     }
 
     #[test]
@@ -703,7 +752,7 @@ mod tests {
                 annotations: None,
             }],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -735,7 +784,7 @@ mod tests {
                 },
             ],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             if let ChatCompletionRequestUserMessageContent::Array(parts) = &user_msg.content {
@@ -761,7 +810,7 @@ mod tests {
             role: "user".to_string(),
             parts: vec![Part::Text { text: "Hello".to_string() }],
         };
-        let msg = content_to_message(&content);
+        let msg = content_to_message(&content, false);
 
         if let ChatCompletionRequestMessage::User(user_msg) = &msg {
             assert!(matches!(
@@ -1215,7 +1264,7 @@ mod tests {
                 role: "user".to_string(),
                 parts: vec![Part::Text { text: "describe".to_string() }, part],
             };
-            let msg = content_to_message(&content);
+            let msg = content_to_message(&content, false);
             let json = serde_json::to_string(&msg).expect("message serializes");
 
             assert!(

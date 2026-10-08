@@ -956,6 +956,7 @@ fn build_vertex_prediction_service(
                 .block_on(
                     PredictionService::builder()
                         .with_endpoint(endpoint)
+                        .with_retry_policy(google_cloud_gax::retry_policy::NeverRetry)
                         .with_credentials(credentials)
                         .build(),
                 )
@@ -1000,6 +1001,8 @@ pub struct GeminiBuilder {
     base_url: Url,
     #[cfg(feature = "vertex")]
     google_cloud: Option<GoogleCloudConfig>,
+    #[cfg(feature = "vertex")]
+    google_cloud_endpoint: Option<String>,
     api_key: Option<String>,
     #[cfg(feature = "vertex")]
     google_cloud_auth: Option<GoogleCloudAuth>,
@@ -1014,6 +1017,8 @@ impl GeminiBuilder {
             base_url: DEFAULT_BASE_URL.clone(),
             #[cfg(feature = "vertex")]
             google_cloud: None,
+            #[cfg(feature = "vertex")]
+            google_cloud_endpoint: None,
             api_key: Some(key.into()),
             #[cfg(feature = "vertex")]
             google_cloud_auth: None,
@@ -1067,6 +1072,23 @@ impl GeminiBuilder {
         self
     }
 
+    /// Override the Vertex API endpoint without switching to the Studio backend.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_gemini::GeminiBuilder;
+    ///
+    /// let builder = GeminiBuilder::new("api-key")
+    ///     .with_google_cloud("my-project", "us-central1")
+    ///     .with_google_cloud_endpoint("https://us-central1-aiplatform.googleapis.com");
+    /// ```
+    #[cfg(feature = "vertex")]
+    pub fn with_google_cloud_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.google_cloud_endpoint = Some(endpoint.into());
+        self
+    }
+
     /// Use Application Default Credentials (ADC) for Vertex AI authentication.
     #[cfg(feature = "vertex")]
     pub fn with_google_cloud_adc(mut self) -> Result<Self, Error> {
@@ -1109,7 +1131,7 @@ impl GeminiBuilder {
                     },
                 };
                 let credentials = google_cloud_auth.credentials()?;
-                let endpoint = config.endpoint();
+                let endpoint = self.google_cloud_endpoint.unwrap_or_else(|| config.endpoint());
                 let prediction =
                     build_vertex_prediction_service(endpoint.clone(), credentials.clone())?;
 
