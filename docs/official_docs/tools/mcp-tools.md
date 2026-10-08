@@ -281,6 +281,45 @@ For task mode, ADK-Rust:
 does not yet have a protocol-neutral resume channel for supplying that missing
 input. Design that interaction explicitly in the owning workflow.
 
+### Dropped calls and cleanup
+
+A remote task outlives the future that started it. When a tool-call future is
+dropped — an agent turn is cancelled, a timeout fires, or the caller stops
+polling — nothing sends `tasks/cancel`, and the task keeps running on the server.
+The toolset tracks every task it has not seen finish, including tasks returned
+while task support is disabled; those are cancelled at once.
+
+`McpToolset::cancel_pending_tasks` cleans up the tracked set:
+
+| Server reports | Action |
+|---|---|
+| Terminal status | Released without a cancel request |
+| Unknown task (`-32602`, for example after a TTL expiry or a reconnect) | Released without a cancel request |
+| Still running | `tasks/cancel`, then released once a second `tasks/get` reports it terminal or unknown |
+
+A task the server has not confirmed stays tracked, and the call returns an error
+naming it, so a later call re-checks it. In-flight calls are tracked too, so
+cleanup also cancels them. Cancellation is cooperative on the server, so bound
+the call with your shutdown deadline:
+
+```rust
+use adk_tool::mcp::McpToolset;
+use std::time::Duration;
+
+async fn shutdown(toolset: &McpToolset) {
+    let cleanup = toolset.cancel_pending_tasks();
+    match tokio::time::timeout(Duration::from_secs(5), cleanup).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "remote MCP tasks may still run"),
+        Err(_) => tracing::warn!("MCP task cleanup exceeded the shutdown deadline"),
+    }
+    toolset.cancellation_token().await.cancel();
+}
+```
+
+`McpServerManager` runs this cleanup for each server it stops, within the
+configured grace period and before it cancels the session.
+
 ## Capability map
 
 | MCP capability | ADK-Rust 2 surface | Notes |
