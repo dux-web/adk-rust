@@ -138,6 +138,12 @@ fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
     }
 
     let message = format_error_chain(e);
+    // Vertex no longer replays a failed request over REST, so a transport failure
+    // is left to the configured retry policy instead.
+    #[cfg(feature = "gemini-vertex")]
+    let transport_failure = adk_gemini::backend::vertex::VertexBackend::is_transport_error(&message);
+    #[cfg(not(feature = "gemini-vertex"))]
+    let transport_failure = false;
 
     // Extract status code from BadResponse variant via Display output
     // BadResponse format: "bad response from server; code {code}; description: ..."
@@ -163,6 +169,8 @@ fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
         (ErrorCategory::NotFound, "model.gemini.not_found", Some(404))
     } else if message.contains("invalid generation config") {
         (ErrorCategory::InvalidInput, "model.gemini.invalid_config", None)
+    } else if transport_failure {
+        (ErrorCategory::Unavailable, "model.gemini.unavailable", None)
     } else {
         (ErrorCategory::Internal, "model.gemini.internal", None)
     };
@@ -2696,5 +2704,29 @@ mod vertex_rag_tests {
         model
             .validate_request_contract(&LlmRequest::new("gemini-3.7-flash", Vec::new()))
             .expect("no store configured, nothing to reject");
+    }
+}
+
+#[cfg(all(test, feature = "gemini-vertex"))]
+mod vertex_transport_tests {
+    use super::*;
+
+    #[test]
+    fn vertex_transport_failures_are_retryable() {
+        let error = adk_gemini::ClientError::Io {
+            source: std::io::Error::other(
+                "the transport reports an error: client error (SendRequest): http2 error",
+            ),
+        };
+        let mapped = gemini_error_to_adk(&error);
+        assert_eq!(
+            (mapped.category, mapped.code, mapped.is_retryable()),
+            (ErrorCategory::Unavailable, "model.gemini.unavailable", true)
+        );
+
+        let denied = adk_gemini::ClientError::Io {
+            source: std::io::Error::other("permission denied"),
+        };
+        assert_eq!(gemini_error_to_adk(&denied).category, ErrorCategory::Internal);
     }
 }
