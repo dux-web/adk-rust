@@ -7,13 +7,18 @@
 ///
 /// # Example
 ///
-/// ```ignore
-/// let adapter: adk_model::openai::RequestAdapter = std::sync::Arc::new(|body, headers| {
+/// ```
+/// use adk_model::openai::{OpenAICompatible, OpenAICompatibleConfig, RequestAdapter};
+/// use std::sync::Arc;
+///
+/// let adapter: RequestAdapter = Arc::new(|body, headers| {
 ///     body["metadata"] = serde_json::json!({"application": "example"});
-///     headers.insert("x-request-source", "example".parse().unwrap());
+///     headers.insert("x-request-source", "example".parse().expect("valid header"));
 ///     Ok(())
 /// });
-/// let client = client.with_request_adapter(adapter);
+/// let client = OpenAICompatible::new(OpenAICompatibleConfig::new("sk-key", "gpt-5-mini"))?
+///     .with_request_adapter(adapter);
+/// # Ok::<(), adk_core::AdkError>(())
 /// ```
 pub type RequestAdapter = std::sync::Arc<
     dyn Fn(

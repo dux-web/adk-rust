@@ -72,6 +72,20 @@ impl BedrockClient {
     }
 
     /// Use an explicit Bedrock bearer key without reading the process credential chain.
+    ///
+    /// # Errors
+    ///
+    /// This constructor does not fail today; the `Result` leaves room for key validation.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::bedrock::{BedrockClient, BedrockConfig};
+    ///
+    /// let config = BedrockConfig::new("us-east-1", "anthropic.claude-sonnet-4-6-v1:0");
+    /// let client = BedrockClient::new_with_api_key(config, "bedrock-api-key")?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
     pub fn new_with_api_key(config: BedrockConfig, api_key: &str) -> Result<Self, AdkError> {
         let mut sdk = aws_sdk_bedrockruntime::Config::builder()
             .behavior_version_latest()
@@ -84,6 +98,22 @@ impl BedrockClient {
     }
 
     /// Supply a configured SDK client, preserving its identity and transport ownership.
+    ///
+    /// ADK retries are disabled because the supplied client carries its own retry
+    /// configuration.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use adk_model::bedrock::{BedrockClient, BedrockConfig};
+    ///
+    /// # async fn example() {
+    /// let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    /// let sdk = aws_sdk_bedrockruntime::Client::new(&sdk_config);
+    /// let config = BedrockConfig::new("us-east-1", "anthropic.claude-sonnet-4-6-v1:0");
+    /// let client = BedrockClient::from_client(config, sdk);
+    /// # }
+    /// ```
     pub fn from_client(config: BedrockConfig, client: aws_sdk_bedrockruntime::Client) -> Self {
         Self {
             client,

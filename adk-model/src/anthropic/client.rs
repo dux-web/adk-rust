@@ -620,9 +620,6 @@ impl Llm for AnthropicClient {
                 // the actual `request-id` header value.
                 Span::current().record("anthropic.request_id", message.id.as_str());
 
-                // Requirement 6.3: Extract cache usage tokens into provider metadata
-                let (_response, _cache_metadata) = convert::from_anthropic_message(&message);
-
                 yield convert::from_anthropic_message(&message).0;
             }
         };

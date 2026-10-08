@@ -667,6 +667,20 @@ See [Ollama library](https://ollama.com/library) for all available models.
 - **Generation Config** - Temperature, top_p, top_k, max_tokens
 - **Token Usage Telemetry** - Automatic `gen_ai.usage.*` span recording for all providers via `adk-telemetry`
 
+## Native Response and Request Fidelity
+
+Provider adapters retain native search/reasoning history, citations, usage, and
+multimodal tool results without adding application-specific display text.
+Responses commentary is available as phase-tagged native messages; applications
+choose whether to display it. Consumers of a complete streaming snapshot replace
+prior deltas when `provider_metadata.content_complete` is true.
+
+OpenAI-compatible and Responses clients accept `with_request_adapter` for
+per-attempt JSON/header customization. Retry limits remain controlled by
+`RetryConfig`, including disabled retries. Explicit Anthropic/Gemini base URLs,
+Vertex endpoints, and a supplied Bedrock client avoid ambient configuration when
+the application owns authentication.
+
 ## Environment Variables
 
 ```bash
@@ -758,17 +772,3 @@ Apache-2.0
 ## Part of ADK-Rust
 
 This crate is part of the [ADK-Rust](https://adk-rust.com) framework for building AI agents in Rust.
-
-### Native response and request fidelity
-
-Provider adapters retain native search/reasoning history, citations, usage, and
-multimodal tool results without adding application-specific display text.
-Responses commentary is available as phase-tagged native messages; applications
-choose whether to display it. Consumers of a complete streaming snapshot replace
-prior deltas when `provider_metadata.content_complete` is true.
-
-OpenAI-compatible and Responses clients accept `with_request_adapter` for
-per-attempt JSON/header customization. Retry limits remain controlled by
-`RetryConfig`, including disabled retries. Explicit Anthropic/Gemini base URLs,
-Vertex endpoints, and a supplied Bedrock client avoid ambient configuration when
-the application owns authentication.

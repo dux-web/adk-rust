@@ -35,8 +35,7 @@ async fn request_customization_preserves_disabled_retries() {
                 )
                 .unwrap()
                 .with_retry_config(RetryConfig::disabled())
-                .with_request_adapter(adapter)
-                .unwrap(),
+                .with_request_adapter(adapter),
             )
         } else {
             Box::new(

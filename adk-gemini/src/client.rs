@@ -1073,6 +1073,16 @@ impl GeminiBuilder {
     }
 
     /// Override the Vertex API endpoint without switching to the Studio backend.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_gemini::GeminiBuilder;
+    ///
+    /// let builder = GeminiBuilder::new("api-key")
+    ///     .with_google_cloud("my-project", "us-central1")
+    ///     .with_google_cloud_endpoint("https://us-central1-aiplatform.googleapis.com");
+    /// ```
     #[cfg(feature = "vertex")]
     pub fn with_google_cloud_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.google_cloud_endpoint = Some(endpoint.into());

@@ -2,6 +2,7 @@
 
 use crate::openai::{OpenAIReasoningEffort, convert};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
+use crate::sse::take_line;
 use adk_core::{
     AdkError, Content, ErrorCategory, ErrorComponent, FinishReason, GenericSchemaAdapter, Llm,
     LlmRequest, LlmResponse, LlmResponseStream, Part, SchemaAdapter, SchemaCache, UsageMetadata,
@@ -371,6 +372,9 @@ impl OpenAICompatible {
     }
 
     /// Customize generation request fields and headers before each HTTP attempt.
+    ///
+    /// The adapter runs under this client's [`RetryConfig`]; see
+    /// [`RequestAdapter`](crate::openai::RequestAdapter) for an example.
     #[must_use]
     pub fn with_request_adapter(mut self, adapter: crate::openai::RequestAdapter) -> Self {
         self.request_adapter = Some(adapter);
@@ -1138,8 +1142,6 @@ impl Llm for OpenAICompatible {
         }
     }
 }
-
-use crate::sse::take_line;
 
 #[cfg(test)]
 mod tests {

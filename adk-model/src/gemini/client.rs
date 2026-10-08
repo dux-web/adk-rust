@@ -377,7 +377,26 @@ impl GeminiModel {
     }
 
     /// Create an API-key model using an explicit REST base URL.
-    /// The base URL includes the API version and ends with a slash.
+    ///
+    /// The base URL includes the API version and ends with a slash. No environment
+    /// variable is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `base_url` is not a valid URL or the client cannot be built.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::GeminiModel;
+    ///
+    /// let model = GeminiModel::new_with_base_url(
+    ///     "api-key",
+    ///     "gemini-3.7-flash",
+    ///     "https://gateway.example.com/v1beta/",
+    /// )?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
     pub fn new_with_base_url(
         api_key: impl Into<String>,
         model: impl Into<String>,
@@ -418,6 +437,28 @@ impl GeminiModel {
     }
 
     /// Use an explicit Vertex endpoint and either a supplied key or execution-host ADC.
+    ///
+    /// Requires `gemini-vertex` feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Application Default Credentials are requested
+    /// (`api_key` is `None`) but unavailable, or when the client cannot be built.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use adk_model::GeminiModel;
+    ///
+    /// let model = GeminiModel::new_google_cloud_endpoint(
+    ///     None,
+    ///     "my-project",
+    ///     "us-central1",
+    ///     "gemini-3.7-flash",
+    ///     "https://us-central1-aiplatform.googleapis.com",
+    /// )?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
     #[cfg(feature = "gemini-vertex")]
     pub fn new_google_cloud_endpoint(
         api_key: Option<&str>,

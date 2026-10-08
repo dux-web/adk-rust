@@ -33,6 +33,8 @@ pub struct OpenAIResponsesClient {
     retry_config: RetryConfig,
     /// HTTP client for direct API calls (compaction, polling, etc.).
     http: reqwest::Client,
+    /// Redirect-free HTTP client under the async-openai generation transport.
+    transport: reqwest_openai::Client,
     /// API key for direct HTTP requests.
     api_key: String,
     /// Base URL for the API (defaults to `https://api.openai.com/v1`).
@@ -180,9 +182,14 @@ impl OpenAIResponsesClient {
         }
         let client = async_openai::Client::with_config(openai_config);
         let uses_max_reasoning = matches!(reasoning_effort, Some(OpenAIReasoningEffort::Max));
+        let transport = reqwest_openai::Client::builder()
+            .redirect(reqwest_openai::redirect::Policy::none())
+            .build()
+            .map_err(|_| AdkError::model("failed to initialize Responses HTTP transport"))?;
         // ADK owns retry policy. async-openai's default executor has another
         // retry layer, including when this model's retries are disabled.
-        let client = with_transport(client, uses_max_reasoning, open_responses_mode, None)?;
+        let client =
+            with_transport(client, &transport, uses_max_reasoning, open_responses_mode, None);
 
         let base_url =
             config.base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string());
@@ -194,6 +201,7 @@ impl OpenAIResponsesClient {
             reasoning_summary: config.reasoning_summary,
             retry_config: RetryConfig::default(),
             http: reqwest::Client::new(),
+            transport,
             api_key: config.api_key,
             base_url,
             open_responses_mode,
@@ -207,18 +215,36 @@ impl OpenAIResponsesClient {
         self
     }
 
-    /// Customize generation request fields and headers without adding an HTTP retry layer.
-    pub fn with_request_adapter(
-        mut self,
-        adapter: super::RequestAdapter,
-    ) -> Result<Self, AdkError> {
+    /// Customize generation request fields and headers before each HTTP attempt.
+    ///
+    /// The adapter runs under this client's [`RetryConfig`]; no HTTP retry layer is
+    /// added. It applies to generation requests, not to compaction or polling.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig, RequestAdapter};
+    /// use std::sync::Arc;
+    ///
+    /// let adapter: RequestAdapter = Arc::new(|body, headers| {
+    ///     body["metadata"] = serde_json::json!({"application": "example"});
+    ///     headers.insert("x-request-source", "example".parse().expect("valid header"));
+    ///     Ok(())
+    /// });
+    /// let client = OpenAIResponsesClient::new(OpenAIResponsesConfig::new("sk-key", "gpt-5"))?
+    ///     .with_request_adapter(adapter);
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    #[must_use]
+    pub fn with_request_adapter(mut self, adapter: super::RequestAdapter) -> Self {
         self.client = with_transport(
             self.client,
+            &self.transport,
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             Some(adapter),
-        )?;
-        Ok(self)
+        );
+        self
     }
 
     /// Set the retry configuration by mutable reference.
@@ -264,19 +290,16 @@ impl OpenAIResponsesClient {
 
 fn with_transport(
     client: async_openai::Client<async_openai::config::OpenAIConfig>,
+    http: &reqwest_openai::Client,
     uses_max_reasoning: bool,
     open_responses_mode: bool,
     adapter: Option<super::RequestAdapter>,
-) -> Result<async_openai::Client<async_openai::config::OpenAIConfig>, AdkError> {
+) -> async_openai::Client<async_openai::config::OpenAIConfig> {
     use async_openai::error::OpenAIError;
     use async_openai::middleware::{HttpRequestFactory, ReqwestService};
     use tower::ServiceExt;
 
-    let http = reqwest_openai::Client::builder()
-        .redirect(reqwest_openai::redirect::Policy::none())
-        .build()
-        .map_err(|_| AdkError::model("failed to initialize Responses HTTP transport"))?;
-    let transport = ReqwestService::new(http);
+    let transport = ReqwestService::new(http.clone());
     let service = tower::service_fn(move |factory: HttpRequestFactory| {
         let transport = transport.clone();
         let adapter = adapter.clone();
@@ -325,7 +348,7 @@ fn with_transport(
         }
     });
 
-    Ok(client.with_http_service(service))
+    client.with_http_service(service)
 }
 
 async fn normalize_responses_response(

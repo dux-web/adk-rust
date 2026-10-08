@@ -172,9 +172,8 @@ where
                         }
                         Err(e) if e.error_len().is_none() => {
                             let valid = e.valid_up_to();
-                            let prefix = std::str::from_utf8(&state.pending[..valid])
-                                .expect("validated UTF-8 prefix");
-                            state.buffer.push_str(prefix);
+                            // The prefix is valid UTF-8, so the lossy decode copies it exactly.
+                            state.buffer.push_str(&String::from_utf8_lossy(&state.pending[..valid]));
                             // Retain the incomplete character for the next network chunk.
                             state.pending.drain(..valid);
                         }
