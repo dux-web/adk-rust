@@ -1034,7 +1034,11 @@ impl GeminiBuilder {
         self
     }
 
-    /// Set a custom HTTP client builder.
+    /// Set a custom HTTP client builder for the AI Studio backend.
+    ///
+    /// Settings such as proxies, timeouts and default headers apply to every Studio
+    /// request. The redirect policy is always replaced with
+    /// [`reqwest::redirect::Policy::none`] so the API key is never re-sent to another host.
     pub fn with_http_client(mut self, client_builder: ClientBuilder) -> Self {
         self.client_builder = client_builder;
         self
@@ -1159,8 +1163,14 @@ impl GeminiBuilder {
         key.set_sensitive(true);
         let mut headers = HeaderMap::new();
         headers.insert("x-goog-api-key", key);
-        let client =
-            self.client_builder.default_headers(headers).build().context(PerformRequestNewSnafu)?;
+        // A redirect would re-send `x-goog-api-key` to the target host, so the Studio
+        // client never follows one, whatever the configured builder says.
+        let client = self
+            .client_builder
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .context(PerformRequestNewSnafu)?;
         let studio =
             backend::studio::StudioBackend::with_client(client, self.model.clone(), self.base_url);
 

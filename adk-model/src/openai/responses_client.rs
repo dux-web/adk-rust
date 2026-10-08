@@ -35,6 +35,10 @@ pub struct OpenAIResponsesClient {
     http: reqwest::Client,
     /// Redirect-free HTTP client under the async-openai generation transport.
     transport: reqwest_openai::Client,
+    /// Headers added to generation and auxiliary requests.
+    default_headers: http::HeaderMap,
+    /// Generation request adapter, kept so rebuilding the transport preserves it.
+    adapter: Option<super::RequestAdapter>,
     /// API key for direct HTTP requests.
     api_key: String,
     /// Base URL for the API (defaults to `https://api.openai.com/v1`).
@@ -202,29 +206,58 @@ impl OpenAIResponsesClient {
             retry_config: RetryConfig::default(),
             http: reqwest::Client::new(),
             transport,
+            default_headers: http::HeaderMap::new(),
+            adapter: None,
             api_key: config.api_key,
             base_url,
             open_responses_mode,
         })
     }
 
-    /// Sets additional HTTP defaults for Responses and auxiliary requests.
+    /// Adds default HTTP headers to generation and auxiliary requests.
     ///
-    /// Explicit authentication headers and compatibility middleware remain active.
+    /// Headers with the same name replace earlier defaults; the per-request
+    /// authorization header takes precedence. The generation transport keeps
+    /// redirects disabled, the Open Responses and maximum-reasoning rewrites, and any
+    /// [`Self::with_request_adapter`] adapter, whichever order the methods are called
+    /// in. Unlike builder methods that only store a value, this method rebuilds both
+    /// `reqwest` clients, so it returns `Result`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig};
+    /// use http::header::{HeaderMap, HeaderValue};
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("x-session-id", HeaderValue::from_static("conversation-1"));
+    /// let client = OpenAIResponsesClient::new(OpenAIResponsesConfig::new("sk-key", "gpt-5"))?
+    ///     .with_default_headers(headers)?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns an error if either HTTP client cannot be initialized.
+    /// Returns an `Internal` error with code `model.openai.http_client_init` when
+    /// either HTTP client cannot be built.
     pub fn with_default_headers(mut self, headers: http::HeaderMap) -> Result<Self, AdkError> {
-        let http = reqwest_openai::Client::builder()
-            .default_headers(headers.clone())
+        self.default_headers.extend(headers);
+        self.transport = reqwest_openai::Client::builder()
+            .default_headers(self.default_headers.clone())
+            .redirect(reqwest_openai::redirect::Policy::none())
             .build()
-            .map_err(|_| AdkError::model("failed to initialize Responses HTTP client"))?;
-        self.client = self.client.with_http_client(http);
+            .map_err(http_client_init_error)?;
         self.http = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(self.default_headers.clone())
             .build()
-            .map_err(|_| AdkError::model("failed to initialize Responses HTTP client"))?;
+            .map_err(http_client_init_error)?;
+        self.client = with_transport(
+            self.client,
+            &self.transport,
+            matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
+            self.open_responses_mode,
+            self.adapter.clone(),
+        );
         Ok(self)
     }
 
@@ -257,12 +290,13 @@ impl OpenAIResponsesClient {
     /// ```
     #[must_use]
     pub fn with_request_adapter(mut self, adapter: super::RequestAdapter) -> Self {
+        self.adapter = Some(adapter);
         self.client = with_transport(
             self.client,
             &self.transport,
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
-            Some(adapter),
+            self.adapter.clone(),
         );
         self
     }
@@ -306,6 +340,17 @@ impl OpenAIResponsesClient {
     pub fn is_open_responses_mode(&self) -> bool {
         self.open_responses_mode
     }
+}
+
+fn http_client_init_error(err: impl std::error::Error + Send + Sync + 'static) -> AdkError {
+    AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::Internal,
+        "model.openai.http_client_init",
+        format!("failed to initialize the Responses HTTP client: {err}"),
+    )
+    .with_provider("openai-responses")
+    .with_source(err)
 }
 
 fn with_transport(

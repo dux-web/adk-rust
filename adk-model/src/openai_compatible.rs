@@ -306,6 +306,8 @@ impl ErrorCodes {
 pub struct OpenAICompatible {
     completion_url: Option<String>,
     http: reqwest::Client,
+    /// Headers added to every request, kept so later calls extend rather than replace them.
+    default_headers: http::HeaderMap,
     request_adapter: Option<crate::openai::RequestAdapter>,
     api_key: String,
     base_url: String,
@@ -350,6 +352,7 @@ impl OpenAICompatible {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|_| AdkError::model("failed to initialize compatible HTTP transport"))?,
+            default_headers: http::HeaderMap::new(),
             request_adapter: None,
             api_key: config.api_key,
             base_url,
@@ -364,16 +367,45 @@ impl OpenAICompatible {
         })
     }
 
-    /// Sets additional HTTP defaults for all requests, preserving explicit authentication headers.
+    /// Adds default HTTP headers to every request, replacing earlier defaults with the same name.
+    ///
+    /// The bearer token and organization headers set per request take precedence, and
+    /// redirects stay disabled. Unlike builder methods that only store a value, this
+    /// method rebuilds the underlying `reqwest` client, so it returns `Result`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
+    /// use http::header::{HeaderMap, HeaderValue};
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert("x-session-id", HeaderValue::from_static("conversation-1"));
+    /// let client = OpenAICompatible::new(OpenAICompatibleConfig::new("api-key", "model"))?
+    ///     .with_default_headers(headers)?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns an error if the HTTP client cannot be initialized.
+    /// Returns an `Internal` error with code `model.openai.http_client_init` when the
+    /// HTTP client cannot be built.
     pub fn with_default_headers(mut self, headers: http::HeaderMap) -> Result<Self, AdkError> {
+        self.default_headers.extend(headers);
         self.http = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(self.default_headers.clone())
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .map_err(|_| AdkError::model("failed to initialize OpenAI-compatible HTTP client"))?;
+            .map_err(|err| {
+                AdkError::new(
+                    ErrorComponent::Model,
+                    ErrorCategory::Internal,
+                    "model.openai.http_client_init",
+                    format!("failed to initialize the {} HTTP client: {err}", self.provider_name),
+                )
+                .with_provider(&self.provider_name)
+                .with_source(err)
+            })?;
         Ok(self)
     }
 
