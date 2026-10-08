@@ -2190,6 +2190,8 @@ impl ToolExecutor<'_> {
                 let mut started = Event::new(self.invocation_id);
                 started.author = self.ctx.agent_name().to_owned();
                 started.branch = self.ctx.branch().to_owned();
+                // Partial, as tool progress is: never persisted, never a final response.
+                started.llm_response.partial = true;
                 started.provider_metadata.insert(
                     "adk_tool_started".into(),
                     serde_json::json!({"id": id, "name": name}).to_string(),
