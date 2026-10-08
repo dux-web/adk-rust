@@ -172,7 +172,8 @@ expensive axes move to a later tier.
   as seven shards driven by `scripts/feature-coverage-pairs.txt`,
   `docs` (`cargo doc --workspace --no-deps` plus doctests), standalone examples
   (4 shards), `templates`, a compile-only macOS build, a Windows workspace build
-  with a targeted sandbox portability smoke, and `semver` (stable strict,
+  with a targeted sandbox portability smoke, and `semver` (stable strict with
+  the next release assumed minor, so additions pass and breakage fails;
   everything else warn-only). A `scope` job skips the Rust jobs when a change
   touches only `docs/` or Markdown, and merge-queue builds skip the standalone
   examples and the macOS/Windows builds the pull request already passed.
