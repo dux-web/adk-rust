@@ -634,7 +634,9 @@ fn default_output_mapper(events: &[adk_core::Event]) -> HashMap<String, Value> {
 
     // Collect text from events
     let mut messages = Vec::new();
+    let mut text_deltas = adk_core::EventTextDeltas::default();
     for event in events {
+        let event = text_deltas.push(event);
         if let Some(content) = event.content() {
             let text = content.parts.iter().filter_map(|p| p.text()).collect::<Vec<_>>().join("");
 
@@ -759,6 +761,7 @@ impl Node for AgentNode {
 
             tokio::pin!(stream);
             let mut all_events = Vec::new();
+            let mut text_deltas = adk_core::EventTextDeltas::default();
 
             while let Some(result) = stream.next().await {
                 match result {
@@ -775,7 +778,7 @@ impl Node for AgentNode {
                             return;
                         }
                         // Emit streaming event immediately
-                        if let Some(content) = event.content() {
+                        if let Some(content) = text_deltas.push(&event).content() {
                             let text: String = content.parts.iter().filter_map(|p| p.text()).collect();
                             if !text.is_empty() {
                                 yield Ok(StreamEvent::Message {
@@ -1096,6 +1099,28 @@ mod tests {
 
         assert!(output.updates.is_empty());
         assert!(output.interrupt.is_none());
+    }
+
+    #[test]
+    fn default_output_mapper_does_not_repeat_a_complete_snapshot() {
+        let mut partial = adk_core::Event::new("invocation");
+        partial.llm_response.partial = true;
+        partial.set_content(adk_core::Content::new("model").with_text("Hello"));
+        let mut terminal = partial.clone();
+        terminal.llm_response.partial = false;
+        terminal.llm_response.provider_metadata =
+            Some(serde_json::json!({"content_complete": true}));
+        terminal.set_content(adk_core::Content::new("model").with_text("Hello world"));
+
+        let updates = default_output_mapper(&[partial, terminal]);
+
+        assert_eq!(
+            updates.get("messages"),
+            Some(&serde_json::json!([
+                {"role": "assistant", "content": "Hello"},
+                {"role": "assistant", "content": " world"},
+            ]))
+        );
     }
 
     #[test]

@@ -365,6 +365,7 @@ impl Launcher {
                         )
                         .await?;
                     let mut printer = StreamPrinter::new(thinking_mode);
+                    let mut text_deltas = adk_core::EventTextDeltas::default();
                     let mut current_agent = String::new();
                     let mut printed_header = false;
                     let mut interrupted = false;
@@ -378,6 +379,7 @@ impl Launcher {
 
                                 match event {
                                     Ok(evt) => {
+                                        let evt = text_deltas.push(&evt);
                                         // Track agent switches in multi-agent workflows
                                         if !evt.author.is_empty()
                                             && evt.author != "user"
