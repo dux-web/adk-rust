@@ -446,7 +446,8 @@ macro_rules! sql_approval_store {
                 query: &ApprovalRequestQuery,
             ) -> Result<Vec<ApprovalRequest>> {
                 let (sql, params) = list_statement(query);
-                let mut statement = sqlx::query_scalar::<_, String>(&sql);
+                // SQL contains fixed clauses and numbered placeholders; values are bound below.
+                let mut statement = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
                 for param in params {
                     statement = match param {
                         SqlParam::Text(text) => statement.bind(text),

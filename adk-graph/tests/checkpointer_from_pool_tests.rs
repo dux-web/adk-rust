@@ -154,6 +154,33 @@ async fn adopting_the_same_pool_twice_succeeds() {
     );
 }
 
+/// Databases predating the interrupt/attempt/child-ledger columns retain their rows.
+#[tokio::test]
+async fn adopts_legacy_schema_without_losing_checkpoints() {
+    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::query(
+        "CREATE TABLE graph_checkpoints (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, \
+         state TEXT NOT NULL, step INTEGER NOT NULL, pending_nodes TEXT NOT NULL, \
+         metadata TEXT, created_at TEXT NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO graph_checkpoints VALUES \
+         ('legacy', 'legacy-thread', '{}', 1, '[]', '{}', '2026-08-20T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cp = SqliteCheckpointer::from_pool(pool.clone()).await.unwrap();
+    let old = cp.load("legacy-thread").await.unwrap().unwrap();
+    assert_eq!((old.checkpoint_id, old.step), ("legacy".to_string(), 1));
+    cp.save(&checkpoint("new-thread", "new-checkpoint", 2)).await.unwrap();
+    let new = cp.load("new-thread").await.unwrap().unwrap();
+    assert_eq!((new.checkpoint_id, new.step), ("new-checkpoint".to_string(), 2));
+}
+
 /// A database written before checkpoints carried versions numbers its rows in
 /// creation order, so the newest stays the newest.
 #[tokio::test]

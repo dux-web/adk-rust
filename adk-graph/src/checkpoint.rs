@@ -382,10 +382,6 @@ pub struct SqliteCheckpointer {
 }
 
 #[cfg(feature = "sqlite")]
-const SQLITE_COLUMNS: &str = "id, thread_id, state, step, pending_nodes, metadata, created_at, \
-     cleared_interrupt, attempts, child_ledger, version, pending_writes";
-
-#[cfg(feature = "sqlite")]
 fn sqlite_error(error: sqlx::Error) -> GraphError {
     GraphError::CheckpointError(error.to_string())
 }
@@ -441,7 +437,7 @@ impl SqliteCheckpointer {
     /// semver-compatible `sqlx` to construct one:
     ///
     /// ```toml
-    /// sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+    /// sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
     /// ```
     ///
     /// # Errors
@@ -474,16 +470,14 @@ impl SqliteCheckpointer {
         // A database created before a column existed keeps its old shape under
         // CREATE TABLE IF NOT EXISTS, so add each column separately and ignore the
         // duplicate-column error on a database that already has it.
-        for column in [
-            "cleared_interrupt TEXT",
-            "attempts TEXT",
-            "child_ledger TEXT",
-            "version INTEGER NOT NULL DEFAULT 0",
-            "pending_writes TEXT",
+        for alter in [
+            "ALTER TABLE graph_checkpoints ADD COLUMN cleared_interrupt TEXT",
+            "ALTER TABLE graph_checkpoints ADD COLUMN attempts TEXT",
+            "ALTER TABLE graph_checkpoints ADD COLUMN child_ledger TEXT",
+            "ALTER TABLE graph_checkpoints ADD COLUMN version INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE graph_checkpoints ADD COLUMN pending_writes TEXT",
         ] {
-            let _ = sqlx::query(&format!("ALTER TABLE graph_checkpoints ADD COLUMN {column}"))
-                .execute(&pool)
-                .await;
+            let _ = sqlx::query(alter).execute(&pool).await;
         }
 
         // Rows written before versions existed are numbered in creation order.
@@ -537,11 +531,12 @@ impl Checkpointer for SqliteCheckpointer {
         ensure_newer(checkpoint, None)?;
         // The guard refuses a stale version in the same statement that inserts, and
         // the unique index refuses a concurrent insert of the same version.
-        let inserted = sqlx::query(&format!(
-            "INSERT INTO graph_checkpoints ({SQLITE_COLUMNS}) \
+        let inserted = sqlx::query(
+            "INSERT INTO graph_checkpoints (id, thread_id, state, step, pending_nodes, metadata, created_at, \
+             cleared_interrupt, attempts, child_ledger, version, pending_writes) \
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
-             WHERE NOT EXISTS (SELECT 1 FROM graph_checkpoints WHERE thread_id = ? AND version >= ?)"
-        ))
+             WHERE NOT EXISTS (SELECT 1 FROM graph_checkpoints WHERE thread_id = ? AND version >= ?)",
+        )
         .bind(&checkpoint.checkpoint_id)
         .bind(&checkpoint.thread_id)
         .bind(serde_json::to_string(&checkpoint.state)?)
@@ -575,10 +570,11 @@ impl Checkpointer for SqliteCheckpointer {
     }
 
     async fn load(&self, thread_id: &str) -> Result<Option<Checkpoint>> {
-        let row = sqlx::query(&format!(
-            "SELECT {SQLITE_COLUMNS} FROM graph_checkpoints WHERE thread_id = ? \
-             ORDER BY version DESC LIMIT 1"
-        ))
+        let row = sqlx::query(
+            "SELECT id, thread_id, state, step, pending_nodes, metadata, created_at, \
+             cleared_interrupt, attempts, child_ledger, version, pending_writes FROM graph_checkpoints WHERE thread_id = ? \
+             ORDER BY version DESC LIMIT 1",
+        )
         .bind(thread_id)
         .fetch_optional(&self.pool)
         .await
@@ -588,7 +584,10 @@ impl Checkpointer for SqliteCheckpointer {
 
     async fn load_by_id(&self, checkpoint_id: &str) -> Result<Option<Checkpoint>> {
         let row =
-            sqlx::query(&format!("SELECT {SQLITE_COLUMNS} FROM graph_checkpoints WHERE id = ?"))
+            sqlx::query(
+            "SELECT id, thread_id, state, step, pending_nodes, metadata, created_at, \
+             cleared_interrupt, attempts, child_ledger, version, pending_writes FROM graph_checkpoints WHERE id = ?",
+        )
                 .bind(checkpoint_id)
                 .fetch_optional(&self.pool)
                 .await
@@ -597,9 +596,10 @@ impl Checkpointer for SqliteCheckpointer {
     }
 
     async fn list(&self, thread_id: &str) -> Result<Vec<Checkpoint>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {SQLITE_COLUMNS} FROM graph_checkpoints WHERE thread_id = ? ORDER BY version ASC"
-        ))
+        let rows = sqlx::query(
+            "SELECT id, thread_id, state, step, pending_nodes, metadata, created_at, \
+             cleared_interrupt, attempts, child_ledger, version, pending_writes FROM graph_checkpoints WHERE thread_id = ? ORDER BY version ASC",
+        )
         .bind(thread_id)
         .fetch_all(&self.pool)
         .await
@@ -613,10 +613,11 @@ impl Checkpointer for SqliteCheckpointer {
         before: Option<u64>,
         limit: usize,
     ) -> Result<Vec<Checkpoint>> {
-        let rows = sqlx::query(&format!(
-            "SELECT {SQLITE_COLUMNS} FROM graph_checkpoints WHERE thread_id = ? AND version < ? \
-             ORDER BY version DESC LIMIT ?"
-        ))
+        let rows = sqlx::query(
+            "SELECT id, thread_id, state, step, pending_nodes, metadata, created_at, \
+             cleared_interrupt, attempts, child_ledger, version, pending_writes FROM graph_checkpoints WHERE thread_id = ? AND version < ? \
+             ORDER BY version DESC LIMIT ?",
+        )
         .bind(thread_id)
         .bind(before.map_or(i64::MAX, |before| before as i64))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))

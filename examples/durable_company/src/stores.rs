@@ -155,7 +155,12 @@ impl Stores {
                 // other's queue, schedules, spend, or kill switch.
                 let admin =
                     PgPoolOptions::new().max_connections(1).connect_with(base.clone()).await?;
-                sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                // The schema name comes from `--schema`, so only a plain identifier is interpolated.
+                anyhow::ensure!(
+                    schema.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                    "--schema must contain only ASCII letters, digits, and underscores"
+                );
+                sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA IF NOT EXISTS {schema}")))
                     .execute(&admin)
                     .await?;
                 admin.close().await;

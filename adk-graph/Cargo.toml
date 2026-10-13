@@ -27,7 +27,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 # Optional SQLite and PostgreSQL checkpointers
-sqlx = { version = "0.8", features = ["runtime-tokio"], optional = true }
+sqlx = { workspace = true, features = ["runtime-tokio"], optional = true }
 
 # Optional shared-database checkpointers. Versions match adk-session, so the lockfile
 # holds one copy of each driver.
@@ -58,7 +58,7 @@ tokio-cron-scheduler = { version = "0.15", optional = true }
 default = []
 sqlite = ["dep:sqlx", "sqlx/sqlite"]
 # Checkpointers for shared databases; each passes the `conformance` suite.
-postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono"]
+postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/tls-rustls-aws-lc-rs"]
 redis = ["dep:fred", "fred/i-scripts"]
 mongodb = ["dep:mongodb"]
 neo4j = ["dep:neo4rs"]

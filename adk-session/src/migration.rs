@@ -58,6 +58,20 @@ impl std::error::Error for MigrationError {}
 // SQL runner — macro generates concrete implementations per database backend
 // ---------------------------------------------------------------------------
 
+// Registry identifiers are interpolated; migration bodies are trusted executable SQL.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+fn validate_registry_table(name: &str) -> Result<(), adk_core::AdkError> {
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(adk_core::AdkError::session(
+            "invalid migration registry table: use an ASCII identifier starting with a letter or underscore".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Expands to the body of a migration run, shared by the pool-based and the
 /// connection-based entry points.
 ///
@@ -74,6 +88,7 @@ macro_rules! sql_migration_body {
         int_type: $int_type:expr $(,)?
     ) => {{
         let registry_table: &str = $registry_table;
+        super::validate_registry_table(registry_table)?;
         let steps: &'static [(i64, &'static str, &'static str)] = $steps;
 
         // Step 1: Create registry table if missing
@@ -85,15 +100,16 @@ macro_rules! sql_migration_body {
             )",
             $int_type
         );
-        sqlx::query(&create_sql).execute($exec).await.map_err(|e| {
+        sqlx::query(sqlx::AssertSqlSafe(create_sql)).execute($exec).await.map_err(|e| {
             adk_core::AdkError::session(format!("migration registry creation failed: {e}"))
         })?;
 
         // Step 2: Read current max applied version
         let max_sql = format!("SELECT COALESCE(MAX(version), 0) AS max_v FROM {registry_table}");
-        let row = sqlx::query(&max_sql).fetch_one($exec).await.map_err(|e| {
-            adk_core::AdkError::session(format!("migration registry read failed: {e}"))
-        })?;
+        let row =
+            sqlx::query(sqlx::AssertSqlSafe(max_sql)).fetch_one($exec).await.map_err(|e| {
+                adk_core::AdkError::session(format!("migration registry read failed: {e}"))
+            })?;
         let mut max_applied: i64 = row.try_get("max_v").map_err(|e| {
             adk_core::AdkError::session(format!("migration registry read failed: {e}"))
         })?;
@@ -108,18 +124,24 @@ macro_rules! sql_migration_body {
                     let ins = format!(
                         "INSERT INTO {registry_table} \
                          (version, description, applied_at) \
-                         VALUES ({v}, '{desc}', '{now}')"
+                         VALUES ($1, $2, $3)"
                     );
-                    sqlx::query(&ins).execute($exec).await.map_err(|e| {
-                        adk_core::AdkError::session(format!(
-                            "{}",
-                            MigrationError {
-                                version: v,
-                                description: desc.to_string(),
-                                cause: e.to_string(),
-                            }
-                        ))
-                    })?;
+                    sqlx::query(sqlx::AssertSqlSafe(ins))
+                        .bind(v)
+                        .bind(desc)
+                        .bind(&now)
+                        .execute($exec)
+                        .await
+                        .map_err(|e| {
+                            adk_core::AdkError::session(format!(
+                                "{}",
+                                MigrationError {
+                                    version: v,
+                                    description: desc.to_string(),
+                                    cause: e.to_string(),
+                                }
+                            ))
+                        })?;
                     max_applied = v;
                 }
             }
@@ -158,34 +180,42 @@ macro_rules! sql_migration_body {
             // semicolon-separated statements in a single call).
             // `Executor::execute` returns a boxed `Send` future; `RawSql::execute` is an
             // `async fn` whose future is not provably `Send` for PostgreSQL connections.
-            sqlx::Executor::execute(&mut *tx, sqlx::raw_sql(sql)).await.map_err(|e| {
-                adk_core::AdkError::session(format!(
-                    "{}",
-                    MigrationError {
-                        version,
-                        description: description.to_string(),
-                        cause: e.to_string(),
-                    }
-                ))
-            })?;
+            sqlx::Executor::execute(&mut *tx, sqlx::raw_sql(sqlx::AssertSqlSafe(sql)))
+                .await
+                .map_err(|e| {
+                    adk_core::AdkError::session(format!(
+                        "{}",
+                        MigrationError {
+                            version,
+                            description: description.to_string(),
+                            cause: e.to_string(),
+                        }
+                    ))
+                })?;
 
             // Record the step in the registry
             let now = Utc::now().to_rfc3339();
             let rec = format!(
                 "INSERT INTO {registry_table} \
                  (version, description, applied_at) \
-                 VALUES ({version}, '{description}', '{now}')"
+                 VALUES ($1, $2, $3)"
             );
-            sqlx::query(&rec).execute(&mut *tx).await.map_err(|e| {
-                adk_core::AdkError::session(format!(
-                    "{}",
-                    MigrationError {
-                        version,
-                        description: description.to_string(),
-                        cause: format!("registry record failed: {e}"),
-                    }
-                ))
-            })?;
+            sqlx::query(sqlx::AssertSqlSafe(rec))
+                .bind(version)
+                .bind(description)
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    adk_core::AdkError::session(format!(
+                        "{}",
+                        MigrationError {
+                            version,
+                            description: description.to_string(),
+                            cause: format!("registry record failed: {e}"),
+                        }
+                    ))
+                })?;
 
             tx.commit().await.map_err(|e| {
                 adk_core::AdkError::session(format!(
@@ -219,6 +249,10 @@ macro_rules! impl_sql_migration_runner {
             use std::pin::Pin;
 
             /// Run all pending migrations for a SQL backend.
+            ///
+            /// `registry_table` must be an ASCII identifier starting with a letter or
+            /// underscore. Step bodies are trusted executable SQL, never user input.
+            /// Descriptions are bound as values and may contain quotes.
             ///
             /// 1. Creates the registry table if it does not exist.
             /// 2. Calls `detect_existing` to check for pre-existing schema
@@ -254,6 +288,9 @@ macro_rules! impl_sql_migration_runner {
             }
 
             /// Run all pending migrations on one connection.
+            ///
+            /// The identifier and trusted-SQL requirements of [`run_sql_migrations`]
+            /// apply to this entry point too.
             ///
             /// Performs the same steps as [`run_sql_migrations`], but every
             /// statement, including `detect_existing`, runs on `conn`. A
@@ -291,13 +328,16 @@ macro_rules! impl_sql_migration_runner {
 
             /// Returns the highest applied migration version, or 0 if no
             /// registry table exists or the registry is empty.
+            ///
+            /// Rejects registry names that are not simple ASCII identifiers.
             pub async fn sql_schema_version(
                 pool: &$pool_ty,
                 registry_table: &str,
             ) -> Result<i64, adk_core::AdkError> {
+                super::validate_registry_table(registry_table)?;
                 let sql =
                     format!("SELECT COALESCE(MAX(version), 0) AS max_v FROM {registry_table}");
-                match sqlx::query(&sql).fetch_one(pool).await {
+                match sqlx::query(sqlx::AssertSqlSafe(sql)).fetch_one(pool).await {
                     Ok(row) => {
                         let version: i64 = row.try_get("max_v").unwrap_or(0);
                         Ok(version)

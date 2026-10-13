@@ -250,6 +250,12 @@ pub trait MemoryService: Send + Sync {
 - [adk-runner](https://crates.io/crates/adk-runner) - Memory injection during execution
 - [adk-rag](https://crates.io/crates/adk-rag) - RAG pipeline with vector stores
 
+## SQLx compatibility
+
+ADK-Rust 3.0 SQL database APIs use SQLx 0.9 pool and error types. Applications
+sharing pools must also use SQLx 0.9. See the [migration guide](../docs/official_docs/migration/sqlx-0.9.md)
+for runtime/TLS flags and migration-input requirements.
+
 ## License
 
 Apache-2.0

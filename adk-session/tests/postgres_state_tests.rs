@@ -80,9 +80,9 @@ async fn postgres_state_migrate_ignores_tables_in_other_schemas() {
     let mut admin = PgConnection::connect(&database_url()).await.expect("connect admin");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let (other, target) = (format!("adk_other_{run}"), format!("adk_target_{run}"));
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE SCHEMA {other}; CREATE TABLE {other}.sessions (id INT); CREATE SCHEMA {target};"
-    ))
+    )))
     .execute(&mut admin)
     .await
     .expect("create schemas");
@@ -108,9 +108,11 @@ async fn postgres_state_migrate_ignores_tables_in_other_schemas() {
     }
     .await;
 
-    sqlx::raw_sql(&format!("DROP SCHEMA {other} CASCADE; DROP SCHEMA {target} CASCADE;"))
-        .execute(&mut admin)
-        .await
-        .expect("drop schemas");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA {other} CASCADE; DROP SCHEMA {target} CASCADE;"
+    )))
+    .execute(&mut admin)
+    .await
+    .expect("drop schemas");
     result.expect("migrate creates the session tables in the current schema");
 }

@@ -690,6 +690,12 @@ Paths and URLs come from workflow state, so both are confined:
   `HttpActionPolicy` permits (`with_http_policy`). The default allows `https` and
   `http` to any host and up to 5 redirects, each re-checked. Logs omit the query string.
 
+## SQLx compatibility
+
+ADK-Rust 3.0 SQL database APIs use SQLx 0.9 pool and error types. Applications
+sharing pools must also use SQLx 0.9. See the [migration guide](../docs/official_docs/migration/sqlx-0.9.md)
+for runtime/TLS flags and migration-input requirements.
+
 ## License
 
 Apache-2.0

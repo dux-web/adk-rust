@@ -163,6 +163,10 @@ livekit-datatrack = { version = "=0.1.13", default-features = false }
 libwebrtc = { version = "=0.3.43", default-features = false }
 webrtc-sys = { version = "=0.3.40", default-features = false }
 
+# Shared database API types; all public pool constructors use this SQLx line.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+pgvector = "=0.4.2"
+
 # ADK internal crates (use { workspace = true } in member crates)
 adk-core = { path = "adk-core", version = "3.0.0" }
 adk-rust-macros = { path = "adk-rust-macros", version = "3.0.0" }

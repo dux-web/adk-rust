@@ -33,10 +33,10 @@ async fn postgres_schema_migrate_ignores_tables_in_other_schemas() {
     let mut admin = PgConnection::connect(&database_url()).await.expect("connect admin");
     let run = uuid::Uuid::new_v4().simple().to_string();
     let (other, target) = (format!("adk_other_{run}"), format!("adk_target_{run}"));
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE SCHEMA {other}; CREATE TABLE {other}.memory_entries (id INT); \
          CREATE SCHEMA {target};"
-    ))
+    )))
     .execute(&mut admin)
     .await
     .expect("create schemas");
@@ -59,10 +59,12 @@ async fn postgres_schema_migrate_ignores_tables_in_other_schemas() {
     .await
     .expect("query information_schema");
 
-    sqlx::raw_sql(&format!("DROP SCHEMA {other} CASCADE; DROP SCHEMA {target} CASCADE;"))
-        .execute(&mut admin)
-        .await
-        .expect("drop schemas");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA {other} CASCADE; DROP SCHEMA {target} CASCADE;"
+    )))
+    .execute(&mut admin)
+    .await
+    .expect("drop schemas");
 
     // Either the migration ran in the target schema, or it failed before recording
     // anything; it never takes the other schema's table as its baseline.

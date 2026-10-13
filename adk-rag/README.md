@@ -543,6 +543,12 @@ let tool = RagTool::new(pipeline, "default_collection");
 // { "query": "pricing info", "collection": "faq", "top_k": 5 }
 ```
 
+## SQLx compatibility
+
+ADK-Rust 3.0 SQL database APIs use SQLx 0.9 pool and error types. Applications
+sharing pools must also use SQLx 0.9. See the [migration guide](../docs/official_docs/migration/sqlx-0.9.md)
+for runtime/TLS flags and migration-input requirements.
+
 ## License
 
 Apache-2.0

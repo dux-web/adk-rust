@@ -403,6 +403,12 @@ use adk_session::SqliteSessionService;
 - [adk-core](https://crates.io/crates/adk-core) - Core `Session` trait
 - [adk-runner](https://crates.io/crates/adk-runner) - Uses sessions for execution
 
+## SQLx compatibility
+
+ADK-Rust 3.0 SQL database APIs use SQLx 0.9 pool and error types. Applications
+sharing pools must also use SQLx 0.9. See the [migration guide](../docs/official_docs/migration/sqlx-0.9.md)
+for runtime/TLS flags and migration-input requirements.
+
 ## License
 
 Apache-2.0

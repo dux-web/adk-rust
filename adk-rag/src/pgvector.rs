@@ -57,6 +57,8 @@ impl PgVectorStore {
 
     /// Sanitize a collection name for use as a table name.
     /// Only allows alphanumeric characters and underscores.
+    /// Dynamic SQL assertions rely on this identifier sanitization and typed
+    /// integer dimensions; all data values remain bound parameters.
     fn sanitize_table_name(name: &str) -> Result<String> {
         let sanitized: String =
             name.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect();
@@ -91,7 +93,10 @@ impl VectorStore for PgVectorStore {
             )"
         );
 
-        sqlx::query(&create_sql).execute(&self.pool).await.map_err(Self::map_err)?;
+        sqlx::query(sqlx::AssertSqlSafe(create_sql.as_str()))
+            .execute(&self.pool)
+            .await
+            .map_err(Self::map_err)?;
 
         debug!(collection = name, table = %table_name, dimensions, "created pgvector table");
         Ok(())
@@ -101,7 +106,10 @@ impl VectorStore for PgVectorStore {
         let table_name = Self::sanitize_table_name(name)?;
 
         let drop_sql = format!("DROP TABLE IF EXISTS {table_name}");
-        sqlx::query(&drop_sql).execute(&self.pool).await.map_err(Self::map_err)?;
+        sqlx::query(sqlx::AssertSqlSafe(drop_sql.as_str()))
+            .execute(&self.pool)
+            .await
+            .map_err(Self::map_err)?;
 
         debug!(collection = name, table = %table_name, "deleted pgvector table");
         Ok(())
@@ -134,7 +142,7 @@ impl VectorStore for PgVectorStore {
                 chunk.embedding.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
             );
 
-            sqlx::query(&upsert_sql)
+            sqlx::query(sqlx::AssertSqlSafe(upsert_sql.as_str()))
                 .bind(&chunk.id)
                 .bind(&chunk.text)
                 .bind(&embedding_str)
@@ -160,7 +168,11 @@ impl VectorStore for PgVectorStore {
         let delete_sql = format!("DELETE FROM {table_name} WHERE id = ANY($1)");
         let id_vec: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
 
-        sqlx::query(&delete_sql).bind(&id_vec).execute(&self.pool).await.map_err(Self::map_err)?;
+        sqlx::query(sqlx::AssertSqlSafe(delete_sql.as_str()))
+            .bind(&id_vec)
+            .execute(&self.pool)
+            .await
+            .map_err(Self::map_err)?;
 
         debug!(collection, count = ids.len(), "deleted chunks from pgvector");
         Ok(())
@@ -187,7 +199,7 @@ impl VectorStore for PgVectorStore {
         let embedding_str =
             format!("[{}]", embedding.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","));
 
-        let rows = sqlx::query(&search_sql)
+        let rows = sqlx::query(sqlx::AssertSqlSafe(search_sql.as_str()))
             .bind(&embedding_str)
             .bind(top_k as i64)
             .fetch_all(&self.pool)

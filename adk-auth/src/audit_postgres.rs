@@ -58,7 +58,7 @@ impl PostgresAuditSink {
     /// Executes each statement individually since sqlx doesn't support
     /// multi-statement queries.
     pub async fn migrate(&self) -> Result<(), AuthError> {
-        for statement in MIGRATION_STATEMENTS {
+        for &statement in MIGRATION_STATEMENTS {
             sqlx::query(statement)
                 .execute(&self.pool)
                 .await
@@ -208,111 +208,57 @@ impl AuditSink for PostgresAuditSink {
     }
 
     async fn query(&self, filter: &AuditFilter) -> Result<Vec<AuditEvent>, AuthError> {
-        let mut conditions = Vec::new();
-        let mut bind_idx = 1u32;
-
-        // Build dynamic WHERE clause
-        if filter.user.is_some() {
-            conditions.push(format!("user_id = ${bind_idx}"));
-            bind_idx += 1;
-        }
-        if filter.workspace_id.is_some() {
-            conditions.push(format!("workspace_id = ${bind_idx}"));
-            bind_idx += 1;
-        }
-        if filter.tenant_id.is_some() {
-            conditions.push(format!("tenant_id = ${bind_idx}"));
-            bind_idx += 1;
-        }
-        if filter.event_type.is_some() {
-            conditions.push(format!("event_type = ${bind_idx}"));
-            bind_idx += 1;
-        }
-        if filter.outcome.is_some() {
-            conditions.push(format!("outcome = ${bind_idx}"));
-            bind_idx += 1;
-        }
-        if filter.resource.is_some() {
-            conditions.push(format!("resource LIKE ${bind_idx}"));
-            bind_idx += 1;
-        }
-        if filter.resource_id.is_some() {
-            conditions.push(format!("resource_id = ${bind_idx}"));
-            bind_idx += 1;
-        }
-        if filter.agent_id.is_some() {
-            conditions.push(format!("agent_id = ${bind_idx}"));
-            bind_idx += 1;
-        }
-        if filter.after.is_some() {
-            conditions.push(format!("timestamp > ${bind_idx}"));
-            bind_idx += 1;
-        }
-        if filter.before.is_some() {
-            conditions.push(format!("timestamp < ${bind_idx}"));
-        }
-
-        let where_clause = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", conditions.join(" AND "))
-        };
-
-        let limit = filter.limit.unwrap_or(1000);
-        let offset = filter.offset.unwrap_or(0);
-
-        let sql = format!(
+        let mut builder = sqlx::QueryBuilder::<sqlx::Postgres>::new(
             "SELECT timestamp, user_id, session_id, event_type, resource, outcome, \
              metadata, workspace_id, tenant_id, request_id, ip_address, resource_id, \
-             action, prev_hash, agent_id, on_behalf_of \
-             FROM audit_events {where_clause} \
-             ORDER BY timestamp DESC \
-             LIMIT {limit} OFFSET {offset}"
+             action, prev_hash, agent_id, on_behalf_of FROM audit_events WHERE TRUE",
         );
-
-        // Use a dynamic query builder approach
-        let mut query = sqlx::query_as::<_, AuditRow>(&sql);
-
         if let Some(ref user) = filter.user {
-            query = query.bind(user);
+            builder.push(" AND user_id = ").push_bind(user);
         }
         if let Some(ref ws) = filter.workspace_id {
-            query = query.bind(ws);
+            builder.push(" AND workspace_id = ").push_bind(ws);
         }
         if let Some(ref tid) = filter.tenant_id {
-            query = query.bind(tid);
+            builder.push(" AND tenant_id = ").push_bind(tid);
         }
         if let Some(ref et) = filter.event_type {
-            let et_str = serde_json::to_value(et)
-                .unwrap_or_default()
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string();
-            query = query.bind(et_str);
+            let value = serde_json::to_value(et).unwrap_or_default();
+            builder
+                .push(" AND event_type = ")
+                .push_bind(value.as_str().unwrap_or("unknown").to_string());
         }
         if let Some(ref oc) = filter.outcome {
-            let oc_str = serde_json::to_value(oc)
-                .unwrap_or_default()
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string();
-            query = query.bind(oc_str);
+            let value = serde_json::to_value(oc).unwrap_or_default();
+            builder
+                .push(" AND outcome = ")
+                .push_bind(value.as_str().unwrap_or("unknown").to_string());
         }
         if let Some(ref res) = filter.resource {
-            query = query.bind(format!("%{res}%"));
+            builder.push(" AND resource LIKE ").push_bind(format!("%{res}%"));
         }
         if let Some(ref rid) = filter.resource_id {
-            query = query.bind(rid);
+            builder.push(" AND resource_id = ").push_bind(rid);
         }
         if let Some(ref agent) = filter.agent_id {
-            query = query.bind(agent);
+            builder.push(" AND agent_id = ").push_bind(agent);
         }
         if let Some(after) = filter.after {
-            query = query.bind(after);
+            builder.push(" AND timestamp > ").push_bind(after);
         }
         if let Some(before) = filter.before {
-            query = query.bind(before);
+            builder.push(" AND timestamp < ").push_bind(before);
         }
+        builder
+            .push(" ORDER BY timestamp DESC LIMIT ")
+            .push_bind(i64::try_from(filter.limit.unwrap_or(1000)).map_err(|_| {
+                AuthError::AuditError("query limit exceeds PostgreSQL BIGINT range".to_string())
+            })?)
+            .push(" OFFSET ")
+            .push_bind(i64::try_from(filter.offset.unwrap_or(0)).map_err(|_| {
+                AuthError::AuditError("query offset exceeds PostgreSQL BIGINT range".to_string())
+            })?);
+        let query = builder.build_query_as::<AuditRow>();
 
         let rows = query
             .fetch_all(&self.pool)

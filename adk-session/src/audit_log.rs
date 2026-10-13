@@ -140,8 +140,8 @@ macro_rules! sql_audit_log_store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| store_error(format!("audit log append failed: {e}")))?;
-                let size: i64 = sqlx::query(&format!(
-                    "SELECT size FROM adk_audit_logs WHERE log_id = $1{}",
+                let size: i64 = sqlx::query(concat!(
+                    "SELECT size FROM adk_audit_logs WHERE log_id = $1",
                     $lock
                 ))
                 .bind(&batch.log_id)
@@ -274,8 +274,8 @@ macro_rules! sql_audit_log_store {
                     .begin_with($begin)
                     .await
                     .map_err(|e| store_error(format!("audit checkpoint write failed: {e}")))?;
-                let size = sqlx::query(&format!(
-                    "SELECT size FROM adk_audit_logs WHERE log_id = $1{}",
+                let size = sqlx::query(concat!(
+                    "SELECT size FROM adk_audit_logs WHERE log_id = $1",
                     $lock
                 ))
                 .bind(&checkpoint.log_id)

@@ -523,7 +523,8 @@ impl MemoryService for PostgresMemoryService {
                             LIMIT $4
                             "#
                         );
-                        sqlx::query(&sql)
+                        // Only the validated numeric embedding dimension changes SQL structure.
+                        sqlx::query(sqlx::AssertSqlSafe(sql))
                             .bind(&req.app_name)
                             .bind(&req.user_id)
                             .bind(&query_vec)
@@ -546,7 +547,8 @@ impl MemoryService for PostgresMemoryService {
                             LIMIT $4
                             "#
                         );
-                        sqlx::query(&sql)
+                        // Only the validated numeric embedding dimension changes SQL structure.
+                        sqlx::query(sqlx::AssertSqlSafe(sql))
                             .bind(&req.app_name)
                             .bind(&req.user_id)
                             .bind(&query_vec)
