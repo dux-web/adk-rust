@@ -1,1 +1,3 @@
-Preserve Responses SSE framing without a content type and retain HTTP status, provider codes, and Retry-After hints on failed requests.
+- **Responses transport metadata** (`adk-model`): SSE framing is preserved when the
+  response has no content type, and failed requests keep the HTTP status, provider
+  code and `Retry-After` hint.
