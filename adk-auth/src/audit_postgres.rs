@@ -54,16 +54,26 @@ impl PostgresAuditSink {
 
     /// Run database migrations to create the audit_events table.
     ///
-    /// Safe to call multiple times — uses `CREATE TABLE IF NOT EXISTS`.
-    /// Executes each statement individually since sqlx doesn't support
-    /// multi-statement queries.
+    /// Safe to call multiple times — uses `CREATE TABLE IF NOT EXISTS`. The
+    /// statements run in one transaction under an advisory lock, so concurrent
+    /// processes can call it at startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError::AuditError` when a statement fails.
     pub async fn migrate(&self) -> Result<(), AuthError> {
+        let fail = |e: sqlx::Error| AuthError::AuditError(format!("migration failed: {e}"));
+        let mut tx = self.pool.begin().await.map_err(fail)?;
+        // `CREATE TABLE IF NOT EXISTS` is not atomic: two concurrent creators both
+        // pass the existence check and one fails on the catalog's unique index.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('audit_events'))")
+            .execute(&mut *tx)
+            .await
+            .map_err(fail)?;
         for &statement in MIGRATION_STATEMENTS {
-            sqlx::query(statement)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| AuthError::AuditError(format!("migration failed: {e}")))?;
+            sqlx::query(statement).execute(&mut *tx).await.map_err(fail)?;
         }
+        tx.commit().await.map_err(fail)?;
         info!("audit_events table ready");
         Ok(())
     }
@@ -235,7 +245,9 @@ impl AuditSink for PostgresAuditSink {
                 .push_bind(value.as_str().unwrap_or("unknown").to_string());
         }
         if let Some(ref res) = filter.resource {
-            builder.push(" AND resource LIKE ").push_bind(format!("%{res}%"));
+            // `strpos` matches a literal substring, as `AuditFilter::matches` does;
+            // LIKE would read `%` and `_` in the filter as wildcards.
+            builder.push(" AND strpos(resource, ").push_bind(res).push(") > 0");
         }
         if let Some(ref rid) = filter.resource_id {
             builder.push(" AND resource_id = ").push_bind(rid);

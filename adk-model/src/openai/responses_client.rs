@@ -40,6 +40,8 @@ pub struct OpenAIResponsesClient {
     default_headers: http::HeaderMap,
     /// Generation request adapter, kept so rebuilding the transport preserves it.
     adapter: Option<super::RequestAdapter>,
+    /// Response header observer, kept so rebuilding the transport preserves it.
+    observer: Option<super::ResponseObserver>,
     /// API key for direct HTTP requests.
     api_key: String,
     /// Base URL for the API (defaults to `https://api.openai.com/v1`).
@@ -194,7 +196,7 @@ impl OpenAIResponsesClient {
         // ADK owns retry policy. async-openai's default executor has another
         // retry layer, including when this model's retries are disabled.
         let client =
-            with_transport(client, &transport, uses_max_reasoning, open_responses_mode, None);
+            with_transport(client, &transport, uses_max_reasoning, open_responses_mode, None, None);
 
         let base_url =
             config.base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string());
@@ -209,6 +211,7 @@ impl OpenAIResponsesClient {
             transport,
             default_headers: http::HeaderMap::new(),
             adapter: None,
+            observer: None,
             api_key: config.api_key,
             base_url,
             open_responses_mode,
@@ -258,6 +261,7 @@ impl OpenAIResponsesClient {
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
+            self.observer.clone(),
         );
         Ok(self)
     }
@@ -298,6 +302,44 @@ impl OpenAIResponsesClient {
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
+            self.observer.clone(),
+        );
+        self
+    }
+
+    /// Observe raw response headers for each Responses generation HTTP attempt.
+    ///
+    /// The observer runs before status handling or body consumption, including
+    /// for unsuccessful responses. It receives headers without interpreting them.
+    /// The callback should not perform I/O or retain sensitive headers.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig, ResponseObserver};
+    /// use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    ///
+    /// let observed = Arc::new(AtomicUsize::new(0));
+    /// let count = Arc::clone(&observed);
+    /// let observer: ResponseObserver = Arc::new(move |headers| {
+    ///     if headers.contains_key("x-request-id") {
+    ///         count.fetch_add(1, Ordering::Relaxed);
+    ///     }
+    /// });
+    /// let client = OpenAIResponsesClient::new(OpenAIResponsesConfig::new("sk-key", "gpt-5"))?
+    ///     .with_response_observer(observer);
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    #[must_use]
+    pub fn with_response_observer(mut self, observer: super::ResponseObserver) -> Self {
+        self.observer = Some(observer);
+        self.client = with_transport(
+            self.client,
+            &self.transport,
+            matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
+            self.open_responses_mode,
+            self.adapter.clone(),
+            self.observer.clone(),
         );
         self
     }
@@ -360,6 +402,7 @@ fn with_transport(
     uses_max_reasoning: bool,
     open_responses_mode: bool,
     adapter: Option<super::RequestAdapter>,
+    observer: Option<super::ResponseObserver>,
 ) -> async_openai::Client<async_openai::config::OpenAIConfig> {
     use async_openai::error::OpenAIError;
     use async_openai::middleware::{HttpRequestFactory, ReqwestService};
@@ -369,6 +412,7 @@ fn with_transport(
     let service = tower::service_fn(move |factory: HttpRequestFactory| {
         let transport = transport.clone();
         let adapter = adapter.clone();
+        let observer = observer.clone();
         async move {
             let streaming = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let requested_streaming = streaming.clone();
@@ -418,6 +462,11 @@ fn with_transport(
                 }
             });
             let response = transport.oneshot(rewritten).await?;
+            if response.url().path().ends_with("/responses")
+                && let Some(observer) = observer
+            {
+                observer(response.headers());
+            }
             normalize_responses_response(
                 response,
                 uses_max_reasoning,

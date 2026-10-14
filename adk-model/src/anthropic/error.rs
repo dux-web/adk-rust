@@ -69,7 +69,7 @@ impl From<AnthropicApiError> for AdkError {
         if let Some(ref rid) = err.request_id {
             adk_err = adk_err.with_request_id(rid.clone());
         }
-        adk_err
+        crate::error_metadata::with_code(adk_err, Some(&err.error_type))
     }
 }
 
@@ -160,7 +160,33 @@ mod tests {
         assert!(adk_err.to_string().contains("529"));
         assert_eq!(adk_err.details.upstream_status_code, Some(529));
         assert_eq!(adk_err.details.provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            adk_err.details.metadata.get("provider_error_code").and_then(serde_json::Value::as_str),
+            Some("overloaded_error")
+        );
         assert!(adk_err.is_retryable(), "529 should be retryable (Unavailable category)");
+    }
+
+    #[test]
+    fn excludes_invalid_provider_codes() {
+        let oversized = "x".repeat(129);
+        for error_type in ["", "bad code", "line\nbreak", oversized.as_str()] {
+            let error = AnthropicApiError {
+                error_type: error_type.to_string(),
+                message: "Bad request".to_string(),
+                status_code: 400,
+                request_id: Some("req_123".to_string()),
+            };
+            let display = error.to_string();
+            let mapped: AdkError = error.into();
+            assert_eq!(mapped.category, adk_core::ErrorCategory::InvalidInput);
+            assert_eq!(mapped.code, "model.anthropic.api_error");
+            assert_eq!(mapped.message, display);
+            assert_eq!(mapped.details.upstream_status_code, Some(400));
+            assert_eq!(mapped.details.request_id.as_deref(), Some("req_123"));
+            assert!(!mapped.is_retryable());
+            assert!(!mapped.details.metadata.contains_key("provider_error_code"));
+        }
     }
 
     #[test]
