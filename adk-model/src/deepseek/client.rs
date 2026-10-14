@@ -267,7 +267,10 @@ impl Llm for DeepSeekClient {
                             "model.deepseek.api_error",
                             format!("DeepSeek API error (HTTP {status}): {error_text}"),
                         ).with_upstream_status(status_code).with_provider("deepseek");
-                        return Err(crate::retry::with_retry_after(error, retry_after));
+                        return Err(crate::retry::with_retry_after(
+                            crate::error_metadata::from_body(error, &error_text),
+                            retry_after,
+                        ));
                     }
 
                     Ok(response)
