@@ -749,7 +749,10 @@ async fn send_request(
         )
         .with_upstream_status(status_code)
         .with_provider(provider_name);
-        return Err(crate::retry::with_retry_after(error, retry_after));
+        return Err(crate::retry::with_retry_after(
+            crate::error_metadata::from_body(error, &body),
+            retry_after,
+        ));
     }
 
     Ok(http_resp)
