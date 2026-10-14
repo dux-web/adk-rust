@@ -158,6 +158,11 @@ if let Some(grounding) = response.candidates.first()
             }
         }
     }
+    if let Some(html) = grounding.search_entry_point.as_ref()
+        .and_then(|entry| entry.rendered_content.as_deref())
+    {
+        println!("Search suggestions: {html}");
+    }
 }
 ```
 
