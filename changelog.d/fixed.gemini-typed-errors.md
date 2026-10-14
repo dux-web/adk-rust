@@ -1,0 +1,1 @@
+- **Gemini errors use typed response status** (`adk-model`): classify Studio and Vertex failures from their actual status instead of error text, and retain bounded provider error codes in metadata.
