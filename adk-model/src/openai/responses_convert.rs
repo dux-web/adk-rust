@@ -256,7 +256,7 @@ pub fn convert_tools(tools: &HashMap<String, serde_json::Value>) -> Result<Vec<T
                     name: name.clone(),
                     description,
                     parameters,
-                    strict: None,
+                    strict: Some(false),
                     defer_loading: None,
                 }))
             }
@@ -293,7 +293,7 @@ fn convert_native_tool(
                 name: name.to_string(),
                 description,
                 parameters,
-                strict: None,
+                strict: Some(false),
                 defer_loading: None,
             }))
         }
@@ -1077,6 +1077,81 @@ mod tests {
         assert_eq!(converted.len(), 1);
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
         assert_eq!(value["type"], "local_shell");
+    }
+
+    #[test]
+    fn ordinary_functions_disable_strict_defaults() {
+        let tools = HashMap::from([(
+            "lookup".to_string(),
+            serde_json::json!({"description": "Find a record"}),
+        )]);
+
+        let converted = convert_tools(&tools).expect("tool conversion should succeed");
+        let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["name"], "lookup");
+        assert_eq!(value["description"], "Find a record");
+        assert_eq!(value["strict"], false);
+    }
+
+    #[test]
+    fn optional_parameters_remain_optional() {
+        let parameters = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"}
+            },
+            "required": ["query"]
+        });
+        let tools = HashMap::from([(
+            "search".to_string(),
+            serde_json::json!({"parameters": parameters.clone()}),
+        )]);
+
+        let converted = convert_tools(&tools).expect("tool conversion should succeed");
+        let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
+        assert_eq!(value["strict"], false);
+        assert_eq!(value["parameters"], parameters);
+    }
+
+    #[test]
+    fn native_functions_keep_explicit_strictness() {
+        for strict in [true, false] {
+            let tools = HashMap::from([(
+                "native".to_string(),
+                serde_json::json!({
+                    "x-adk-openai-tool": {
+                        "type": "function",
+                        "name": "native",
+                        "parameters": {"type": "object", "properties": {}},
+                        "strict": strict
+                    }
+                }),
+            )]);
+
+            let converted = convert_tools(&tools).expect("native tool should convert");
+            let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
+            assert_eq!(value["type"], "function");
+            assert_eq!(value["strict"], strict);
+        }
+    }
+
+    #[test]
+    fn fallback_functions_disable_strict_defaults() {
+        let tools = HashMap::from([(
+            "lookup".to_string(),
+            serde_json::json!({
+                "parameters": {"type": "object", "properties": {}},
+                "x-adk-openai-tool": {"type": "unsupported_tool"}
+            }),
+        )]);
+
+        let converted = convert_tools(&tools).expect("fallback tool should convert");
+        let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["strict"], false);
+        assert_eq!(value["parameters"]["type"], "object");
     }
 
     #[test]
