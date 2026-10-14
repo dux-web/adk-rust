@@ -278,6 +278,7 @@ pub mod openrouter;
 /// Conversion outcomes for content parts sent to a provider.
 pub mod part_conversion;
 
+mod error_metadata;
 /// Canonical provider identifiers and metadata.
 pub mod provider;
 /// Retry logic with exponential backoff for transient provider errors.

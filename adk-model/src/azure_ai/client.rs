@@ -155,7 +155,10 @@ impl Llm for AzureAIClient {
                             "model.azure_ai.api_error",
                             format!("Azure AI error for endpoint={endpoint}, status={status}: {error_text}"),
                         ).with_upstream_status(status_code).with_provider("azure-ai");
-                        return Err(crate::retry::with_retry_after(error, retry_after));
+                        return Err(crate::error_metadata::from_body(
+                            crate::retry::with_retry_after(error, retry_after),
+                            &error_text,
+                        ));
                     }
 
                     Ok(resp)

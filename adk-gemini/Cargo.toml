@@ -238,14 +238,13 @@ version = "^0.3"
 
 [dependencies.google-cloud-aiplatform-v1]
 version = "1.9.0"
-features = ["prediction-service", "default-rustls-provider"]
+features = ["prediction-service"]
 default-features = false
 optional = true
 
 [dependencies.google-cloud-auth]
 version = "1.8.0"
 default-features = false
-features = ["default-rustls-provider"]
 optional = true
 
 [dependencies.google-cloud-gax]
@@ -267,7 +266,8 @@ features = [
     "http2",
     "json",
     "stream",
-    "rustls-tls"
+    "rustls-tls-webpki-roots-no-provider",
+    "rustls-tls-native-roots-no-provider"
 ]
 
 [dependencies.schemars]

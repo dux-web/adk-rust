@@ -749,7 +749,10 @@ async fn send_request(
         )
         .with_upstream_status(status_code)
         .with_provider(provider_name);
-        return Err(crate::retry::with_retry_after(error, retry_after));
+        return Err(crate::error_metadata::from_body(
+            crate::retry::with_retry_after(error, retry_after),
+            &body,
+        ));
     }
 
     Ok(http_resp)
@@ -982,6 +985,34 @@ impl Llm for OpenAICompatible {
                                 }
                             }
 
+                            // Emit reasoning before consuming a terminal delta.
+                            // Fallback to "reasoning" field for OpenRouter, Kilo Gateway, SambaNova, Cerebras, Groq
+                            let reasoning = delta.get("reasoning_content")
+                                .or_else(|| delta.get("reasoning"))
+                                .and_then(|v| v.as_str());
+                            if let Some(reasoning) = reasoning
+                                && !reasoning.is_empty() {
+                                    yield LlmResponse {
+                                        content: Some(Content {
+                                            role: "model".to_string(),
+                                            parts: vec![Part::Thinking {
+                                                thinking: reasoning.to_string(),
+                                                signature: None,
+                                            }],
+                                        }),
+                                        usage_metadata: None,
+                                        finish_reason: None,
+                                        citation_metadata: None,
+                                        partial: true,
+                                        turn_complete: false,
+                                        interrupted: false,
+                                        error_code: None,
+                                        error_message: None,
+                                        provider_metadata: None,
+                                        interaction_id: None,
+                                    };
+                                }
+
                             // Check for finish_reason → emit final response.
                             if let Some(ref fr) = finish_reason_str {
                                 let finish_reason = Some(parse_finish_reason(fr));
@@ -1068,34 +1099,6 @@ impl Llm for OpenAICompatible {
                                 }
                                 continue;
                             }
-
-                            // Emit partial reasoning_content as Part::Thinking.
-                            // Fallback to "reasoning" field for OpenRouter, Kilo Gateway, SambaNova, Cerebras, Groq
-                            let reasoning = delta.get("reasoning_content")
-                                .or_else(|| delta.get("reasoning"))
-                                .and_then(|v| v.as_str());
-                            if let Some(reasoning) = reasoning
-                                && !reasoning.is_empty() {
-                                    yield LlmResponse {
-                                        content: Some(Content {
-                                            role: "model".to_string(),
-                                            parts: vec![Part::Thinking {
-                                                thinking: reasoning.to_string(),
-                                                signature: None,
-                                            }],
-                                        }),
-                                        usage_metadata: None,
-                                        finish_reason: None,
-                                        citation_metadata: None,
-                                        partial: true,
-                                        turn_complete: false,
-                                        interrupted: false,
-                                        error_code: None,
-                                        error_message: None,
-                                        provider_metadata: None,
-                                        interaction_id: None,
-                                    };
-                                }
 
                             // Emit partial text content via tool call buffer.
                             // The buffer detects <tool_call> tags split across chunks
@@ -1212,6 +1215,10 @@ impl Llm for OpenAICompatible {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "openai_compatible/streaming_tests.rs"]
+mod streaming_tests;
 
 #[cfg(test)]
 mod tests {

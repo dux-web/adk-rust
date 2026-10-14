@@ -11,6 +11,52 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::TryStreamExt;
 
+fn response_modalities(config: &adk_core::GenerateContentConfig) -> Result<Option<Vec<String>>> {
+    config
+        .extensions
+        .get("gemini")
+        .and_then(|options| options.get("response_modalities"))
+        .map(|value| {
+            serde_json::from_value(value.clone())
+                .map_err(|_| adk_core::AdkError::model("invalid Gemini response modalities"))
+        })
+        .transpose()
+}
+
+#[cfg(test)]
+mod modality_tests {
+    use super::*;
+    use adk_core::GenerateContentConfig;
+
+    #[test]
+    fn forwards_declared_modalities() {
+        let mut config = GenerateContentConfig::default();
+        assert_eq!(response_modalities(&config).unwrap(), None);
+        config
+            .extensions
+            .insert("gemini".into(), serde_json::json!({"response_modalities":["TEXT", "IMAGE"]}));
+        let converted = adk_gemini::GenerationConfig {
+            response_modalities: response_modalities(&config).unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(converted).unwrap()["responseModalities"],
+            serde_json::json!(["TEXT", "IMAGE"]),
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_modalities() {
+        let mut config = GenerateContentConfig::default();
+        for value in [serde_json::json!("IMAGE"), serde_json::json!(["IMAGE", 1])] {
+            config
+                .extensions
+                .insert("gemini".into(), serde_json::json!({"response_modalities":value}));
+            assert!(response_modalities(&config).is_err());
+        }
+    }
+}
+
 #[cfg(feature = "gemini-interactions")]
 use super::interactions_target::InteractionTarget;
 
@@ -146,40 +192,55 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
     #[cfg(not(feature = "gemini-vertex"))]
     let transport_failure = false;
 
-    // Extract status code from BadResponse variant via Display output
-    // BadResponse format: "bad response from server; code {code}; description: ..."
-    let (category, code, status_code) = if message.contains("code 429")
-        || message.contains("RESOURCE_EXHAUSTED")
-        || message.contains("rate limit")
-    {
-        (ErrorCategory::RateLimited, "model.gemini.rate_limited", Some(429u16))
-    } else if message.contains("code 503") || message.contains("UNAVAILABLE") {
-        (ErrorCategory::Unavailable, "model.gemini.unavailable", Some(503))
-    } else if message.contains("code 529") || message.contains("OVERLOADED") {
-        (ErrorCategory::Unavailable, "model.gemini.overloaded", Some(529))
-    } else if message.contains("code 408")
-        || message.contains("DEADLINE_EXCEEDED")
-        || message.contains("TIMEOUT")
-    {
-        (ErrorCategory::Timeout, "model.gemini.timeout", Some(408))
-    } else if message.contains("code 401") || message.contains("Invalid API key") {
-        (ErrorCategory::Unauthorized, "model.gemini.unauthorized", Some(401))
-    } else if message.contains("code 400") {
-        (ErrorCategory::InvalidInput, "model.gemini.bad_request", Some(400))
-    } else if message.contains("code 404") {
-        (ErrorCategory::NotFound, "model.gemini.not_found", Some(404))
-    } else if message.contains("invalid generation config") {
-        (ErrorCategory::InvalidInput, "model.gemini.invalid_config", None)
-    } else if transport_failure {
-        (ErrorCategory::Unavailable, "model.gemini.unavailable", None)
-    } else {
-        (ErrorCategory::Internal, "model.gemini.internal", None)
+    // Only a transport status identifies a provider rejection; error text can
+    // contain unrelated status-like strings.
+    let status_code = match e {
+        adk_gemini::ClientError::BadResponse { code, .. } => Some(*code),
+        #[cfg(feature = "gemini-vertex")]
+        adk_gemini::ClientError::GoogleCloudRequest { source } => source.http_status_code(),
+        _ => None,
+    };
+    let (category, code) = match status_code {
+        Some(401) => (ErrorCategory::Unauthorized, "model.gemini.unauthorized"),
+        Some(403) => (ErrorCategory::Forbidden, "model.gemini.forbidden"),
+        Some(404) => (ErrorCategory::NotFound, "model.gemini.not_found"),
+        Some(408 | 504) => (ErrorCategory::Timeout, "model.gemini.timeout"),
+        Some(429) => (ErrorCategory::RateLimited, "model.gemini.rate_limited"),
+        Some(529) => (ErrorCategory::Unavailable, "model.gemini.overloaded"),
+        Some(400..=499) => (ErrorCategory::InvalidInput, "model.gemini.bad_request"),
+        Some(500..=599) => (ErrorCategory::Unavailable, "model.gemini.unavailable"),
+        None if message.contains("invalid generation config") => {
+            (ErrorCategory::InvalidInput, "model.gemini.invalid_config")
+        }
+        None if transport_failure => (ErrorCategory::Unavailable, "model.gemini.unavailable"),
+        _ => (ErrorCategory::Internal, "model.gemini.internal"),
     };
 
     let mut err = adk_core::AdkError::new(ErrorComponent::Model, category, code, message)
         .with_provider("gemini");
     if let Some(sc) = status_code {
         err = err.with_upstream_status(sc);
+    }
+    if let adk_gemini::ClientError::BadResponse { description: Some(body), .. } = e {
+        err = crate::error_metadata::from_body(err, body);
+    }
+    #[cfg(feature = "gemini-vertex")]
+    if let adk_gemini::ClientError::GoogleCloudRequest { source } = e {
+        if let Some(body) = source.http_payload().and_then(|body| std::str::from_utf8(body).ok()) {
+            err = crate::error_metadata::from_body(err, body);
+        }
+        if let Some(status) = source.status() {
+            for detail in &status.details {
+                let Ok(detail) = serde_json::to_value(detail) else { continue };
+                if detail["@type"] != "type.googleapis.com/google.rpc.ErrorInfo" {
+                    continue;
+                }
+                err = crate::error_metadata::with_code(err, detail["reason"].as_str());
+                if err.details.metadata.contains_key("provider_error_code") {
+                    break;
+                }
+            }
+        }
     }
     err
 }
@@ -1099,6 +1160,20 @@ impl GeminiModel {
     ) -> Result<LlmResponseStream> {
         let mut builder = self.client.generate_content();
 
+        let instructions = req
+            .contents
+            .iter()
+            .filter(|content| content.role == "system")
+            .flat_map(|content| &content.parts)
+            .filter_map(|part| match part {
+                Part::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !instructions.is_empty() {
+            builder = builder.with_system_instruction(instructions.join("\n"));
+        }
+
         // Build a map of function_name → thought_signature from FunctionCall parts
         // in model content. Gemini 3.x requires thought_signature on FunctionResponse
         // parts when thinking is active, but adk_core::Part::FunctionResponse doesn't
@@ -1315,6 +1390,7 @@ impl GeminiModel {
 
         // Add generation config
         if let Some(config) = req.config {
+            let response_modalities = response_modalities(&config)?;
             let has_schema = config.response_schema.is_some();
             let gen_config = adk_gemini::GenerationConfig {
                 temperature: config.temperature,
@@ -1328,6 +1404,7 @@ impl GeminiModel {
                     None
                 },
                 thinking_config: self.thinking_config.clone(),
+                response_modalities,
                 ..Default::default()
             };
             builder = builder.with_generation_config(gen_config);
@@ -2034,6 +2111,78 @@ mod tests {
         },
         time::Duration,
     };
+
+    #[test]
+    fn preserves_structured_provider_error_codes() {
+        for (body, expected) in [
+            (
+                serde_json::json!({"error":{"code":"unsupported_capability","status":"INVALID_ARGUMENT","message":"Fixture request rejected"}}),
+                "unsupported_capability",
+            ),
+            (
+                serde_json::json!({"error":{"code":400,"status":"UNSUPPORTED_CAPABILITY"}}),
+                "UNSUPPORTED_CAPABILITY",
+            ),
+            (
+                serde_json::json!({"error":{"code":"", "status":"INVALID_ARGUMENT"}}),
+                "INVALID_ARGUMENT",
+            ),
+        ] {
+            let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+                code: 400,
+                description: Some(body.to_string()),
+            });
+            assert_eq!(error.details.metadata.len(), 1);
+            assert_eq!(error.details.metadata["provider_error_code"], expected);
+            assert_eq!(error.details.upstream_status_code, Some(400));
+            assert_eq!(error.category, ErrorCategory::InvalidInput);
+            assert_eq!(error.code, "model.gemini.bad_request");
+            assert!(std::error::Error::source(&error).is_none());
+        }
+    }
+
+    #[test]
+    fn trusts_transport_status_not_provider_text() {
+        for (status, category) in [
+            (403, ErrorCategory::Forbidden),
+            (500, ErrorCategory::Unavailable),
+            (422, ErrorCategory::InvalidInput),
+            (405, ErrorCategory::InvalidInput),
+            (501, ErrorCategory::Unavailable),
+        ] {
+            let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+                code: status,
+                description: Some(serde_json::json!({"error":{"code":"unsupported_capability", "message":"code 400; rate limit; UNAVAILABLE"}}).to_string()),
+            });
+            assert_eq!(error.details.upstream_status_code, Some(status));
+            assert_eq!(error.category, category);
+            assert_eq!(error.details.metadata["provider_error_code"], "unsupported_capability");
+        }
+    }
+
+    #[test]
+    fn ignores_unstructured_provider_error_codes() {
+        for description in [
+            None,
+            Some("unsupported_capability".into()),
+            Some(serde_json::json!({"error":{"code":400,"message":"unsupported_capability"}}).to_string()),
+            Some(serde_json::json!({"error":{"code":"unsupported capability"}}).to_string()),
+            Some(serde_json::json!({"error":{"code":"https://example.test"}}).to_string()),
+            Some(serde_json::json!({"error":{"code":"x".repeat(129)}}).to_string()),
+            Some(serde_json::json!({"error":{"code":"unsupported_capability","message":"x".repeat(64 * 1024)}}).to_string()),
+        ] {
+            let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+                code: 400,
+                description,
+            });
+            assert!(error.details.metadata.is_empty());
+            assert_eq!(error.details.upstream_status_code, Some(400));
+        }
+        let error = gemini_error_to_adk(&adk_gemini::ClientError::MissingResponseHeader {
+            header: "unsupported_capability".into(),
+        });
+        assert!(error.details.metadata.is_empty());
+    }
 
     #[test]
     fn env_flag_truthy_accepts_one_and_case_insensitive_true() {

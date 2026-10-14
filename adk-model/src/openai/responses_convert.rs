@@ -256,7 +256,7 @@ pub fn convert_tools(tools: &HashMap<String, serde_json::Value>) -> Result<Vec<T
                     name: name.clone(),
                     description,
                     parameters,
-                    strict: None,
+                    strict: Some(false),
                     defer_loading: None,
                 }))
             }
@@ -293,7 +293,7 @@ fn convert_native_tool(
                 name: name.to_string(),
                 description,
                 parameters,
-                strict: None,
+                strict: Some(false),
                 defer_loading: None,
             }))
         }
@@ -611,7 +611,13 @@ pub fn from_response(response: &Response) -> LlmResponse {
             continue;
         }
         for content in &message.content {
-            let OutputMessageContent::OutputText(text) = content else { continue };
+            let text = match content {
+                OutputMessageContent::OutputText(text) => text,
+                OutputMessageContent::Refusal(refusal) => {
+                    offset += refusal.refusal.chars().count();
+                    continue;
+                }
+            };
             let length = text.text.chars().count();
             for annotation in &text.annotations {
                 let Annotation::UrlCitation(citation) = annotation else { continue };
@@ -662,7 +668,7 @@ pub fn from_response(response: &Response) -> LlmResponse {
 
 /// Convert a single `OutputItem` to zero or more ADK `Part`s.
 ///
-/// - `Message` → `Part::Text` for each non-empty text content
+/// - `Message` → `Part::Text` for each non-empty text or refusal
 /// - `Reasoning` → `Part::Thinking` with concatenated summary text
 /// - `FunctionCall` → `Part::FunctionCall` with parsed JSON args
 /// - Other variants (WebSearchCall, FileSearchCall, etc.) → empty vec (handled in provider_metadata)
@@ -685,6 +691,9 @@ fn output_item_to_parts(item: &OutputItem) -> Result<Vec<Part>, String> {
             .filter_map(|c| match c {
                 OutputMessageContent::OutputText(t) if !t.text.is_empty() => {
                     Some(Part::Text { text: t.text.clone() })
+                }
+                OutputMessageContent::Refusal(r) if !r.refusal.is_empty() => {
+                    Some(Part::Text { text: r.refusal.clone() })
                 }
                 _ => None,
             })
@@ -1052,6 +1061,84 @@ mod tests {
         assert_eq!(converted.len(), 1);
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
         assert_eq!(value["type"], "local_shell");
+    }
+
+    mod tool_conversion {
+        use super::*;
+
+        fn parameters() -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            })
+        }
+
+        #[test]
+        fn ordinary_preserves_optional_parameters() {
+            let parameters = parameters();
+            let declaration = serde_json::json!({
+                "description": "Search records",
+                "parameters": parameters
+            });
+            let tools = HashMap::from([("search".to_string(), declaration.clone())]);
+            let converted = convert_tools(&tools).expect("tool conversion should succeed");
+            let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
+
+            assert_eq!(value["type"], "function");
+            assert_eq!(value["name"], "search");
+            assert_eq!(value["description"], declaration["description"]);
+            assert_eq!(value["parameters"], parameters);
+            assert_eq!(value["strict"], false);
+            assert_eq!(tools["search"], declaration);
+        }
+
+        #[test]
+        fn unknown_native_preserves_optional_parameters() {
+            let parameters = parameters();
+            let declaration = serde_json::json!({
+                "description": "Search records",
+                "parameters": parameters,
+                "x-adk-openai-tool": {"type": "skill"}
+            });
+            let tools = HashMap::from([("search".to_string(), declaration.clone())]);
+            let converted = convert_tools(&tools).expect("tool conversion should succeed");
+            let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
+
+            assert_eq!(value["type"], "function");
+            assert_eq!(value["name"], "search");
+            assert_eq!(value["description"], declaration["description"]);
+            assert_eq!(value["parameters"], parameters);
+            assert_eq!(value["strict"], false);
+            assert_eq!(tools["search"], declaration);
+        }
+
+        #[test]
+        fn native_preserves_strictness() {
+            for strict in [Some(true), Some(false), None] {
+                let mut descriptor = serde_json::json!({
+                    "type": "function",
+                    "name": "native_search",
+                    "description": "Search records",
+                    "parameters": parameters()
+                });
+                if let Some(strict) = strict {
+                    descriptor["strict"] = serde_json::json!(strict);
+                }
+                let tools = HashMap::from([(
+                    "search".to_string(),
+                    serde_json::json!({"x-adk-openai-tool": descriptor}),
+                )]);
+                let converted = convert_tools(&tools).expect("tool conversion should succeed");
+                let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
+
+                assert_eq!(value, descriptor);
+            }
+        }
     }
 
     #[test]

@@ -22,10 +22,10 @@ futures.workspace = true
 async-stream.workspace = true
 serde_json.workspace = true
 serde = { workspace = true }
-async-openai = { version = "0.41", optional = true, default-features = false, features = ["rustls", "chat-completion", "responses", "middleware"] }
+async-openai = { version = "0.41", optional = true, default-features = false, features = ["rustls-no-provider", "chat-completion", "responses", "middleware"] }
 adk-anthropic = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
-reqwest-openai = { package = "reqwest", version = "0.13", optional = true, default-features = false, features = ["rustls", "stream"] }
+reqwest-openai = { package = "reqwest", version = "0.13", optional = true, default-features = false, features = ["rustls-no-provider", "stream"] }
 http = { version = "1", optional = true }
 tower = { version = "0.5", optional = true, features = ["util"] }
 tokio-tungstenite = { workspace = true, optional = true }
@@ -53,7 +53,7 @@ openai-conversations = ["openai"]
 # adk-server directly for webhook verification/handling.
 openai-responses-full = ["openai-ws", "openai-conversations"]
 xai = ["openai"]
-anthropic = ["dep:adk-anthropic"]
+anthropic = ["dep:adk-anthropic", "dep:http"]
 opencode = ["openai", "anthropic", "gemini"]
 deepseek = ["dep:reqwest"]
 ollama = ["dep:ollama-rs", "dep:schemars"]
@@ -70,6 +70,7 @@ azure-ai = ["dep:reqwest"]
 all-providers = ["gemini", "openai", "anthropic", "deepseek", "ollama", "groq", "openrouter", "opencode", "bedrock", "azure-ai"]
 
 [dev-dependencies]
+rustls = { workspace = true }
 proptest = "1.5"
 tokio = { workspace = true, features = ["rt", "macros"] }
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }

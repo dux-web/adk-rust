@@ -15,6 +15,7 @@ use wiremock::{
 
 #[tokio::test]
 async fn request_customization_preserves_disabled_retries() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     for responses in [false, true] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -37,7 +38,8 @@ async fn request_customization_preserves_disabled_retries() {
                 )
                 .unwrap()
                 .with_retry_config(RetryConfig::disabled())
-                .with_request_adapter(adapter),
+                .with_request_adapter(adapter)
+                .unwrap(),
             )
         } else {
             Box::new(
@@ -66,6 +68,7 @@ async fn request_customization_preserves_disabled_retries() {
 
 #[tokio::test]
 async fn default_headers_keep_max_reasoning_and_adapter_in_either_order() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     for headers_first in [true, false] {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -89,9 +92,9 @@ async fn default_headers_keep_max_reasoning_and_adapter_in_either_order() {
         .unwrap()
         .with_retry_config(RetryConfig::disabled());
         let client = if headers_first {
-            client.with_default_headers(headers).unwrap().with_request_adapter(adapter)
+            client.with_default_headers(headers).unwrap().with_request_adapter(adapter).unwrap()
         } else {
-            client.with_request_adapter(adapter).with_default_headers(headers).unwrap()
+            client.with_request_adapter(adapter).unwrap().with_default_headers(headers).unwrap()
         };
         let request = LlmRequest::new("fixture", vec![Content::new("user").with_text("Hello")]);
         let result =
