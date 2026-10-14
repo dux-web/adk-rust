@@ -19,6 +19,9 @@ pub enum WebSearchErrorCode {
 
     /// The query provided to the web search tool is too long.
     QueryTooLong,
+
+    /// The search request exceeds the provider's size limit.
+    RequestTooLarge,
 }
 
 impl fmt::Display for WebSearchErrorCode {
@@ -29,6 +32,7 @@ impl fmt::Display for WebSearchErrorCode {
             WebSearchErrorCode::MaxUsesExceeded => write!(f, "max_uses_exceeded"),
             WebSearchErrorCode::TooManyRequests => write!(f, "too_many_requests"),
             WebSearchErrorCode::QueryTooLong => write!(f, "query_too_long"),
+            WebSearchErrorCode::RequestTooLarge => write!(f, "request_too_large"),
         }
     }
 }
@@ -82,6 +86,17 @@ impl WebSearchToolResultError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_size_error_round_trips() {
+        let wire = serde_json::json!({
+            "type": "web_search_tool_result_error", "error_code": "request_too_large"
+        });
+        let error: WebSearchToolResultError = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(error.error_code, WebSearchErrorCode::RequestTooLarge);
+        assert_eq!(error.error_code.to_string(), "request_too_large");
+        assert_eq!(serde_json::to_value(error).unwrap(), wire);
+    }
 
     #[test]
     fn serialization() {
