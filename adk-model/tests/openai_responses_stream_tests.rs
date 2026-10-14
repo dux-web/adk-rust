@@ -22,6 +22,44 @@ fn completion(output: Value) -> Value {
     })
 }
 
+fn message(id: &str, content: Value) -> Value {
+    json!({
+        "type": "message", "id": id, "role": "assistant", "status": "completed",
+        "content": content
+    })
+}
+
+fn text(value: &str) -> Value {
+    json!({"type": "output_text", "text": value, "annotations": []})
+}
+
+fn delta(id: &str, output_index: u32, content_index: u32, value: &str) -> Value {
+    json!({
+        "type": "response.output_text.delta", "sequence_number": 1, "item_id": id,
+        "output_index": output_index, "content_index": content_index, "delta": value
+    })
+}
+
+fn done(id: &str, output_index: u32, content_index: u32, value: &str) -> Value {
+    json!({
+        "type": "response.output_text.done", "sequence_number": 2, "item_id": id,
+        "output_index": output_index, "content_index": content_index,
+        "text": value, "logprobs": []
+    })
+}
+
+fn text_parts(results: &[LlmResponse]) -> Vec<&str> {
+    results
+        .iter()
+        .filter_map(|response| response.content.as_ref())
+        .flat_map(|content| &content.parts)
+        .filter_map(|part| match part {
+            Part::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn responses(events: &[Value], open_responses_mode: bool, prefix: &str) -> Vec<LlmResponse> {
     try_responses(events, open_responses_mode, prefix).await.expect("SSE events must deserialize")
 }
@@ -211,4 +249,330 @@ async fn compatible_stream_restores_only_the_matching_tools_arguments() {
             },
         ]
     );
+}
+
+mod output_recovery {
+    use super::*;
+
+    #[tokio::test]
+    async fn completed_text_without_deltas_is_visible() {
+        for compatible in [false, true] {
+            let results = responses(
+                &[completion(json!([
+                    message("first", json!([text("First")])),
+                    message("second", json!([text("Second")]))
+                ]))],
+                compatible,
+                "",
+            )
+            .await;
+            assert_eq!(text_parts(&results), ["First", "Second"]);
+            assert!(results[0].turn_complete);
+            assert_eq!(results[0].usage_metadata.as_ref().unwrap().total_token_count, 120);
+        }
+    }
+
+    #[tokio::test]
+    async fn final_events_emit_only_unseen_suffixes() {
+        for compatible in [false, true] {
+            let item = message("msg", json!([text("Answer")]));
+            let results = responses(
+                &[
+                    delta("msg", 0, 0, "Ans"),
+                    done("msg", 0, 0, "Answer"),
+                    done("msg", 0, 0, "Answer"),
+                    json!({"type":"response.content_part.done", "sequence_number":3,
+                        "item_id":"msg", "output_index":0, "content_index":0,
+                        "part":text("Answer")}),
+                    json!({"type":"response.output_item.done", "sequence_number":4,
+                        "output_index":0, "item":item}),
+                    completion(json!([item])),
+                ],
+                compatible,
+                "",
+            )
+            .await;
+            assert_eq!(text_parts(&results), ["Ans", "wer"]);
+            assert!(results.last().unwrap().content.is_none());
+            assert_eq!(
+                results
+                    .last()
+                    .unwrap()
+                    .usage_metadata
+                    .as_ref()
+                    .unwrap()
+                    .cache_read_input_token_count,
+                Some(42)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn done_recovers_missing_terminal_output() {
+        for compatible in [false, true] {
+            let item = json!({"type":"function_call", "id":"fc_a", "call_id":"call_a",
+                "name":"read_file", "arguments":r#"{"path":"first.txt"}"#, "status":"completed"});
+            let results = responses(
+                &[
+                    json!({"type":"response.output_item.done", "sequence_number":1,
+                        "output_index":0, "item":item}),
+                    json!({"type":"response.output_item.done", "sequence_number":2,
+                        "output_index":0, "item":item}),
+                    completion(json!([])),
+                ],
+                compatible,
+                "",
+            )
+            .await;
+            let terminal = results.last().unwrap();
+            assert_eq!(terminal.provider_metadata.as_ref().unwrap()["content_complete"], true);
+            assert_eq!(
+                terminal.content.as_ref().unwrap().parts,
+                [Part::FunctionCall {
+                    id: Some("call_a".into()),
+                    name: "read_file".into(),
+                    args: json!({"path":"first.txt"}),
+                    thought_signature: None,
+                }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_terminal_output_supersedes_done_items() {
+        for compatible in [false, true] {
+            let item = json!({"type":"function_call", "id":"fc_a", "call_id":"call_a",
+                "name":"read_file", "arguments":"{}", "status":"completed"});
+            let results = responses(
+                &[
+                    json!({"type":"response.output_item.done", "sequence_number":1,
+                        "output_index":0, "item":item}),
+                    completion(json!([message("answer", json!([text("No tool needed")]))])),
+                ],
+                compatible,
+                "",
+            )
+            .await;
+            assert_eq!(text_parts(&results), ["No tool needed"]);
+            assert!(
+                !results
+                    .last()
+                    .unwrap()
+                    .content
+                    .as_ref()
+                    .unwrap()
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part, Part::FunctionCall { .. }))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn corrected_and_unfinished_text_use_authoritative_output() {
+        for compatible in [false, true] {
+            let corrected = responses(
+                &[
+                    delta("msg", 0, 0, "Draft"),
+                    done("msg", 0, 0, "Final"),
+                    completion(json!([message("msg", json!([text("Final")]))])),
+                ],
+                compatible,
+                "",
+            )
+            .await;
+            assert_eq!(text_parts(&corrected), ["Draft", "Final"]);
+            let terminal = corrected.last().unwrap();
+            assert_eq!(terminal.provider_metadata.as_ref().unwrap()["content_complete"], true);
+            assert_eq!(
+                terminal.content.as_ref().unwrap().parts,
+                [Part::Text { text: "Final".into() }]
+            );
+
+            let unfinished =
+                responses(&[delta("msg", 0, 0, "Draft"), completion(json!([]))], compatible, "")
+                    .await;
+            let terminal = unfinished.last().unwrap();
+            assert_eq!(terminal.provider_metadata.as_ref().unwrap()["content_complete"], true);
+            assert!(terminal.content.as_ref().unwrap().parts.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn out_of_order_parts_use_terminal_order() {
+        for compatible in [false, true] {
+            let results = responses(
+                &[
+                    delta("second", 1, 0, "Second"),
+                    delta("first", 0, 0, "First"),
+                    completion(json!([
+                        message("first", json!([text("First")])),
+                        message("second", json!([text("Second")]))
+                    ])),
+                ],
+                compatible,
+                "",
+            )
+            .await;
+            let terminal = results.last().unwrap();
+            assert_eq!(terminal.provider_metadata.as_ref().unwrap()["content_complete"], true);
+            assert_eq!(
+                terminal.content.as_ref().unwrap().parts,
+                [Part::Text { text: "First".into() }, Part::Text { text: "Second".into() },]
+            );
+        }
+    }
+}
+
+mod refusal_recovery {
+    use super::*;
+
+    #[tokio::test]
+    async fn repeated_payloads_emit_only_unseen_suffixes() {
+        for compatible in [false, true] {
+            let refusal = json!({"type":"refusal", "refusal":"I cannot help"});
+            let item = message("msg", json!([refusal]));
+            let results = responses(
+                &[
+                    json!({"type":"response.refusal.delta", "sequence_number":1,
+                        "item_id":"msg", "output_index":0, "content_index":0,
+                        "delta":"I cannot"}),
+                    json!({"type":"response.refusal.done", "sequence_number":2,
+                        "item_id":"msg", "output_index":0, "content_index":0,
+                        "refusal":"I cannot help"}),
+                    json!({"type":"response.content_part.done", "sequence_number":3,
+                        "item_id":"msg", "output_index":0, "content_index":0,
+                        "part":refusal}),
+                    json!({"type":"response.output_item.done", "sequence_number":4,
+                        "output_index":0, "item":item}),
+                    completion(json!([item])),
+                ],
+                compatible,
+                "",
+            )
+            .await;
+            assert_eq!(text_parts(&results), ["I cannot", " help"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_refusal_keeps_following_citation_offsets() {
+        for compatible in [false, true] {
+            let results = responses(
+                &[completion(json!([message(
+                    "msg",
+                    json!([
+                        {"type":"refusal", "refusal":"Cannot"},
+                        {"type":"output_text", "text":"Details", "annotations":[{
+                            "type":"url_citation", "url":"https://example.test", "title":"Example",
+                            "start_index":0, "end_index":7
+                        }]}
+                    ])
+                )]))],
+                compatible,
+                "",
+            )
+            .await;
+            assert_eq!(text_parts(&results), ["Cannot", "Details"]);
+            let citation = &results[0].citation_metadata.as_ref().unwrap().citation_sources[0];
+            assert_eq!((citation.start_index, citation.end_index), (Some(6), Some(13)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_summary_done_emits_only_unseen_text() {
+    for compatible in [false, true] {
+        let item = json!({"type":"reasoning", "id":"rs", "status":"completed", "summary":[
+            {"type":"summary_text", "text":"Thinking"},
+            {"type":"summary_text", "text":"More"}
+        ]});
+        let results = responses(
+            &[
+                json!({"type":"response.reasoning_summary_text.delta", "sequence_number":1,
+                    "item_id":"rs", "output_index":0, "summary_index":0, "delta":"Think"}),
+                json!({"type":"response.reasoning_summary_text.done", "sequence_number":2,
+                    "item_id":"rs", "output_index":0, "summary_index":0, "text":"Thinking"}),
+                json!({"type":"response.reasoning_summary_part.done", "sequence_number":3,
+                    "item_id":"rs", "output_index":0, "summary_index":0,
+                    "part":{"type":"summary_text", "text":"Thinking"}}),
+                json!({"type":"response.output_item.done", "sequence_number":4,
+                    "output_index":0, "item":item}),
+                completion(json!([item, message("msg", json!([text("Answer")]))])),
+            ],
+            compatible,
+            "",
+        )
+        .await;
+        let thinking = results
+            .iter()
+            .filter_map(|response| response.content.as_ref())
+            .flat_map(|content| &content.parts)
+            .filter_map(|part| match part {
+                Part::Thinking { thinking, .. } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(thinking, ["Think", "ing", "More"]);
+        assert_eq!(text_parts(&results), ["Answer"]);
+    }
+}
+
+#[tokio::test]
+async fn native_tool_requests_stream_and_preserve_final_call() {
+    for compatible in [false, true] {
+        let server = MockServer::start().await;
+        let tool = json!({
+            "type":"web_search_call", "id":"ws_1", "status":"completed",
+            "action":{"type":"search", "query":"rust"}
+        });
+        let body = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\n",
+            json!({"type":"response.output_item.added", "sequence_number":0,
+                "output_index":0, "item":{"type":"web_search_call", "id":"ws_1",
+                "status":"in_progress"}}),
+            json!({"type":"response.web_search_call.searching", "sequence_number":1,
+                "output_index":0, "item_id":"ws_1"}),
+            json!({"type":"response.output_item.done", "sequence_number":2,
+                "output_index":0, "item":tool}),
+            completion(json!([tool, message("answer", json!([text("Found results")]))]))
+        );
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = OpenAIResponsesClient::new(
+            OpenAIResponsesConfig::new("test-key", "test-model")
+                .with_base_url(server.uri())
+                .with_open_responses_mode(compatible),
+        )
+        .unwrap();
+        let mut request =
+            LlmRequest::new("test-model", vec![Content::new("user").with_text("Search")]);
+        request.tools.insert("search".into(), json!({"x-adk-openai-tool":{"type":"web_search"}}));
+        let results = client
+            .generate_content(request, true)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let sent = server.received_requests().await.unwrap();
+        let request_body: Value = serde_json::from_slice(&sent[0].body).unwrap();
+        assert_eq!(request_body["stream"], true);
+        assert_eq!(results.len(), 1);
+        let terminal = &results[0];
+        assert!(terminal.turn_complete);
+        assert_eq!(terminal.provider_metadata.as_ref().unwrap()["content_complete"], true);
+        assert!(matches!(
+            &terminal.content.as_ref().unwrap().parts[0],
+            Part::ServerToolCall { .. }
+        ));
+        assert_eq!(
+            terminal.content.as_ref().unwrap().parts[1],
+            Part::Text { text: "Found results".into() }
+        );
+    }
 }

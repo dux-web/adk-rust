@@ -4,12 +4,16 @@ use super::config::{OpenAIReasoningEffort, OpenAIResponsesConfig, ReasoningSumma
 use super::responses_convert;
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
 use adk_core::{
-    AdkError, Content, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponse,
-    LlmResponseStream, Part,
+    AdkError, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponse, LlmResponseStream,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
+
+#[path = "responses_stream.rs"]
+mod stream;
+
+use stream::StreamState;
 
 /// Client for the OpenAI Responses API (`/responses` endpoint).
 ///
@@ -48,79 +52,6 @@ pub struct OpenAIResponsesClient {
     /// When `true`, relaxes strict OpenAI field validation and allows
     /// connecting to Open Responses-compatible endpoints without an OpenAI API key.
     open_responses_mode: bool,
-}
-
-#[derive(Default)]
-struct StreamPhases {
-    commentary: std::collections::HashSet<String>,
-}
-
-impl StreamPhases {
-    fn commentary(
-        &mut self,
-        event: &async_openai::types::responses::ResponseStreamEvent,
-    ) -> Option<LlmResponse> {
-        use async_openai::types::responses::{MessagePhase, OutputItem, ResponseStreamEvent};
-        match event {
-            ResponseStreamEvent::ResponseOutputItemAdded(event) => {
-                if let OutputItem::Message(message) = &event.item
-                    && message.phase == Some(MessagePhase::Commentary)
-                {
-                    self.commentary.insert(message.id.clone());
-                }
-                None
-            }
-            ResponseStreamEvent::ResponseOutputTextDelta(event)
-                if self.commentary.contains(&event.item_id) =>
-            {
-                Some(LlmResponse {
-                    content: Some(Content {
-                        role: "model".into(),
-                        parts: vec![Part::ServerToolCall {
-                            server_tool_call: serde_json::json!({
-                                "type": "message", "role": "assistant", "id": event.item_id,
-                                "phase": "commentary", "status": "in_progress",
-                                "content": [{"type": "output_text", "text": event.delta, "annotations": []}]
-                            }),
-                        }],
-                    }),
-                    partial: true,
-                    turn_complete: false,
-                    ..Default::default()
-                })
-            }
-            _ => None,
-        }
-    }
-
-    fn complete(&self, mut response: LlmResponse) -> LlmResponse {
-        if self.commentary.is_empty() {
-            return completed_stream_response(response);
-        }
-        // The final native messages replace their streamed fragments in history.
-        response.provider_metadata.get_or_insert_with(|| serde_json::json!({}))["content_complete"] =
-            serde_json::json!(true);
-        response
-    }
-}
-
-fn completed_stream_response(full: LlmResponse) -> LlmResponse {
-    let trailing_parts = full
-        .content
-        .as_ref()
-        .map(|content| {
-            content
-                .parts
-                .iter()
-                .filter(|part| !matches!(part, Part::Text { .. } | Part::Thinking { .. }))
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let content = (!trailing_parts.is_empty())
-        .then_some(Content { role: "model".to_string(), parts: trailing_parts });
-
-    LlmResponse { content, partial: false, turn_complete: true, ..full }
 }
 
 impl OpenAIResponsesClient {
@@ -886,9 +817,9 @@ impl Llm for OpenAIResponsesClient {
             self.reasoning_summary,
         )?;
 
-        let uses_native_tools = responses_convert::request_uses_native_tools(&request);
+        let native_tools = responses_convert::request_uses_native_tools(&request);
 
-        if stream && !uses_native_tools {
+        if stream {
             // Explicitly set stream=true — async-openai's create_stream() does NOT
             // set this field automatically, causing the server to return JSON instead
             // of text/event-stream, which triggers an InvalidContentType error.
@@ -905,88 +836,51 @@ impl Llm for OpenAIResponsesClient {
                 })
                 .await?;
 
-            let mut phases = StreamPhases::default();
-            let response_stream = event_stream.filter_map(move |event_result| {
-                futures::future::ready(match event_result {
-                    Ok(event) => {
-                        if let Some(response) = phases.commentary(&event) {
-                            return futures::future::ready(Some(Ok(response)));
+            let mut state = StreamState::new(native_tools);
+            let response_stream = try_stream! {
+                futures::pin_mut!(event_stream);
+                while let Some(event_result) = event_stream.next().await {
+                    let event = event_result.map_err(map_openai_error)?;
+                    if let Some(response) = state.partial(&event) {
+                        yield response;
+                        continue;
+                    }
+                    use async_openai::types::responses::ResponseStreamEvent;
+                    match event {
+                        ResponseStreamEvent::ResponseCompleted(evt) => {
+                            yield state.complete(&evt.response);
+                            break;
                         }
-                        use async_openai::types::responses::ResponseStreamEvent;
-                        match event {
-                            ResponseStreamEvent::ResponseOutputTextDelta(evt) => {
-                                Some(Ok(LlmResponse {
-                                    content: Some(Content {
-                                        role: "model".to_string(),
-                                        parts: vec![Part::Text { text: evt.delta }],
-                                    }),
-                                    partial: true,
-                                    turn_complete: false,
-                                    ..Default::default()
-                                }))
-                            }
-
-                            ResponseStreamEvent::ResponseReasoningSummaryTextDelta(evt) => {
-                                Some(Ok(LlmResponse {
-                                    content: Some(Content {
-                                        role: "model".to_string(),
-                                        parts: vec![Part::Thinking {
-                                            thinking: evt.delta,
-                                            signature: None,
-                                        }],
-                                    }),
-                                    partial: true,
-                                    turn_complete: false,
-                                    ..Default::default()
-                                }))
-                            }
-
-                            // ResponseCompleted carries the authoritative response with
-                            // correct function call names, usage, and finish reason.
-                            // We extract only function calls (text was already streamed
-                            // via delta events) and mark the turn complete.
-                            ResponseStreamEvent::ResponseCompleted(evt) => {
-                                let full = responses_convert::from_response(&evt.response);
-                                Some(Ok(phases.complete(full)))
-                            }
-
-                            ResponseStreamEvent::ResponseIncomplete(evt) => {
-                                let full = responses_convert::from_response(&evt.response);
-                                Some(Ok(phases.complete(full)))
-                            }
-
-                            ResponseStreamEvent::ResponseFailed(evt) => {
-                                let (error_code, error_message) =
-                                    if let Some(err) = &evt.response.error {
-                                        (Some(err.code.clone()), Some(err.message.clone()))
-                                    } else {
-                                        (
-                                            Some("unknown".to_string()),
-                                            Some("Response failed".to_string()),
-                                        )
-                                    };
-                                Some(Ok(LlmResponse {
-                                    error_code,
-                                    error_message,
-                                    turn_complete: true,
-                                    ..Default::default()
-                                }))
-                            }
-
-                            ResponseStreamEvent::ResponseError(evt) => Some(Ok(LlmResponse {
+                        ResponseStreamEvent::ResponseIncomplete(evt) => {
+                            yield state.complete(&evt.response);
+                            break;
+                        }
+                        ResponseStreamEvent::ResponseFailed(evt) => {
+                            let (error_code, error_message) =
+                                if let Some(err) = &evt.response.error {
+                                    (Some(err.code.clone()), Some(err.message.clone()))
+                                } else {
+                                    (Some("unknown".to_string()), Some("Response failed".to_string()))
+                                };
+                            yield LlmResponse {
+                                error_code,
+                                error_message,
+                                turn_complete: true,
+                                ..Default::default()
+                            };
+                        }
+                        ResponseStreamEvent::ResponseError(evt) => {
+                            yield LlmResponse {
                                 error_code: evt.code.or_else(|| Some("error".to_string())),
                                 error_message: Some(evt.message),
                                 turn_complete: true,
                                 ..Default::default()
-                            })),
-
-                            // Skip all other events
-                            _ => None,
+                            };
                         }
+                        _ => {}
                     }
-                    Err(e) => Some(Err(map_openai_error(e))),
-                })
-            });
+                }
+            };
 
             Ok(crate::usage_tracking::with_priced_usage_tracking(
                 Box::pin(response_stream),
@@ -995,12 +889,6 @@ impl Llm for OpenAIResponsesClient {
                 &self.model,
             ))
         } else {
-            if stream && uses_native_tools {
-                adk_telemetry::debug!(
-                    "OpenAI native tools detected; using non-streaming responses path to avoid upstream SSE item parsing drift"
-                );
-            }
-
             // Non-streaming path
             let client = self.client.clone();
             let retry_config = self.retry_config.clone();
@@ -1043,8 +931,23 @@ impl Llm for OpenAIResponsesClient {
 mod tests {
     use super::*;
     use crate::openai::config::OpenAIResponsesConfig;
+    use adk_core::Part;
     use async_openai::error::{ApiError, ApiErrorResponse, OpenAIError};
+    use async_openai::types::responses::Response;
     use serde_json::json;
+
+    fn terminal(output: serde_json::Value) -> Response {
+        serde_json::from_value(json!({
+            "id": "resp_test", "object": "response", "created_at": 0,
+            "model": "test-model", "status": "completed", "output": output,
+            "usage": {
+                "input_tokens": 10, "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5, "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 15
+            }
+        }))
+        .expect("terminal response should deserialize")
+    }
 
     const FIRST_ARGUMENTS: &str = r#"{"path":"first.txt"}"#;
     fn stream_with_first_call() -> OpenResponsesStreamState {
@@ -1059,33 +962,36 @@ mod tests {
     }
     #[test]
     fn commentary_is_delivered_and_replaced_by_final_content() {
-        let mut phases = StreamPhases::default();
+        let mut state = StreamState::new(false);
         let added = serde_json::from_value(serde_json::json!({
             "type":"response.output_item.added", "sequence_number":0, "output_index":0,
             "item":{"type":"message", "id":"msg", "role":"assistant", "status":"in_progress",
                     "phase":"commentary", "content":[]}
         }))
         .unwrap();
-        assert!(phases.commentary(&added).is_none());
+        assert!(state.partial(&added).is_none());
         let delta = serde_json::from_value(serde_json::json!({
             "type":"response.output_text.delta", "sequence_number":1, "item_id":"msg",
             "output_index":0, "content_index":0, "delta":"Checking", "logprobs":[]
         }))
         .unwrap();
-        let response = phases.commentary(&delta).unwrap();
+        let response = state.partial(&delta).unwrap();
         let Part::ServerToolCall { server_tool_call } = &response.content.unwrap().parts[0] else {
             panic!("native message expected");
         };
         assert_eq!(server_tool_call["phase"], "commentary");
         assert_eq!(server_tool_call["content"][0]["text"], "Checking");
-        let content =
-            Content { role: "model".into(), parts: vec![Part::Text { text: "Done".into() }] };
-        let final_response =
-            phases.complete(LlmResponse { content: Some(content.clone()), ..Default::default() });
-        assert_eq!(
-            serde_json::to_value(final_response.content).unwrap(),
-            serde_json::to_value(Some(content)).unwrap()
+        let final_response = state.complete(&terminal(json!([
+            {"type":"message", "id":"msg", "role":"assistant", "status":"completed",
+             "phase":"commentary", "content":[{"type":"output_text", "text":"Checking", "annotations":[]}]},
+            {"type":"message", "id":"answer", "role":"assistant", "status":"completed",
+             "content":[{"type":"output_text", "text":"Done", "annotations":[]}]}
+        ])));
+        let parts = &final_response.content.as_ref().unwrap().parts;
+        assert!(
+            matches!(&parts[0], Part::ServerToolCall { server_tool_call } if server_tool_call["phase"] == "commentary")
         );
+        assert_eq!(parts[1], Part::Text { text: "Done".into() });
         assert_eq!(final_response.provider_metadata.unwrap()["content_complete"], true);
     }
 
@@ -1212,18 +1118,18 @@ mod tests {
     }
 
     #[test]
-    fn completed_stream_response_preserves_errors() {
-        let full = LlmResponse {
-            error_code: Some("model.openai_responses.invalid_tool_arguments".to_string()),
-            error_message: Some("invalid function arguments".to_string()),
-            ..Default::default()
-        };
-        let expected = LlmResponse { turn_complete: true, ..full.clone() };
-
+    fn completion_preserves_errors() {
+        let mut state = StreamState::new(false);
+        let result = state.complete(&terminal(json!([{
+            "type":"function_call", "id":"fc_bad", "call_id":"call_bad",
+            "name":"read_file", "arguments":"{invalid", "status":"completed"
+        }])));
         assert_eq!(
-            serde_json::to_value(completed_stream_response(full)).unwrap(),
-            serde_json::to_value(expected).unwrap()
+            result.error_code.as_deref(),
+            Some("model.openai_responses.invalid_tool_arguments")
         );
+        assert!(result.error_message.is_some());
+        assert!(result.turn_complete);
     }
 
     #[test]
@@ -1313,25 +1219,19 @@ mod tests {
     }
 
     #[test]
-    fn completed_stream_response_preserves_citations() {
-        let full = LlmResponse {
-            content: Some(Content::new("model").with_text("answer")),
-            citation_metadata: Some(adk_core::CitationMetadata {
-                citation_sources: vec![adk_core::CitationSource {
-                    uri: Some("https://example.test".to_string()),
-                    title: Some("Example".to_string()),
-                    start_index: Some(0),
-                    end_index: Some(6),
-                    license: None,
-                    publication_date: None,
-                }],
-            }),
-            ..Default::default()
-        };
+    fn completion_preserves_citations() {
+        let mut state = StreamState::new(false);
+        let completed = state.complete(&terminal(json!([{
+            "type":"message", "id":"answer", "role":"assistant", "status":"completed",
+            "content":[{"type":"output_text", "text":"answer", "annotations":[{
+                "type":"url_citation", "start_index":0, "end_index":6,
+                "url":"https://example.test", "title":"Example"
+            }]}]
+        }])));
 
-        let completed = completed_stream_response(full);
-
-        assert!(completed.content.is_none());
+        let content = completed.content.as_ref().expect("answer should be present");
+        assert_eq!(content.role, "model");
+        assert_eq!(content.parts, [Part::Text { text: "answer".into() }]);
         assert_eq!(
             completed
                 .citation_metadata
