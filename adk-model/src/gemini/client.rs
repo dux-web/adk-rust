@@ -124,7 +124,6 @@ pub struct GeminiModel {
     vertex_backend: bool,
 }
 
-/// Convert a Gemini client error to a structured `AdkError` with proper category and retry hints.
 /// Built-in tool uses observed across the responses of one Gemini call.
 ///
 /// Search is counted per distinct `webSearchQueries` entry, Maps once per grounded
@@ -184,50 +183,146 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
     }
 
     let message = format_error_chain(e);
-    // Vertex no longer replays a failed request over REST, so a transport failure
-    // is left to the configured retry policy instead.
-    #[cfg(feature = "gemini-vertex")]
-    let transport_failure =
-        adk_gemini::backend::vertex::VertexBackend::is_transport_error(&message);
-    #[cfg(not(feature = "gemini-vertex"))]
-    let transport_failure = false;
 
-    // Extract status code from BadResponse variant via Display output
-    // BadResponse format: "bad response from server; code {code}; description: ..."
-    let (category, code, status_code) = if message.contains("code 429")
-        || message.contains("RESOURCE_EXHAUSTED")
-        || message.contains("rate limit")
-    {
-        (ErrorCategory::RateLimited, "model.gemini.rate_limited", Some(429u16))
-    } else if message.contains("code 503") || message.contains("UNAVAILABLE") {
-        (ErrorCategory::Unavailable, "model.gemini.unavailable", Some(503))
-    } else if message.contains("code 529") || message.contains("OVERLOADED") {
-        (ErrorCategory::Unavailable, "model.gemini.overloaded", Some(529))
-    } else if message.contains("code 408")
-        || message.contains("DEADLINE_EXCEEDED")
-        || message.contains("TIMEOUT")
-    {
-        (ErrorCategory::Timeout, "model.gemini.timeout", Some(408))
-    } else if message.contains("code 401") || message.contains("Invalid API key") {
-        (ErrorCategory::Unauthorized, "model.gemini.unauthorized", Some(401))
-    } else if message.contains("code 400") {
-        (ErrorCategory::InvalidInput, "model.gemini.bad_request", Some(400))
-    } else if message.contains("code 404") {
-        (ErrorCategory::NotFound, "model.gemini.not_found", Some(404))
-    } else if message.contains("invalid generation config") {
-        (ErrorCategory::InvalidInput, "model.gemini.invalid_config", None)
-    } else if transport_failure {
-        (ErrorCategory::Unavailable, "model.gemini.unavailable", None)
-    } else {
-        (ErrorCategory::Internal, "model.gemini.internal", None)
+    // Response text can mention a different status; only the transport may
+    // establish an upstream HTTP status.
+    let status_code = match e {
+        adk_gemini::ClientError::BadResponse { code, .. } => Some(*code),
+        #[cfg(feature = "gemini-vertex")]
+        adk_gemini::ClientError::GoogleCloudRequest { source } => source.http_status_code(),
+        _ => None,
+    };
+    let (category, code) = match status_code {
+        Some(401) => (ErrorCategory::Unauthorized, "model.gemini.unauthorized"),
+        Some(403) => (ErrorCategory::Forbidden, "model.gemini.forbidden"),
+        Some(404) => (ErrorCategory::NotFound, "model.gemini.not_found"),
+        Some(408 | 504) => (ErrorCategory::Timeout, "model.gemini.timeout"),
+        Some(429) => (ErrorCategory::RateLimited, "model.gemini.rate_limited"),
+        Some(529) => (ErrorCategory::Unavailable, "model.gemini.overloaded"),
+        Some(400..=499) => (ErrorCategory::InvalidInput, "model.gemini.bad_request"),
+        Some(500..=599) => (ErrorCategory::Unavailable, "model.gemini.unavailable"),
+        _ => error_without_status(e),
     };
 
     let mut err = adk_core::AdkError::new(ErrorComponent::Model, category, code, message)
         .with_provider("gemini");
-    if let Some(sc) = status_code {
-        err = err.with_upstream_status(sc);
+    if let Some(status_code) = status_code {
+        err = err.with_upstream_status(status_code);
+    }
+    if let adk_gemini::ClientError::BadResponse { description: Some(body), .. } = e {
+        err = with_provider_code(err, provider_code_from_body(body).as_deref());
+    }
+    #[cfg(feature = "gemini-vertex")]
+    if let adk_gemini::ClientError::GoogleCloudRequest { source } = e {
+        if let Some(body) = source.http_payload().and_then(|body| std::str::from_utf8(body).ok()) {
+            err = with_provider_code(err, provider_code_from_body(body).as_deref());
+        }
+        if let Some(status) = source.status() {
+            for detail in &status.details {
+                let Ok(detail) = serde_json::to_value(detail) else {
+                    continue;
+                };
+                if detail["@type"] != "type.googleapis.com/google.rpc.ErrorInfo" {
+                    continue;
+                }
+                err = with_provider_code(err, detail["reason"].as_str());
+                if err.details.metadata.contains_key("provider_error_code") {
+                    break;
+                }
+            }
+        }
     }
     err
+}
+
+/// Classify failures with no HTTP response without inventing an upstream status.
+fn error_without_status(error: &adk_gemini::ClientError) -> (ErrorCategory, &'static str) {
+    match error {
+        adk_gemini::ClientError::InvalidGenerationConfig { .. } => {
+            (ErrorCategory::InvalidInput, "model.gemini.invalid_config")
+        }
+        adk_gemini::ClientError::Validation { .. } => {
+            (ErrorCategory::InvalidInput, "model.gemini.bad_request")
+        }
+        adk_gemini::ClientError::InvalidApiKey { .. } => {
+            (ErrorCategory::Unauthorized, "model.gemini.unauthorized")
+        }
+        adk_gemini::ClientError::PerformRequestNew { source }
+        | adk_gemini::ClientError::PerformRequest { source, .. }
+            if source.is_timeout() =>
+        {
+            (ErrorCategory::Timeout, "model.gemini.timeout")
+        }
+        adk_gemini::ClientError::PerformRequestNew { source }
+        | adk_gemini::ClientError::PerformRequest { source, .. }
+            if source.is_connect() =>
+        {
+            (ErrorCategory::Unavailable, "model.gemini.unavailable")
+        }
+        #[cfg(feature = "gemini-vertex")]
+        adk_gemini::ClientError::GoogleCloudRequest { source } if source.is_timeout() => {
+            (ErrorCategory::Timeout, "model.gemini.timeout")
+        }
+        #[cfg(feature = "gemini-vertex")]
+        adk_gemini::ClientError::GoogleCloudRequest { source } => {
+            if let Some(status) = source.status() {
+                match status.code.name() {
+                    "RESOURCE_EXHAUSTED" => {
+                        (ErrorCategory::RateLimited, "model.gemini.rate_limited")
+                    }
+                    "UNAVAILABLE" => (ErrorCategory::Unavailable, "model.gemini.unavailable"),
+                    "DEADLINE_EXCEEDED" => (ErrorCategory::Timeout, "model.gemini.timeout"),
+                    "UNAUTHENTICATED" => (ErrorCategory::Unauthorized, "model.gemini.unauthorized"),
+                    "PERMISSION_DENIED" => (ErrorCategory::Forbidden, "model.gemini.forbidden"),
+                    "NOT_FOUND" => (ErrorCategory::NotFound, "model.gemini.not_found"),
+                    "INVALID_ARGUMENT" => (ErrorCategory::InvalidInput, "model.gemini.bad_request"),
+                    _ => (ErrorCategory::Internal, "model.gemini.internal"),
+                }
+            } else if adk_gemini::backend::vertex::VertexBackend::is_transport_error(
+                &source.to_string(),
+            ) {
+                (ErrorCategory::Unavailable, "model.gemini.unavailable")
+            } else {
+                (ErrorCategory::Internal, "model.gemini.internal")
+            }
+        }
+        #[cfg(feature = "gemini-vertex")]
+        adk_gemini::ClientError::Io { source }
+            if adk_gemini::backend::vertex::VertexBackend::is_transport_error(
+                &source.to_string(),
+            ) =>
+        {
+            (ErrorCategory::Unavailable, "model.gemini.unavailable")
+        }
+        _ => (ErrorCategory::Internal, "model.gemini.internal"),
+    }
+}
+
+/// Keep provider-specific error codes bounded and distinct from the ADK error code.
+fn with_provider_code(mut error: adk_core::AdkError, code: Option<&str>) -> adk_core::AdkError {
+    if let Some(code) = code.filter(|code| valid_provider_code(code)) {
+        error.details.metadata.insert("provider_error_code".into(), serde_json::json!(code));
+    }
+    error
+}
+
+fn valid_provider_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 128
+        && code.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+}
+
+fn provider_code_from_body(body: &str) -> Option<String> {
+    if body.len() > 64 * 1024 {
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    ["/error/code", "/error/status"].into_iter().find_map(|path| {
+        body.pointer(path)
+            .and_then(serde_json::Value::as_str)
+            .filter(|code| valid_provider_code(code))
+            .map(str::to_owned)
+    })
 }
 
 /// Maps a terminal [`InteractionStatus`](adk_gemini::interactions::InteractionStatus)
@@ -2124,6 +2219,85 @@ mod tests {
     };
 
     #[test]
+    fn response_status_ignores_misleading_text() {
+        for (status, category, code) in [
+            (400, ErrorCategory::InvalidInput, "model.gemini.bad_request"),
+            (401, ErrorCategory::Unauthorized, "model.gemini.unauthorized"),
+            (403, ErrorCategory::Forbidden, "model.gemini.forbidden"),
+            (404, ErrorCategory::NotFound, "model.gemini.not_found"),
+            (408, ErrorCategory::Timeout, "model.gemini.timeout"),
+            (429, ErrorCategory::RateLimited, "model.gemini.rate_limited"),
+            (500, ErrorCategory::Unavailable, "model.gemini.unavailable"),
+            (504, ErrorCategory::Timeout, "model.gemini.timeout"),
+            (529, ErrorCategory::Unavailable, "model.gemini.overloaded"),
+        ] {
+            let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+                code: status,
+                description: Some(
+                    serde_json::json!({"error": {
+                        "code": "unsupported_capability",
+                        "message": "code 400; code 401; code 429; rate limit; UNAVAILABLE; TIMEOUT"
+                    }})
+                    .to_string(),
+                ),
+            });
+            assert_eq!(error.category, category);
+            assert_eq!(error.code, code);
+            assert_eq!(error.details.upstream_status_code, Some(status));
+            assert_eq!(error.details.metadata["provider_error_code"], "unsupported_capability");
+        }
+    }
+
+    #[test]
+    fn provider_codes_require_bounded_json_fields() {
+        for (body, expected) in [
+            (
+                serde_json::json!({"error":{"code":"unsupported_capability"}}).to_string(),
+                Some("unsupported_capability"),
+            ),
+            (
+                serde_json::json!({"error":{"code":400,"status":"INVALID_ARGUMENT"}})
+                    .to_string(),
+                Some("INVALID_ARGUMENT"),
+            ),
+            (
+                serde_json::json!({"error":{"code":"", "status":"INVALID_ARGUMENT"}})
+                    .to_string(),
+                Some("INVALID_ARGUMENT"),
+            ),
+            ("unsupported_capability".to_string(), None),
+            (serde_json::json!({"error":{"code":"unsupported capability"}}).to_string(), None),
+            (serde_json::json!({"error":{"code":"x".repeat(129)}}).to_string(), None),
+            (
+                serde_json::json!({"error":{"code":"unsupported_capability", "message":"x".repeat(64 * 1024)}}).to_string(),
+                None,
+            ),
+        ] {
+            let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+                code: 400,
+                description: Some(body),
+            });
+            let actual = error
+                .details
+                .metadata
+                .get("provider_error_code")
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn local_config_error_has_no_upstream_status() {
+        let error = gemini_error_to_adk(&adk_gemini::ClientError::InvalidGenerationConfig {
+            message: "code 429; RESOURCE_EXHAUSTED".to_string(),
+        });
+        assert_eq!(error.category, ErrorCategory::InvalidInput);
+        assert_eq!(error.code, "model.gemini.invalid_config");
+        assert_eq!(error.details.upstream_status_code, None);
+        assert!(error.details.metadata.is_empty());
+    }
+
+    #[test]
     fn env_flag_truthy_accepts_one_and_case_insensitive_true() {
         for truthy in ["1", "true", "TRUE", "True", " true ", "tRuE"] {
             assert!(env_flag_truthy(truthy), "expected {truthy:?} to be truthy");
@@ -2844,6 +3018,53 @@ mod vertex_rag_tests {
 #[cfg(all(test, feature = "gemini-vertex"))]
 mod vertex_transport_tests {
     use super::*;
+    use google_cloud_gax::error::{
+        Error as GaxError,
+        rpc::{Code, Status, StatusDetails},
+    };
+
+    #[test]
+    fn service_status_and_reason_are_preserved() {
+        let detail: StatusDetails = serde_json::from_value(serde_json::json!({
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "QUOTA_EXCEEDED"
+        }))
+        .expect("valid ErrorInfo detail");
+        let status = Status::default()
+            .set_code(Code::ResourceExhausted)
+            .set_message("code 400; invalid API key")
+            .set_details([detail]);
+        let error = adk_gemini::ClientError::GoogleCloudRequest {
+            source: GaxError::service_with_http_metadata(status, Some(429), None),
+        };
+
+        let mapped = gemini_error_to_adk(&error);
+        assert_eq!(mapped.category, ErrorCategory::RateLimited);
+        assert_eq!(mapped.code, "model.gemini.rate_limited");
+        assert_eq!(mapped.details.upstream_status_code, Some(429));
+        assert_eq!(mapped.details.metadata["provider_error_code"], "QUOTA_EXCEEDED");
+    }
+
+    #[test]
+    fn rpc_status_does_not_invent_http_status() {
+        let detail: StatusDetails = serde_json::from_value(serde_json::json!({
+            "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+            "reason": "RATE_LIMITED"
+        }))
+        .expect("valid ErrorInfo detail");
+        let status = Status::default()
+            .set_code(Code::ResourceExhausted)
+            .set_message("code 503; unavailable")
+            .set_details([detail]);
+        let error =
+            adk_gemini::ClientError::GoogleCloudRequest { source: GaxError::service(status) };
+
+        let mapped = gemini_error_to_adk(&error);
+        assert_eq!(mapped.category, ErrorCategory::RateLimited);
+        assert_eq!(mapped.code, "model.gemini.rate_limited");
+        assert_eq!(mapped.details.upstream_status_code, None);
+        assert_eq!(mapped.details.metadata["provider_error_code"], "RATE_LIMITED");
+    }
 
     #[test]
     fn vertex_transport_failures_are_retryable() {
