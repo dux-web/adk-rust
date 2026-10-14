@@ -1,0 +1,1 @@
+- **Anthropic request adapter** (`adk-model`): optionally adapt the complete Messages JSON body and outgoing headers for each attempt, including streaming requests, while preserving the default SDK path when unused.
