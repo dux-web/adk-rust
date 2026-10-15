@@ -8,6 +8,8 @@ mod lines;
 mod parse;
 #[path = "responses_stream.rs"]
 mod stream;
+#[path = "responses_wire.rs"]
+pub(super) mod wire;
 use stream::StreamState;
 
 use super::config::{OpenAIReasoningEffort, OpenAIResponsesConfig, ReasoningSummary};
@@ -949,7 +951,7 @@ impl Llm for OpenAIResponsesClient {
                     async move {
                         client
                             .responses()
-                            .create_stream(request)
+                            .create_stream_byot::<_, serde_json::Value>(request)
                             .await
                             .map_err(|error| map_error(error, parse::Layer::StreamSetup))
                     }
@@ -960,41 +962,23 @@ impl Llm for OpenAIResponsesClient {
             let response_stream = try_stream! {
                 futures::pin_mut!(event_stream);
                 while let Some(event_result) = event_stream.next().await {
-                    let event = event_result
+                    let value = event_result
                         .map_err(|error| map_error(error, parse::Layer::StreamEvent))?;
-                    if let Some(response) = state.partial(&event) {
-                        yield response;
-                    } else {
-                        use async_openai::types::responses::ResponseStreamEvent;
-                        match event {
-                            // ResponseCompleted carries the authoritative response with
-                            // final output, function calls, usage, and finish reason.
-                            ResponseStreamEvent::ResponseCompleted(evt) => {
-                                yield state.complete(&evt.response);
-                                break;
-                            }
-
-                            ResponseStreamEvent::ResponseIncomplete(evt) => {
-                                yield state.complete(&evt.response);
-                                break;
-                            }
-
-                            ResponseStreamEvent::ResponseFailed(evt) => {
-                                Err(errors::stream_error(
-                                    evt.response.error.as_ref().map(|error| error.code.as_str()),
-                                ))?;
-                            }
-
-                            ResponseStreamEvent::ResponseError(evt) => {
-                                Err(errors::stream_error(evt.code.as_deref()))?;
-                            }
-
-                            // Lifecycle and native-tool events are stream activity even before
-                            // text is available. Consumers may suppress empty partial output.
-                            _ => yield LlmResponse { partial: true, ..Default::default() },
+                    match wire::event(value)? {
+                        wire::Event::Terminal(response) => {
+                            yield state.finish(&response)?;
+                            return;
+                        }
+                        wire::Event::Content(event) => {
+                            yield state.partial(&event)
+                                .unwrap_or_else(|| LlmResponse { partial: true, ..Default::default() });
+                        }
+                        wire::Event::Activity => {
+                            yield LlmResponse { partial: true, ..Default::default() };
                         }
                     }
                 }
+                Err(wire::unfinished())?;
             };
 
             Ok(crate::usage_tracking::with_usage_tracking(Box::pin(response_stream), usage_span))
@@ -1009,11 +993,12 @@ impl Llm for OpenAIResponsesClient {
                     is_retryable_model_error,
                     || {
                         let client = client.clone();
-                        let req = create_request.clone();
+                        let mut req = create_request.clone();
+                        req.stream = Some(false);
                         async move {
                             client
                                 .responses()
-                                .create(req)
+                                .create_byot::<_, serde_json::Value>(req)
                                 .await
                                 .map_err(map_openai_error)
                         }
@@ -1021,7 +1006,8 @@ impl Llm for OpenAIResponsesClient {
                 )
                 .await?;
 
-                let mut adk_response = responses_convert::from_response(&response);
+                let projected = wire::response(response.clone(), &response, parse::Layer::ResponseBody)?;
+                let mut adk_response = responses_convert::from_projection(&projected);
                 adk_response.turn_complete = true;
                 adk_response.partial = false;
                 yield adk_response;

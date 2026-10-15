@@ -4,17 +4,20 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use adk_core::{Content, LlmResponse, Part};
 use async_openai::types::responses::{
-    MessagePhase, OutputContent, OutputItem, OutputMessageContent, Response, ResponseStreamEvent,
-    SummaryPart,
+    MessagePhase, OutputContent, OutputItem, OutputMessageContent, ReasoningItemContent,
+    ResponseStreamEvent, SummaryPart,
 };
 
 use super::responses_convert;
+#[cfg(test)]
+use async_openai::types::responses::Response;
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum TextKind {
     Answer,
     Refusal,
     Summary,
+    Reasoning,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -36,6 +39,7 @@ pub(super) struct StreamState {
     emitted: BTreeMap<TextKey, String>,
     finalized: BTreeMap<TextKey, String>,
     finalized_items: BTreeMap<u32, OutputItem>,
+    pending_calls: BTreeMap<u32, Option<String>>,
     commentary: HashSet<(u32, String)>,
     native_tools: bool,
     corrected: bool,
@@ -52,7 +56,24 @@ impl StreamState {
         let mut parts = Vec::new();
         match event {
             ResponseOutputItemAdded(event) => {
+                match &event.item {
+                    OutputItem::FunctionCall(call) => {
+                        self.pending_calls.insert(event.output_index, Some(call.call_id.clone()));
+                    }
+                    OutputItem::CustomToolCall(call) => {
+                        self.pending_calls.insert(event.output_index, Some(call.call_id.clone()));
+                    }
+                    _ => {}
+                }
                 self.record_phase(event.output_index, &event.item);
+                return None;
+            }
+            ResponseFunctionCallArgumentsDelta(event) => {
+                self.pending_calls.entry(event.output_index).or_default();
+                return None;
+            }
+            ResponseCustomToolCallInputDelta(event) => {
+                self.pending_calls.entry(event.output_index).or_default();
                 return None;
             }
             ResponseOutputTextDelta(event) => {
@@ -140,7 +161,26 @@ impl StreamState {
                 );
                 self.done(key, &text.text, &mut parts);
             }
+            ResponseReasoningTextDelta(event) => {
+                let key = TextKey::new(
+                    &event.item_id,
+                    event.output_index,
+                    event.content_index,
+                    TextKind::Reasoning,
+                );
+                self.delta(key, &event.delta, &mut parts);
+            }
+            ResponseReasoningTextDone(event) => {
+                let key = TextKey::new(
+                    &event.item_id,
+                    event.output_index,
+                    event.content_index,
+                    TextKind::Reasoning,
+                );
+                self.done(key, &event.text, &mut parts);
+            }
             ResponseOutputItemDone(event) => {
+                self.pending_calls.remove(&event.output_index);
                 self.finalized_items.insert(event.output_index, event.item.clone());
                 self.record_phase(event.output_index, &event.item);
                 let mut item = event.item.clone();
@@ -155,7 +195,18 @@ impl StreamState {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn complete(&mut self, response: &Response) -> LlmResponse {
+        self.finish(&super::wire::Response::from(response)).unwrap()
+    }
+
+    pub(super) fn finish(
+        &mut self,
+        response: &super::wire::Response,
+    ) -> Result<LlmResponse, adk_core::AdkError> {
+        if response.output_missing && self.finalized_items.is_empty() {
+            return Err(super::wire::missing_output());
+        }
         let mut response = response.clone();
         let recovered = response.output.is_empty() && !self.finalized_items.is_empty();
         if recovered {
@@ -163,7 +214,27 @@ impl StreamState {
             // Recover the whole items, including calls and reasoning, not only text.
             response.output = self.finalized_items.values().cloned().collect();
         }
-        let mut full = responses_convert::from_response(&response);
+        super::wire::validate(&response)?;
+        for (index, expected) in &self.pending_calls {
+            fn call_id(item: &OutputItem) -> Option<&str> {
+                match item {
+                    OutputItem::FunctionCall(call) => Some(call.call_id.as_str()),
+                    OutputItem::CustomToolCall(call) => Some(call.call_id.as_str()),
+                    _ => None,
+                }
+            }
+            let identity = if let Some(expected) = expected {
+                response.output.iter().filter_map(call_id).find(|identity| *identity == expected)
+            } else {
+                response.output.get(*index as usize).and_then(call_id)
+            };
+            if identity.is_none()
+                || expected.as_deref().zip(identity).is_some_and(|(left, right)| left != right)
+            {
+                return Err(super::wire::unfinished());
+            }
+        }
+        let mut full = responses_convert::from_projection(&response);
         let mut unseen = response.clone();
         let mut final_keys = BTreeSet::new();
         for (output_index, item) in unseen.output.iter_mut().enumerate() {
@@ -191,9 +262,9 @@ impl StreamState {
                 serde_json::json!(true);
         } else {
             // Keep metadata/citation offsets from the full response, not its suffixes.
-            full.content = responses_convert::from_response(&unseen).content;
+            full.content = responses_convert::from_projection(&unseen).content;
         }
-        full
+        Ok(full)
     }
 
     fn record_phase(&mut self, output_index: u32, item: &OutputItem) {
@@ -285,7 +356,7 @@ impl StreamState {
                     TextKey::new(&message.id, output_index, index as u32, kind)
                 })
                 .collect(),
-            OutputItem::Reasoning(reasoning) => reasoning
+            OutputItem::Reasoning(reasoning) if !reasoning.summary.is_empty() => reasoning
                 .summary
                 .iter()
                 .enumerate()
@@ -295,6 +366,21 @@ impl StreamState {
                         output_index,
                         index as u32,
                         TextKind::Summary,
+                    )
+                })
+                .collect(),
+            OutputItem::Reasoning(reasoning) => reasoning
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    TextKey::new(
+                        reasoning.id.as_deref().unwrap_or_default(),
+                        output_index,
+                        index as u32,
+                        TextKind::Reasoning,
                     )
                 })
                 .collect(),
@@ -326,6 +412,21 @@ impl StreamState {
                         TextKey::new(item_id, output_index, part_index as u32, TextKind::Summary);
                     text.text = self.done(key, &text.text, parts);
                 }
+                if reasoning.summary.is_empty() {
+                    for (part_index, content) in reasoning.content.iter_mut().flatten().enumerate()
+                    {
+                        let text = match content {
+                            ReasoningItemContent::ReasoningText(text) => &mut text.text,
+                        };
+                        let key = TextKey::new(
+                            item_id,
+                            output_index,
+                            part_index as u32,
+                            TextKind::Reasoning,
+                        );
+                        *text = self.done(key, text, parts);
+                    }
+                }
             }
             _ => {}
         }
@@ -347,7 +448,7 @@ impl StreamState {
                     "phase": "commentary", "status": message_status, "content": [content]
                 }),
             })
-        } else if key.kind == TextKind::Summary {
+        } else if matches!(key.kind, TextKind::Summary | TextKind::Reasoning) {
             Some(Part::Thinking { thinking: text.into(), signature: None })
         } else {
             Some(Part::Text { text: text.into() })

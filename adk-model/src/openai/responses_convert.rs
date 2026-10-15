@@ -15,13 +15,15 @@ use async_openai::types::responses::{
     FunctionTool, FunctionToolCall, IncludeEnum, InputContent, InputFileContent, InputImageContent,
     InputItem, InputParam, Item, MessagePhase, OutputItem, OutputMessageContent, Prompt,
     PromptCacheRetention as OaiPromptCacheRetention, Reasoning,
-    ReasoningEffort as OaiReasoningEffort, ReasoningSummary as OaiReasoningSummary, Response,
-    ResponseUsage, Role, ServiceTier as OaiServiceTier, Status, SummaryPart, Tool, Truncation,
+    ReasoningEffort as OaiReasoningEffort, ReasoningItemContent,
+    ReasoningSummary as OaiReasoningSummary, Response, ResponseUsage, Role,
+    ServiceTier as OaiServiceTier, Status, SummaryPart, Tool, Truncation,
 };
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 
 use super::config::{OpenAIReasoningEffort, ReasoningSummary};
+use super::responses_client::wire::Response as Projection;
 
 /// Convert a list of ADK `Content` items to Responses API `InputItem` list.
 pub fn contents_to_input_items(contents: &[Content]) -> Vec<InputItem> {
@@ -591,7 +593,16 @@ pub fn build_create_response(
 /// collects all parts into a single `Content`, and maps usage, finish reason,
 /// and provider metadata.
 pub fn from_response(response: &Response) -> LlmResponse {
-    let parts = response.output.iter().map(output_item_to_parts).collect::<Result<Vec<_>, _>>();
+    from_projection(&Projection::from(response))
+}
+
+pub(super) fn from_projection(response: &Projection) -> LlmResponse {
+    let terminal_error = super::responses_client::wire::validate(response).err();
+    let parts = if terminal_error.is_none() {
+        response.output.iter().map(output_item_to_parts).collect::<Result<Vec<_>, _>>()
+    } else {
+        Ok(Vec::new())
+    };
     let (parts, argument_error) = match parts {
         Ok(parts) => (parts.into_iter().flatten().collect::<Vec<_>>(), None),
         Err(error) => (Vec::new(), Some(error)),
@@ -601,8 +612,8 @@ pub fn from_response(response: &Response) -> LlmResponse {
         if parts.is_empty() { None } else { Some(Content { role: "model".to_string(), parts }) };
 
     let usage_metadata = response.usage.as_ref().map(convert_usage);
-    let finish_reason = map_finish_reason(response);
-    let provider_metadata = build_provider_metadata(response);
+    let finish_reason = terminal_error.is_none().then(|| map_finish_reason(response)).flatten();
+    let provider_metadata = projection_metadata(response);
     let mut citation_sources = Vec::new();
     let mut offset = 0usize;
     for item in &response.output {
@@ -657,10 +668,12 @@ pub fn from_response(response: &Response) -> LlmResponse {
         partial: false,
         turn_complete: true,
         interrupted: false,
-        error_code: argument_error
-            .as_ref()
-            .map(|_| "model.openai_responses.invalid_tool_arguments".to_owned()),
-        error_message: argument_error,
+        error_code: terminal_error.as_ref().map(|error| error.code.to_owned()).or_else(|| {
+            argument_error
+                .as_ref()
+                .map(|_| "model.openai_responses.invalid_tool_arguments".to_owned())
+        }),
+        error_message: terminal_error.map(|error| error.message).or(argument_error),
         provider_metadata,
         interaction_id: None,
     }
@@ -699,7 +712,7 @@ fn output_item_to_parts(item: &OutputItem) -> Result<Vec<Part>, String> {
             })
             .collect(),
         OutputItem::Reasoning(reasoning) => {
-            let concatenated: String = reasoning
+            let mut concatenated: String = reasoning
                 .summary
                 .iter()
                 .map(|sp| match sp {
@@ -707,6 +720,18 @@ fn output_item_to_parts(item: &OutputItem) -> Result<Vec<Part>, String> {
                 })
                 .collect::<Vec<_>>()
                 .join("");
+            if concatenated.is_empty() {
+                concatenated = reasoning
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|content| match content {
+                        ReasoningItemContent::ReasoningText(text) => text.text.as_str(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+            }
 
             if concatenated.is_empty() {
                 vec![]
@@ -795,7 +820,7 @@ where
     serde_json::to_value(output).ok().and_then(|value| serde_json::from_value(value).ok())
 }
 
-fn reasoning_history_parts(response: &Response) -> Vec<serde_json::Value> {
+fn reasoning_history_parts(response: &Projection) -> Vec<serde_json::Value> {
     response
         .output
         .iter()
@@ -822,7 +847,7 @@ fn convert_usage(usage: &ResponseUsage) -> UsageMetadata {
 }
 
 /// Map response status to ADK `FinishReason`.
-fn map_finish_reason(response: &Response) -> Option<FinishReason> {
+fn map_finish_reason(response: &Projection) -> Option<FinishReason> {
     match &response.status {
         Status::Completed => Some(FinishReason::Stop),
         Status::Incomplete => {
@@ -832,13 +857,12 @@ fn map_finish_reason(response: &Response) -> Option<FinishReason> {
                 } else if details.reason.contains("content_filter") {
                     Some(FinishReason::Safety)
                 } else {
-                    Some(FinishReason::Stop)
+                    None
                 }
             } else {
-                Some(FinishReason::Stop)
+                None
             }
         }
-        Status::Failed => Some(FinishReason::Stop),
         _ => None,
     }
 }
@@ -904,7 +928,12 @@ fn extract_tool_search_selected(
 /// Always includes `response_id` and `status`. Optionally includes `service_tier`,
 /// `encrypted_content` from reasoning items, and `built_in_tool_outputs` from web search,
 /// file search, code interpreter, image generation, MCP, shell, and skill calls.
+#[cfg(test)]
 fn build_provider_metadata(response: &Response) -> Option<serde_json::Value> {
+    projection_metadata(&Projection::from(response))
+}
+
+fn projection_metadata(response: &Projection) -> Option<serde_json::Value> {
     let mut openai = serde_json::Map::new();
     openai.insert("response_id".to_string(), serde_json::Value::String(response.id.clone()));
 
@@ -921,14 +950,7 @@ fn build_provider_metadata(response: &Response) -> Option<serde_json::Value> {
 
     // Include service_tier if present
     if let Some(tier) = &response.service_tier {
-        let tier_str = match tier {
-            OaiServiceTier::Auto => "auto",
-            OaiServiceTier::Default => "default",
-            OaiServiceTier::Flex => "flex",
-            OaiServiceTier::Scale => "scale",
-            OaiServiceTier::Priority => "priority",
-        };
-        openai.insert("service_tier".to_string(), serde_json::Value::String(tier_str.to_string()));
+        openai.insert("service_tier".to_string(), tier.clone());
     }
 
     // Extract phase from output messages if present.
@@ -2046,6 +2068,11 @@ mod tests {
             let llm_response = from_response(&response);
             let metadata = llm_response.provider_metadata.expect("metadata should exist");
             assert_eq!(metadata["openai"]["status"], status_str);
+            assert_eq!(llm_response.error_code.is_none(), status_str == "completed");
+            if status_str != "completed" {
+                assert!(llm_response.finish_reason.is_none());
+                assert!(llm_response.content.is_none());
+            }
         }
     }
 

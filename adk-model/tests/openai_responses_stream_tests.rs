@@ -23,7 +23,40 @@ fn completion(output: Value) -> Value {
 }
 
 async fn responses(events: &[Value], open_responses_mode: bool, prefix: &str) -> Vec<LlmResponse> {
-    try_responses(events, open_responses_mode, prefix).await.expect("SSE events must deserialize")
+    let results = try_responses(events, open_responses_mode, prefix)
+        .await
+        .expect("SSE events must deserialize");
+    assert_eq!(results.iter().filter(|response| response.turn_complete).count(), 1);
+    let activity = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some(
+                    "response.output_item.added"
+                        | "response.output_item.done"
+                        | "response.function_call_arguments.delta"
+                        | "response.function_call_arguments.done"
+                )
+            )
+        })
+        .count();
+    assert_eq!(results.iter().filter(|response| empty_activity(response)).count(), activity);
+    results.into_iter().filter(|response| !empty_activity(response)).collect()
+}
+
+fn empty_activity(response: &LlmResponse) -> bool {
+    response.partial
+        && !response.turn_complete
+        && !response.interrupted
+        && response.content.is_none()
+        && response.error_code.is_none()
+        && response.error_message.is_none()
+        && response.usage_metadata.is_none()
+        && response.finish_reason.is_none()
+        && response.citation_metadata.is_none()
+        && response.provider_metadata.is_none()
+        && response.interaction_id.is_none()
 }
 
 async fn try_responses(
@@ -31,6 +64,7 @@ async fn try_responses(
     open_responses_mode: bool,
     prefix: &str,
 ) -> Result<Vec<LlmResponse>, adk_core::AdkError> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let server = MockServer::start().await;
     let mut body = prefix.to_string();
     for event in events {
