@@ -338,7 +338,7 @@ async fn preserves_known_incomplete_outcomes_and_aliases() {
         for result in
             [unary(&value).await.unwrap(), events(&[terminal(value.clone())]).await.unwrap()]
         {
-            assert_eq!(result.last().unwrap().finish_reason, Some(finish.clone()));
+            assert_eq!(result.last().unwrap().finish_reason, Some(finish));
         }
     }
     let mut done = terminal(response(json!([])));
