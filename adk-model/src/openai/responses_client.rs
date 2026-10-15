@@ -2,14 +2,14 @@
 
 #[path = "responses_parse.rs"]
 mod parse;
+#[path = "responses_wire.rs"]
+pub(super) mod wire;
 use super::config::{OpenAIReasoningEffort, OpenAIResponsesConfig, ReasoningSummary};
 use super::responses_convert;
 use super::responses_stream::StreamState;
 use super::{responses_errors, responses_lines};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
-use adk_core::{
-    AdkError, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponse, LlmResponseStream,
-};
+use adk_core::{AdkError, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponseStream};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -779,17 +779,6 @@ fn set_max_reasoning_effort(
     Ok(())
 }
 
-/// Whether a stream event failed to deserialize only because its top-level `type` is unknown.
-fn is_unknown_event_type(error: &serde_json::Error, payload: &str) -> bool {
-    error.is_data()
-        && serde_json::from_str::<serde_json::Value>(payload)
-            .ok()
-            .as_ref()
-            .and_then(|event| event.get("type"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| error.to_string().starts_with(&format!("unknown variant `{kind}`")))
-}
-
 /// Map an `async_openai::error::OpenAIError` to an `AdkError`.
 pub(super) fn map_openai_error(e: async_openai::error::OpenAIError) -> AdkError {
     map_error(e, parse::Layer::ResponseBody)
@@ -896,7 +885,7 @@ impl Llm for OpenAIResponsesClient {
                     async move {
                         client
                             .responses()
-                            .create_stream(request)
+                            .create_stream_byot::<_, serde_json::Value>(request)
                             .await
                             .map_err(|error| map_error(error, parse::Layer::StreamSetup))
                     }
@@ -907,56 +896,22 @@ impl Llm for OpenAIResponsesClient {
             let response_stream = try_stream! {
                 futures::pin_mut!(event_stream);
                 while let Some(event_result) = event_stream.next().await {
-                    use async_openai::types::responses::ResponseStreamEvent;
-                    let event = match event_result {
-                        Ok(event) => event,
-                        Err(async_openai::error::OpenAIError::JSONDeserialize(error, payload))
-                            if is_unknown_event_type(&error, &payload) =>
-                        {
-                            // A newer event type must not end a turn the client can still finish.
-                            tracing::debug!(error = %error, "skipping unrecognized Responses stream event");
-                            continue;
+                    let value = event_result
+                        .map_err(|error| map_error(error, parse::Layer::StreamEvent))?;
+                    match wire::event(value)? {
+                        wire::Event::Terminal(response) => {
+                            yield state.finish(&response)?;
+                            return;
                         }
-                        Err(error) => Err(map_error(error, parse::Layer::StreamEvent))?,
-                    };
-                    match event {
-                        ResponseStreamEvent::ResponseCompleted(evt) => {
-                            yield state.complete(evt.response);
-                            break;
-                        }
-                        ResponseStreamEvent::ResponseIncomplete(evt) => {
-                            yield state.complete(evt.response);
-                            break;
-                        }
-                        ResponseStreamEvent::ResponseFailed(evt) => {
-                            let (error_code, error_message) = match evt.response.error {
-                                Some(err) => (Some(err.code), Some(err.message)),
-                                None => {
-                                    (Some("unknown".to_string()), Some("Response failed".to_string()))
-                                }
-                            };
-                            yield LlmResponse {
-                                error_code,
-                                error_message,
-                                turn_complete: true,
-                                ..Default::default()
-                            };
-                        }
-                        ResponseStreamEvent::ResponseError(evt) => {
-                            yield LlmResponse {
-                                error_code: evt.code.or_else(|| Some("error".to_string())),
-                                error_message: Some(evt.message),
-                                turn_complete: true,
-                                ..Default::default()
-                            };
-                        }
-                        event => {
-                            if let Some(response) = state.partial(event) {
+                        wire::Event::Content(event) => {
+                            if let Some(response) = state.partial(*event) {
                                 yield response;
                             }
                         }
+                        wire::Event::Activity => {}
                     }
                 }
+                Err(wire::unfinished())?;
             };
 
             Ok(crate::usage_tracking::with_priced_usage_tracking(
@@ -976,11 +931,12 @@ impl Llm for OpenAIResponsesClient {
                     is_retryable_model_error,
                     || {
                         let client = client.clone();
-                        let req = create_request.clone();
+                        let mut req = create_request.clone();
+                        req.stream = Some(false);
                         async move {
                             client
                                 .responses()
-                                .create(req)
+                                .create_byot::<_, serde_json::Value>(req)
                                 .await
                                 .map_err(map_openai_error)
                         }
@@ -988,7 +944,8 @@ impl Llm for OpenAIResponsesClient {
                 )
                 .await?;
 
-                let mut adk_response = responses_convert::from_response(&response);
+                let projected = wire::response(response.clone(), &response, parse::Layer::ResponseBody)?;
+                let mut adk_response = responses_convert::from_projection(&projected);
                 adk_response.turn_complete = true;
                 adk_response.partial = false;
                 yield adk_response;

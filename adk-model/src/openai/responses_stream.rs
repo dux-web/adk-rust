@@ -4,17 +4,21 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use adk_core::{Content, LlmResponse, Part};
 use async_openai::types::responses::{
-    MessagePhase, OutputContent, OutputItem, OutputMessageContent, Response, ResponseStreamEvent,
-    SummaryPart,
+    MessagePhase, OutputContent, OutputItem, OutputMessageContent, ReasoningItemContent,
+    ResponseStreamEvent, SummaryPart,
 };
 
+use super::responses_client::wire;
 use super::responses_convert;
+#[cfg(test)]
+use async_openai::types::responses::Response;
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 enum TextKind {
     Answer,
     Refusal,
     Summary,
+    Reasoning,
 }
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -36,6 +40,7 @@ pub(super) struct StreamState {
     emitted: BTreeMap<TextKey, String>,
     finalized: BTreeMap<TextKey, String>,
     finalized_items: BTreeMap<u32, OutputItem>,
+    pending_calls: BTreeMap<u32, Option<String>>,
     commentary: HashSet<(u32, String)>,
     native_tools: bool,
     corrected: bool,
@@ -53,7 +58,24 @@ impl StreamState {
         let mut parts = Vec::new();
         match event {
             ResponseOutputItemAdded(event) => {
+                match &event.item {
+                    OutputItem::FunctionCall(call) => {
+                        self.pending_calls.insert(event.output_index, Some(call.call_id.clone()));
+                    }
+                    OutputItem::CustomToolCall(call) => {
+                        self.pending_calls.insert(event.output_index, Some(call.call_id.clone()));
+                    }
+                    _ => {}
+                }
                 self.record_phase(event.output_index, &event.item);
+                return None;
+            }
+            ResponseFunctionCallArgumentsDelta(event) => {
+                self.pending_calls.entry(event.output_index).or_default();
+                return None;
+            }
+            ResponseCustomToolCallInputDelta(event) => {
+                self.pending_calls.entry(event.output_index).or_default();
                 return None;
             }
             ResponseOutputTextDelta(event) => {
@@ -141,7 +163,32 @@ impl StreamState {
                 );
                 self.done(key, &text.text, &mut parts);
             }
+            ResponseReasoningTextDelta(event) => {
+                let key = TextKey::new(
+                    &event.item_id,
+                    event.output_index,
+                    event.content_index,
+                    TextKind::Reasoning,
+                );
+                self.delta(key, &event.delta, &mut parts);
+            }
+            ResponseReasoningTextDone(event) => {
+                let key = TextKey::new(
+                    &event.item_id,
+                    event.output_index,
+                    event.content_index,
+                    TextKind::Reasoning,
+                );
+                self.done(key, &event.text, &mut parts);
+            }
             ResponseOutputItemDone(event) => {
+                // A complete done call may replace its whole identity, never mix
+                // earlier fragments into that authoritative payload.
+                if let Some(pending) = self.pending_calls.get_mut(&event.output_index)
+                    && let Some(call_id) = wire::finalized_call(&event.item)
+                {
+                    *pending = Some(call_id.to_owned());
+                }
                 self.record_phase(event.output_index, &event.item);
                 for (key, text) in Self::item_texts(event.output_index, &event.item) {
                     self.done(key, text, &mut parts);
@@ -157,15 +204,47 @@ impl StreamState {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn complete(&mut self, response: Response) -> LlmResponse {
+        self.finish(&wire::Response::from(&response)).unwrap()
+    }
+
     /// Converts the terminal response, keeping only what the stream has not delivered.
-    pub(super) fn complete(&mut self, mut response: Response) -> LlmResponse {
+    pub(super) fn finish(
+        &mut self,
+        response: &wire::Response,
+    ) -> Result<LlmResponse, adk_core::AdkError> {
+        if response.output_missing && self.finalized_items.is_empty() {
+            return Err(wire::missing_output());
+        }
+        let mut response = response.clone();
         let recovered = response.output.is_empty() && !self.finalized_items.is_empty();
         if recovered {
             // Some endpoints omit terminal output after emitting authoritative done items.
             // Recover the whole items, including calls and reasoning.
             response.output = std::mem::take(&mut self.finalized_items).into_values().collect();
         }
-        let mut full = responses_convert::from_response(&response);
+        wire::validate(&response)?;
+        for (index, expected) in &self.pending_calls {
+            fn call_id(item: &OutputItem) -> Option<&str> {
+                match item {
+                    OutputItem::FunctionCall(call) => Some(call.call_id.as_str()),
+                    OutputItem::CustomToolCall(call) => Some(call.call_id.as_str()),
+                    _ => None,
+                }
+            }
+            let identity = if let Some(expected) = expected {
+                response.output.iter().filter_map(call_id).find(|identity| *identity == expected)
+            } else {
+                response.output.get(*index as usize).and_then(call_id)
+            };
+            if identity.is_none()
+                || expected.as_deref().zip(identity).is_some_and(|(left, right)| left != right)
+            {
+                return Err(wire::unfinished());
+            }
+        }
+        let mut full = responses_convert::from_projection(&response);
         let mut final_keys = BTreeSet::new();
         for (output_index, item) in response.output.iter_mut().enumerate() {
             final_keys.extend(Self::item_texts(output_index as u32, item).map(|(key, _)| key));
@@ -194,7 +273,7 @@ impl StreamState {
             // Keep metadata/citation offsets from the full response, not its suffixes.
             full.content = responses_convert::output_parts(&response.output).ok().flatten();
         }
-        full
+        Ok(full)
     }
 
     fn record_phase(&mut self, output_index: u32, item: &OutputItem) {
@@ -298,7 +377,20 @@ impl StreamState {
                 )
             })
         });
-        message_texts.chain(summary_texts)
+        let raw_texts = reasoning
+            .into_iter()
+            .filter(|reasoning| reasoning.summary.is_empty())
+            .flat_map(move |reasoning| {
+                let item_id = reasoning.id.as_deref().unwrap_or_default();
+                reasoning.content.iter().flatten().enumerate().map(move |(index, content)| {
+                    let ReasoningItemContent::ReasoningText(text) = content;
+                    (
+                        TextKey::new(item_id, output_index, index as u32, TextKind::Reasoning),
+                        text.text.as_str(),
+                    )
+                })
+            });
+        message_texts.chain(summary_texts).chain(raw_texts)
     }
 
     /// Replaces each text in `item` with the suffix the stream has not delivered.
@@ -327,6 +419,21 @@ impl StreamState {
                         TextKey::new(item_id, output_index, part_index as u32, TextKind::Summary);
                     text.text = self.done(key, &text.text, &mut ignored);
                 }
+                if reasoning.summary.is_empty() {
+                    for (part_index, content) in reasoning.content.iter_mut().flatten().enumerate()
+                    {
+                        let text = match content {
+                            ReasoningItemContent::ReasoningText(text) => &mut text.text,
+                        };
+                        let key = TextKey::new(
+                            item_id,
+                            output_index,
+                            part_index as u32,
+                            TextKind::Reasoning,
+                        );
+                        *text = self.done(key, text, &mut ignored);
+                    }
+                }
             }
             _ => {}
         }
@@ -343,7 +450,7 @@ impl StreamState {
         if self.is_commentary(key) {
             let content = commentary_content(key.kind, text);
             Some(commentary_message(&key.item_id, message_status, vec![content]))
-        } else if key.kind == TextKind::Summary {
+        } else if matches!(key.kind, TextKind::Summary | TextKind::Reasoning) {
             Some(Part::Thinking { thinking: text.into(), signature: None })
         } else {
             Some(Part::Text { text: text.into() })
