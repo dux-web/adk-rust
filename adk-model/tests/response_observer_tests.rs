@@ -149,7 +149,7 @@ async fn preserves_builders_in_both_orders() {
                 assert_eq!(requests.len(), 1);
                 let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
                 assert_eq!(body["metadata"]["fixture"], "custom");
-                assert_eq!(body["stream"].as_bool().unwrap_or(false), streaming);
+                assert_eq!(body.get("stream"), Some(&Value::Bool(streaming)));
             }
         }
     }
