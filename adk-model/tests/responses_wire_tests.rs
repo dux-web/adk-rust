@@ -353,21 +353,30 @@ async fn preserves_known_incomplete_outcomes_and_aliases() {
 }
 
 #[tokio::test]
-async fn rejects_eof_without_terminal() {
+async fn retries_eof_without_terminal() {
     for prefix in ["", ": heartbeat\n\n", "data: [DONE]\n\n"] {
         let error = generate(prefix.into(), true).await.unwrap_err();
-        safe(&error);
+        assert_eq!(error.category, adk_core::ErrorCategory::Unavailable);
+        assert!(error.retry.should_retry);
+        assert!(adk_model::retry::is_retryable_model_error(&error));
         assert_eq!(error.code, "model.openai_responses.unfinished_stream");
     }
     let error =
         events(&[json!({"type":"response.created","response":{"id":"r"}})]).await.unwrap_err();
+    assert_eq!(error.category, adk_core::ErrorCategory::Unavailable);
+    assert!(error.retry.should_retry);
     assert_eq!(error.code, "model.openai_responses.unfinished_stream");
+}
+
+#[tokio::test]
+async fn rejects_unfinished_terminal() {
     let fragment = json!({"type":"response.function_call_arguments.delta", "sequence_number":1,
         "item_id":"fc", "output_index":0, "delta":"{"});
-    assert_eq!(
-        events(&[fragment, terminal(response(json!([])))]).await.unwrap_err().code,
-        "model.openai_responses.unfinished_stream"
-    );
+    let error = events(&[fragment, terminal(response(json!([])))]).await.unwrap_err();
+    safe(&error);
+    assert_eq!(error.category, adk_core::ErrorCategory::Internal);
+    assert!(!error.retry.should_retry);
+    assert_eq!(error.code, "model.openai_responses.unfinished_stream");
 }
 
 #[tokio::test]

@@ -978,7 +978,13 @@ impl Llm for OpenAIResponsesClient {
                         }
                     }
                 }
-                Err(wire::unfinished())?;
+                // Physical EOF is recoverable; a malformed terminal remains a wire error.
+                Err(AdkError::new(
+                    ErrorComponent::Model,
+                    ErrorCategory::Unavailable,
+                    "model.openai_responses.unfinished_stream",
+                    "OpenAI Responses stream ended before completion",
+                ).with_provider("openai-responses"))?;
             };
 
             Ok(crate::usage_tracking::with_usage_tracking(Box::pin(response_stream), usage_span))
@@ -1567,6 +1573,7 @@ mod tests {
 
     #[test]
     fn test_new_allows_empty_api_key_with_open_responses_mode_and_base_url() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         // Open Responses mode + custom base URL should allow empty API key
         let config = OpenAIResponsesConfig::new("", "local-model")
             .with_open_responses_mode(true)
@@ -1577,6 +1584,7 @@ mod tests {
 
     #[test]
     fn test_open_responses_mode_stored_on_client() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let config = OpenAIResponsesConfig::new("", "local-model")
             .with_open_responses_mode(true)
             .with_base_url("http://localhost:1234/v1");
@@ -1587,6 +1595,7 @@ mod tests {
 
     #[test]
     fn test_new_with_api_key_and_open_responses_mode() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         // Even with Open Responses mode, providing an API key should work fine
         let config = OpenAIResponsesConfig::new("sk-test", "local-model")
             .with_open_responses_mode(true)
@@ -1598,6 +1607,7 @@ mod tests {
 
     #[test]
     fn test_new_without_open_responses_mode_stores_false() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let config = OpenAIResponsesConfig::new("sk-test", "gpt-4o");
         let client = OpenAIResponsesClient::new(config).unwrap();
         assert!(!client.is_open_responses_mode());
@@ -1614,6 +1624,7 @@ mod tests {
 
     #[test]
     fn test_custom_base_url_with_api_key_works_without_open_responses_mode() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let config = OpenAIResponsesConfig::new("sk-test", "local-model")
             .with_base_url("http://localhost:1234/v1");
         let client = OpenAIResponsesClient::new(config).unwrap();
