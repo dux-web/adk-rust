@@ -4,6 +4,8 @@
 mod errors;
 #[path = "responses_lines.rs"]
 mod lines;
+#[path = "responses_parse.rs"]
+mod parse;
 #[path = "responses_stream.rs"]
 mod stream;
 use stream::StreamState;
@@ -821,6 +823,13 @@ fn set_max_reasoning_effort(
 
 /// Map an `async_openai::error::OpenAIError` to an `AdkError`.
 pub(super) fn map_openai_error(e: async_openai::error::OpenAIError) -> AdkError {
+    map_error(e, parse::Layer::ResponseBody)
+}
+
+fn map_error(e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkError {
+    if let async_openai::error::OpenAIError::JSONDeserialize(error, body) = e {
+        return parse::error(&error, &body, layer);
+    }
     if let Some(error) = errors::mapped_http_error(&e) {
         return error;
     }
@@ -848,17 +857,6 @@ pub(super) fn map_openai_error(e: async_openai::error::OpenAIError) -> AdkError 
             ErrorCategory::Unavailable,
             "model.openai_responses.stream",
             format!("OpenAI Responses API stream error: {error_string}"),
-        )
-        .with_provider("openai-responses");
-    }
-
-    // JSON deserialization → Internal
-    if let async_openai::error::OpenAIError::JSONDeserialize(_, _) = e {
-        return AdkError::new(
-            ErrorComponent::Model,
-            ErrorCategory::Internal,
-            "model.openai_responses.parse",
-            format!("OpenAI Responses API parse error: {error_string}"),
         )
         .with_provider("openai-responses");
     }
@@ -949,7 +947,11 @@ impl Llm for OpenAIResponsesClient {
                     let client = self.client.clone();
                     let request = create_request.clone();
                     async move {
-                        client.responses().create_stream(request).await.map_err(map_openai_error)
+                        client
+                            .responses()
+                            .create_stream(request)
+                            .await
+                            .map_err(|error| map_error(error, parse::Layer::StreamSetup))
                     }
                 })
                 .await?;
@@ -958,7 +960,8 @@ impl Llm for OpenAIResponsesClient {
             let response_stream = try_stream! {
                 futures::pin_mut!(event_stream);
                 while let Some(event_result) = event_stream.next().await {
-                    let event = event_result.map_err(map_openai_error)?;
+                    let event = event_result
+                        .map_err(|error| map_error(error, parse::Layer::StreamEvent))?;
                     if let Some(response) = state.partial(&event) {
                         yield response;
                     } else {
