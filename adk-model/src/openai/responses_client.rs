@@ -1,5 +1,7 @@
 //! OpenAI Responses API client implementation.
 
+#[path = "responses_parse.rs"]
+mod parse;
 use super::config::{OpenAIReasoningEffort, OpenAIResponsesConfig, ReasoningSummary};
 use super::responses_convert;
 use super::responses_stream::StreamState;
@@ -790,8 +792,15 @@ fn is_unknown_event_type(error: &serde_json::Error, payload: &str) -> bool {
 
 /// Map an `async_openai::error::OpenAIError` to an `AdkError`.
 pub(super) fn map_openai_error(e: async_openai::error::OpenAIError) -> AdkError {
-    if let Some(mapped) = responses_errors::mapped_http_error(&e) {
-        return mapped;
+    map_error(e, parse::Layer::ResponseBody)
+}
+
+fn map_error(e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkError {
+    if let async_openai::error::OpenAIError::JSONDeserialize(error, body) = e {
+        return parse::error(&error, &body, layer);
+    }
+    if let Some(error) = responses_errors::mapped_http_error(&e) {
+        return error;
     }
     let error_string = e.to_string();
 
@@ -817,17 +826,6 @@ pub(super) fn map_openai_error(e: async_openai::error::OpenAIError) -> AdkError 
             ErrorCategory::Unavailable,
             "model.openai_responses.stream",
             format!("OpenAI Responses API stream error: {error_string}"),
-        )
-        .with_provider("openai-responses");
-    }
-
-    // JSON deserialization → Internal
-    if let async_openai::error::OpenAIError::JSONDeserialize(_, _) = e {
-        return AdkError::new(
-            ErrorComponent::Model,
-            ErrorCategory::Internal,
-            "model.openai_responses.parse",
-            format!("OpenAI Responses API parse error: {error_string}"),
         )
         .with_provider("openai-responses");
     }
@@ -896,7 +894,11 @@ impl Llm for OpenAIResponsesClient {
                     let client = self.client.clone();
                     let request = create_request.clone();
                     async move {
-                        client.responses().create_stream(request).await.map_err(map_openai_error)
+                        client
+                            .responses()
+                            .create_stream(request)
+                            .await
+                            .map_err(|error| map_error(error, parse::Layer::StreamSetup))
                     }
                 })
                 .await?;
@@ -915,7 +917,7 @@ impl Llm for OpenAIResponsesClient {
                             tracing::debug!(error = %error, "skipping unrecognized Responses stream event");
                             continue;
                         }
-                        Err(error) => Err(map_openai_error(error))?,
+                        Err(error) => Err(map_error(error, parse::Layer::StreamEvent))?,
                     };
                     match event {
                         ResponseStreamEvent::ResponseCompleted(evt) => {
