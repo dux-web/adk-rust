@@ -180,6 +180,55 @@ async fn recovers_only_authoritative_missing_output() {
 }
 
 #[tokio::test]
+async fn rejects_empty_terminal_identity() {
+    let value = json!({"id":"", "status":"completed", "output":[]});
+    for result in [unary(&value).await, events(&[terminal(value.clone())]).await] {
+        let error = result.unwrap_err();
+        safe(&error);
+        assert_eq!(error.code, "model.openai_responses.invalid_identity");
+    }
+}
+
+#[tokio::test]
+async fn rejects_unrelated_done_after_tool_fragment() {
+    let error = events(&[
+        json!({"type":"response.function_call_arguments.delta", "sequence_number":1,
+            "item_id":"fc_pending", "output_index":0, "delta":"{\"path\":"}),
+        json!({"type":"response.output_item.done", "sequence_number":2,
+            "output_index":0, "item":message("unrelated")}),
+        terminal(response(json!([message("unrelated")]))),
+    ])
+    .await
+    .unwrap_err();
+    safe(&error);
+    assert_eq!(error.code, "model.openai_responses.unfinished_stream");
+}
+
+#[tokio::test]
+async fn rejects_unfinished_done_identity_replacement() {
+    for (status, arguments, call_id) in
+        [("in_progress", "{}", "call_b"), ("completed", "{", "call_b"), ("completed", "{}", "")]
+    {
+        let done_call = json!({"type":"function_call", "call_id":call_id,
+            "name":"read", "arguments":arguments, "status":status});
+        let final_call = json!({"type":"function_call", "call_id":"call_b",
+            "name":"read", "arguments":"{}", "status":"completed"});
+        let error = events(&[
+            json!({"type":"response.output_item.added", "sequence_number":1,
+                "output_index":0, "item":{"type":"function_call", "call_id":"call_a",
+                    "name":"read", "arguments":"", "status":"in_progress"}}),
+            json!({"type":"response.output_item.done", "sequence_number":2,
+                "output_index":0, "item":done_call}),
+            terminal(response(json!([final_call]))),
+        ])
+        .await
+        .unwrap_err();
+        safe(&error);
+        assert_eq!(error.code, "model.openai_responses.unfinished_stream");
+    }
+}
+
+#[tokio::test]
 async fn preserves_raw_reasoning_and_done_order() {
     let reasoning = json!({"type":"reasoning", "id":"rs", "summary":[],
         "content":[{"type":"reasoning_text", "text":"thought"}]});

@@ -180,7 +180,13 @@ impl StreamState {
                 self.done(key, &event.text, &mut parts);
             }
             ResponseOutputItemDone(event) => {
-                self.pending_calls.remove(&event.output_index);
+                // A complete done call may replace its whole identity, never mix
+                // earlier fragments into that authoritative payload.
+                if let Some(pending) = self.pending_calls.get_mut(&event.output_index)
+                    && let Some(call_id) = super::wire::finalized_call(&event.item)
+                {
+                    *pending = Some(call_id.to_owned());
+                }
                 self.finalized_items.insert(event.output_index, event.item.clone());
                 self.record_phase(event.output_index, &event.item);
                 let mut item = event.item.clone();

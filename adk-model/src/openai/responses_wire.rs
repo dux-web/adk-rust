@@ -179,7 +179,30 @@ pub(super) fn response(
     Ok(projected)
 }
 
+pub(super) fn finalized_call(item: &OutputItem) -> Option<&str> {
+    match item {
+        OutputItem::FunctionCall(call)
+            if !call.call_id.is_empty()
+                && !call.name.is_empty()
+                && call.status.as_ref().is_none_or(|status| *status == OutputStatus::Completed)
+                && super::super::convert::decode_tool_call_arguments(Some(&Value::String(
+                    call.arguments.clone(),
+                )))
+                .is_ok() =>
+        {
+            Some(&call.call_id)
+        }
+        OutputItem::CustomToolCall(call) if !call.call_id.is_empty() && !call.name.is_empty() => {
+            Some(&call.call_id)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn validate(response: &Response) -> Result<(), AdkError> {
+    if response.id.is_empty() {
+        return Err(invalid("invalid_identity", "OpenAI Responses identity is empty"));
+    }
     let mut calls = std::collections::HashSet::new();
     for item in &response.output {
         let (call_id, name, unfinished) = match item {
