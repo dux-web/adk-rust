@@ -911,7 +911,13 @@ impl Llm for OpenAIResponsesClient {
                         wire::Event::Activity => {}
                     }
                 }
-                Err(wire::unfinished())?;
+                // Physical EOF is recoverable; a malformed terminal remains a wire error.
+                Err(AdkError::new(
+                    ErrorComponent::Model,
+                    ErrorCategory::Unavailable,
+                    "model.openai_responses.unfinished_stream",
+                    "OpenAI Responses stream ended before completion",
+                ).with_provider("openai-responses"))?;
             };
 
             Ok(crate::usage_tracking::with_priced_usage_tracking(
