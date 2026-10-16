@@ -15,7 +15,6 @@ const MAX_STOP_SEQUENCES: usize = 100;
 const MAX_STOP_SEQUENCE_LENGTH: usize = 1000;
 /// Text bytes in the system prompt (100 KB).
 const MAX_SYSTEM_PROMPT_LENGTH: usize = 100_000;
-const MAX_TOOLS_COUNT: usize = 100;
 /// Largest image the Messages API accepts (5 MB), compared against the decoded size.
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 /// Largest PDF the Messages API accepts (32 MB), compared against the decoded size.
@@ -480,16 +479,6 @@ impl MessageCreateParams {
                     Some("system".to_string()),
                 ));
             }
-        }
-
-        // Validate tools count
-        if let Some(ref tools) = self.tools
-            && tools.len() > MAX_TOOLS_COUNT
-        {
-            return Err(crate::Error::validation(
-                format!("Tools count {} exceeds limit of {}", tools.len(), MAX_TOOLS_COUNT),
-                Some("tools".to_string()),
-            ));
         }
 
         // Validate thinking config with security checks
@@ -1040,5 +1029,69 @@ mod tests {
         let params = MessageCreateParams::simple("Hi", KnownModel::ClaudeSonnet46)
             .with_system("s".repeat(MAX_SYSTEM_PROMPT_LENGTH + 1));
         assert!(params.validate().is_err(), "a system prompt above the limit is rejected");
+    }
+
+    fn params_with_tools() -> MessageCreateParams {
+        let tools = (0..101)
+            .map(|index| {
+                ToolUnionParam::CustomTool(
+                    crate::types::ToolParam::new(
+                        format!("tool_{index}"),
+                        json!({
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                            "additionalProperties": false
+                        }),
+                    )
+                    .with_description(format!("Tool {index}")),
+                )
+            })
+            .collect();
+        MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet46).with_tools(tools)
+    }
+
+    #[test]
+    fn retains_more_than_one_hundred_tools() {
+        let params = params_with_tools();
+        params.validate().expect("valid tools are not limited to one hundred");
+
+        let serialized = to_value(&params).unwrap();
+        let tools = serialized["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 101);
+        assert_eq!(tools.first().unwrap()["name"], "tool_0");
+        assert_eq!(tools.last().unwrap()["name"], "tool_100");
+        for (index, tool) in tools.iter().enumerate() {
+            assert_eq!(
+                tool,
+                &json!({
+                    "type": "custom",
+                    "name": format!("tool_{index}"),
+                    "description": format!("Tool {index}"),
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                        "additionalProperties": false
+                    }
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn validates_other_parameters_with_many_tools() {
+        let mut no_tokens = params_with_tools();
+        no_tokens.max_tokens = 0;
+        let invalid_thinking = params_with_tools().with_thinking(ThinkingConfig::enabled(1023));
+        for (params, parameter) in
+            [(no_tokens, "max_tokens"), (invalid_thinking, "thinking.budget_tokens")]
+        {
+            let error = params.validate().expect_err("invalid parameters remain rejected");
+            assert!(
+                matches!(error, crate::Error::Validation { param: Some(actual), .. } if actual == parameter),
+                "expected validation of {parameter}"
+            );
+        }
     }
 }
