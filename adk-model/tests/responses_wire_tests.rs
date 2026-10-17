@@ -66,10 +66,15 @@ async fn unary(value: &Value) -> Result<Vec<LlmResponse>, AdkError> {
 }
 
 fn safe(error: &AdkError) {
+    safe_output(error);
+    assert!(std::error::Error::source(error).is_none());
+}
+
+fn safe_output(error: &AdkError) {
     assert!(!error.to_string().contains(SECRET));
     assert!(!format!("{error:?}").contains(SECRET));
     assert!(!serde_json::to_string(&error.details.metadata).unwrap().contains(SECRET));
-    assert!(std::error::Error::source(error).is_none());
+    assert!(!error.to_problem_json().to_string().contains(SECRET));
     assert!(!error.is_retryable());
 }
 
@@ -309,7 +314,22 @@ async fn rejects_failed_unknown_and_nonterminal_statuses() {
         value["error"] = json!({"code":SECRET,"message":SECRET});
         for result in [unary(&value).await, events(&[terminal(value.clone())]).await] {
             let error = result.unwrap_err();
-            safe(&error);
+            if status == "failed" {
+                safe_output(&error);
+                assert_eq!(error.code, "model.openai_responses.response_failed");
+                let detail = std::error::Error::source(&error)
+                    .unwrap()
+                    .downcast_ref::<adk_model::openai::ProviderErrorDetails>()
+                    .unwrap();
+                assert_eq!(detail.code.as_deref(), Some(SECRET));
+                assert_eq!(detail.message.as_deref(), Some(SECRET));
+                assert_eq!(detail.kind, None);
+                assert_eq!(detail.param, None);
+                assert_eq!(detail.status, None);
+                assert_eq!(detail.request_id, None);
+            } else {
+                safe(&error);
+            }
             assert_ne!(error.code, "model.openai_responses.unfinished_stream");
         }
     }

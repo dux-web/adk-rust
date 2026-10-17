@@ -120,7 +120,21 @@ mod http_errors {
             };
             let error = result.unwrap_err();
             assert_eq!(error.details.upstream_status_code, Some(status));
-            assert!(error.to_string().contains("Selected model is not supported"));
+            let detail = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<adk_model::openai::ProviderErrorDetails>()
+                .unwrap();
+            assert_eq!(detail.message.as_deref(), Some("Selected model is not supported"));
+            assert_eq!(detail.status, Some(status));
+            assert_eq!(detail.code, None);
+            assert_eq!(detail.kind, None);
+            assert_eq!(detail.param, None);
+            assert_eq!(detail.request_id, None);
+            assert!(!error.to_string().contains("Selected model is not supported"));
+            assert!(!format!("{error:?}").contains("Selected model is not supported"));
+            assert!(
+                !error.to_problem_json().to_string().contains("Selected model is not supported")
+            );
             assert_ne!(error.code, "model.openai_responses.parse");
         }
     }

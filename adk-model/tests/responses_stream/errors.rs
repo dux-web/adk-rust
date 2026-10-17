@@ -180,3 +180,55 @@ async fn preserves_unknown_service_retry() {
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
+
+#[tokio::test]
+async fn retains_private_structured_stream_errors() {
+    for compatible in [false, true] {
+        for kind in ["nested", "flat", "failed"] {
+            let (_server, client) = client(vec![failure("context_limit", kind)], compatible).await;
+            let mut stream = client.generate_content(request(), true).await.unwrap();
+            let error = stream.next().await.unwrap().unwrap_err();
+            let detail = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<adk_model::openai::ProviderErrorDetails>()
+                .unwrap();
+            assert_eq!(detail.code.as_deref(), Some("context_limit"));
+            assert_eq!(detail.message.as_deref(), Some(PRIVATE));
+            assert_eq!(detail.status, None);
+            assert!(!format!("{error:?}").contains(PRIVATE));
+            assert!(!error.to_string().contains(PRIVATE));
+            assert!(!error.to_problem_json().to_string().contains(PRIVATE));
+            assert!(!error.retry.should_retry);
+            assert!(stream.next().await.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn retains_private_structured_http_errors() {
+    for compatible in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({"error":{
+                "type":"invalid_request_error", "code":"context_limit", "param":"input",
+                "message":PRIVATE}})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = super::client(&server.uri(), compatible);
+        let error = client.generate_content(request(), true).await.err().unwrap();
+        let detail = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<adk_model::openai::ProviderErrorDetails>()
+            .unwrap();
+        assert_eq!(detail.code.as_deref(), Some("context_limit"));
+        assert_eq!(detail.kind.as_deref(), Some("invalid_request_error"));
+        assert_eq!(detail.param.as_deref(), Some("input"));
+        assert_eq!(detail.message.as_deref(), Some(PRIVATE));
+        assert_eq!(detail.status, Some(400));
+        assert_eq!(error.details.upstream_status_code, Some(400));
+        assert!(!format!("{error:?}").contains(PRIVATE));
+        assert!(!error.to_problem_json().to_string().contains(PRIVATE));
+    }
+}

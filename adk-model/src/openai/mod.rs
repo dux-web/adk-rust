@@ -24,6 +24,7 @@ pub mod conversations;
 pub(crate) mod convert;
 pub mod file_input;
 pub mod pricing;
+mod provider_error;
 mod request;
 mod responses_client;
 mod responses_convert;
@@ -42,6 +43,7 @@ pub use config::{
 };
 #[cfg(feature = "openai-conversations")]
 pub use conversations::ConversationsClient;
+pub use provider_error::ProviderErrorDetails;
 pub use request::{RequestAdapter, ResponseObserver};
 pub use responses_client::OpenAIResponsesClient;
 pub use schema_adapter::{OpenAiSchemaAdapter, OpenAiStrictSchemaAdapter};

@@ -69,6 +69,24 @@ struct Lifecycle {
 #[derive(Deserialize)]
 struct Failure {
     code: Option<String>,
+    message: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    param: Option<String>,
+    request_id: Option<String>,
+}
+
+impl From<Failure> for super::super::ProviderErrorDetails {
+    fn from(error: Failure) -> Self {
+        Self {
+            code: error.code,
+            kind: error.kind,
+            message: error.message,
+            param: error.param,
+            request_id: error.request_id,
+            status: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -107,14 +125,16 @@ pub(super) fn event(value: Value) -> Result<Event, AdkError> {
                 &value,
                 parse::Layer::StreamEvent,
             )?;
-            Err(errors::stream_error(header.error.as_ref().and_then(|error| error.code.as_deref())))
+            Err(errors::stream_error(header.error.map(Into::into)))
         }
         "response.cancelled" | "response.canceled" => {
             Err(invalid("cancelled", "OpenAI Responses generation was cancelled"))
         }
         "error" => {
-            let failure: Failure = decode(value.clone(), &value, parse::Layer::StreamEvent)?;
-            Err(errors::stream_error(failure.code.as_deref()))
+            let mut failure: Failure = decode(value.clone(), &value, parse::Layer::StreamEvent)?;
+            // The outer `type` identifies the event, not the provider error.
+            failure.kind = value.get("error_type").and_then(Value::as_str).map(str::to_owned);
+            Err(errors::stream_error(Some(failure.into())))
         }
         "response.output_item.added"
         | "response.output_item.done"
@@ -149,9 +169,7 @@ pub(super) fn response(
 ) -> Result<Response, AdkError> {
     let header: Header = decode(value.clone(), body, layer)?;
     if header.status == Status::Failed {
-        return Err(errors::stream_error(
-            header.error.as_ref().and_then(|error| error.code.as_deref()),
-        ));
+        return Err(errors::stream_error(header.error.map(Into::into)));
     }
     // Detailed usage is optional on compatible providers; absent breakdowns do
     // not invalidate the authoritative input/output/total counts.

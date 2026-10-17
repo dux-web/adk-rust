@@ -1,5 +1,6 @@
 //! Responses error normalization and safe, non-replaying stream failures.
 
+use super::super::ProviderErrorDetails;
 use adk_core::{AdkError, ErrorCategory, ErrorComponent, RetryHint};
 use async_openai::error::{ApiErrorResponse, OpenAIError};
 use async_openai::types::responses::ResponseErrorEvent;
@@ -149,6 +150,9 @@ struct ErrorDetail {
     code: Option<String>,
     message: String,
     param: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    request_id: Option<String>,
 }
 
 pub(super) fn normalize_event(value: &mut Value) -> bool {
@@ -160,6 +164,8 @@ pub(super) fn normalize_event(value: &mut Value) -> bool {
     let Ok(nested) = serde_json::from_value::<NestedError>(value.clone()) else {
         return false;
     };
+    let kind = nested.error.kind;
+    let request_id = nested.error.request_id;
     let event = ResponseErrorEvent {
         sequence_number: nested.sequence_number,
         code: nested.error.code,
@@ -170,6 +176,12 @@ pub(super) fn normalize_event(value: &mut Value) -> bool {
         return false;
     };
     flattened["type"] = "error".into();
+    if let Some(kind) = kind {
+        flattened["error_type"] = kind.into();
+    }
+    if let Some(request_id) = request_id {
+        flattened["request_id"] = request_id.into();
+    }
     *value = flattened;
     true
 }
@@ -195,10 +207,12 @@ pub(super) fn sharing_error(code: Option<&str>) -> Option<AdkError> {
     )
 }
 
-pub(super) fn stream_error(code: Option<&str>) -> AdkError {
+pub(super) fn stream_error(details: Option<ProviderErrorDetails>) -> AdkError {
+    let code = details.as_ref().and_then(|details| details.code.as_deref());
     // Provider messages and unknown codes can echo request credentials. Only
-    // known static diagnostics leave the adapter; no failed stream is replayed.
-    sharing_error(code).unwrap_or_else(|| {
+    // formatting uses static diagnostics; raw fields stay in a redacted source.
+    // No failed stream is replayed.
+    let error = sharing_error(code).unwrap_or_else(|| {
         AdkError::new(
             ErrorComponent::Model,
             ErrorCategory::Internal,
@@ -206,7 +220,11 @@ pub(super) fn stream_error(code: Option<&str>) -> AdkError {
             "OpenAI Responses generation failed",
         )
         .with_provider("openai-responses")
-    })
+    });
+    match details {
+        Some(details) => error.with_source(details),
+        None => error,
+    }
 }
 
 #[cfg(test)]

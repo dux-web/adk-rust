@@ -875,9 +875,17 @@ fn map_error(e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkErr
 
 fn map_api_error(api_err: &async_openai::error::ApiErrorResponse) -> AdkError {
     let status_code = api_err.status_code.as_u16();
+    let details = super::ProviderErrorDetails {
+        code: api_err.api_error.code.clone(),
+        kind: api_err.api_error.r#type.clone(),
+        message: Some(api_err.api_error.message.clone()),
+        param: api_err.api_error.param.clone(),
+        status: Some(status_code),
+        request_id: None,
+    };
     if let Some(error) = errors::sharing_error(api_err.api_error.code.as_deref()) {
         return crate::error_metadata::with_code(
-            error.with_upstream_status(status_code),
+            error.with_upstream_status(status_code).with_source(details),
             api_err.api_error.code.as_deref(),
         );
     }
@@ -894,14 +902,10 @@ fn map_api_error(api_err: &async_openai::error::ApiErrorResponse) -> AdkError {
         _ => (ErrorCategory::Internal, "model.openai_responses.api_error"),
     };
     crate::error_metadata::with_code(
-        AdkError::new(
-            ErrorComponent::Model,
-            category,
-            code,
-            format!("OpenAI Responses API error: {api_err}"),
-        )
-        .with_provider("openai-responses")
-        .with_upstream_status(status_code),
+        AdkError::new(ErrorComponent::Model, category, code, "OpenAI Responses API request failed")
+            .with_provider("openai-responses")
+            .with_upstream_status(status_code)
+            .with_source(details),
         api_err.api_error.code.as_deref(),
     )
 }
