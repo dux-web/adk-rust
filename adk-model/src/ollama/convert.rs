@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use crate::attachment;
 use adk_core::{Content, FinishReason, LlmResponse, Part, UsageMetadata};
 use ollama_rs::generation::chat::{ChatMessage, ChatMessageResponse};
+use serde_json::Value;
 
 /// Convert ADK Content to Ollama ChatMessage.
 pub fn content_to_chat_message(content: &Content) -> Option<ChatMessage> {
@@ -52,6 +53,39 @@ pub fn content_to_chat_message(content: &Content) -> Option<ChatMessage> {
         }
         _ => None,
     }
+}
+
+/// Metric fields of a final `/api/chat` line, kept in `provider_usage`.
+const METRICS: [&str; 6] = [
+    "total_duration",
+    "load_duration",
+    "prompt_eval_count",
+    "prompt_eval_duration",
+    "eval_count",
+    "eval_duration",
+];
+
+/// Usage from a final (`done: true`) `/api/chat` line, read from the line as received.
+///
+/// Ollama leaves out a metric that is zero, such as `prompt_eval_count` when the whole prompt
+/// came from its cache, so a missing or `null` count is zero and the counts that are present
+/// are still reported. `provider_usage` keeps the line's metric fields exactly as sent.
+pub fn usage(line: &Value) -> Option<UsageMetadata> {
+    use crate::usage_json::count;
+    let object = line.as_object()?;
+    let metrics: serde_json::Map<String, Value> = METRICS
+        .iter()
+        .filter_map(|key| Some(((*key).to_string(), object.get(*key)?.clone())))
+        .collect();
+    let prompt = count(line, "/prompt_eval_count").unwrap_or_default();
+    let output = count(line, "/eval_count").unwrap_or_default();
+    Some(UsageMetadata {
+        prompt_token_count: prompt,
+        candidates_token_count: output,
+        total_token_count: prompt.saturating_add(output),
+        provider_usage: (!metrics.is_empty()).then_some(Value::Object(metrics)),
+        ..Default::default()
+    })
 }
 
 /// Convert Ollama ChatMessageResponse to ADK LlmResponse.
@@ -105,11 +139,22 @@ pub fn chat_response_to_llm_response(
     // Determine finish reason
     let finish_reason = if response.done { Some(FinishReason::Stop) } else { None };
 
-    // Extract usage metadata from final_data if available
+    // `ollama-rs` keeps the metrics only when all six are present; a caller holding the line
+    // as received replaces this with `usage`, which reports whichever counts are present.
     let usage_metadata = response.final_data.as_ref().map(|data| UsageMetadata {
-        prompt_token_count: data.prompt_eval_count as i32,
-        candidates_token_count: data.eval_count as i32,
-        total_token_count: (data.prompt_eval_count + data.eval_count) as i32,
+        prompt_token_count: i32::try_from(data.prompt_eval_count).unwrap_or(i32::MAX),
+        candidates_token_count: i32::try_from(data.eval_count).unwrap_or(i32::MAX),
+        total_token_count: i32::try_from(data.prompt_eval_count.saturating_add(data.eval_count))
+            .unwrap_or(i32::MAX),
+        // Built field by field: `ollama-rs` 0.3.4 does not implement `Serialize` for this type.
+        provider_usage: Some(serde_json::json!({
+            "total_duration": data.total_duration,
+            "load_duration": data.load_duration,
+            "prompt_eval_count": data.prompt_eval_count,
+            "prompt_eval_duration": data.prompt_eval_duration,
+            "eval_count": data.eval_count,
+            "eval_duration": data.eval_duration,
+        })),
         ..Default::default()
     });
 
@@ -197,5 +242,28 @@ mod tests {
         let message = content_to_chat_message(&content).expect("message should be created");
         assert!(message.content.contains("text/csv"));
         assert!(message.content.contains("https://example.com/data.csv"));
+    }
+
+    #[test]
+    fn typed_final_data_and_the_raw_line_report_the_same_usage() {
+        let line = serde_json::json!({
+            "model": "qwen3",
+            "created_at": "2026-10-17T00:00:00Z",
+            "message": {"role": "assistant", "content": "done"},
+            "done": true,
+            "total_duration": 2000,
+            "load_duration": 10,
+            "prompt_eval_count": 44,
+            "prompt_eval_duration": 300,
+            "eval_count": 8,
+            "eval_duration": 700
+        });
+        let response: ChatMessageResponse = serde_json::from_value(line.clone()).unwrap();
+        let typed = chat_response_to_llm_response(&response, false, &HashSet::new())
+            .usage_metadata
+            .expect("typed final data carries usage");
+        let raw = usage(&line).expect("the raw line carries usage");
+        assert_eq!(serde_json::to_value(&typed).unwrap(), serde_json::to_value(&raw).unwrap());
+        assert_eq!((raw.prompt_token_count, raw.candidates_token_count), (44, 8));
     }
 }

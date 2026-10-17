@@ -19,6 +19,7 @@ playground versions are being finalized:
 - `examples/stream_termination` — model streams that end early, end mid tool call, or carry an error frame fail the run instead of persisting a truncated answer, for the OpenAI-compatible, Groq, Ollama, and OpenRouter clients against a scripted local upstream, plus live OpenAI, Groq, and OpenRouter happy paths
 - `examples/openrouter` — end-to-end OpenRouter validation through the ADK agent stack
 - `examples/bedrock_test` — Bedrock smoke testing
+- `examples/usage_accounting` — token usage reported with `null` or missing counts, through `LlmAgent` and `Runner` with the OpenAI Responses, Anthropic, Gemini, Gemini Interactions, DeepSeek, Groq and Ollama clients against a scripted upstream, plus live OpenAI, Anthropic and Gemini: turns succeed, the tool runs once, `provider_usage` is the provider's own usage object, and run budgets count it
 - `examples/payments` — agentic commerce scenario index for ACP/AP2 validation paths
 - `examples/developer_ergonomics` — developer ergonomics validation (RunnerConfigBuilder, ToolExecutionStrategy, SimpleToolContext, StatefulTool, run_str, #[tool] attributes)
 - `examples/approval_scoping` — approvals bound to the agent that held the call and the tool it was held for: two agents in a `SequentialAgent` sharing a tool name, a held MCP call whose name moves to another server or whose tool is redefined, and fingerprints reused across runs, over the SQLite approval store with a scripted OpenAI-compatible server and live OpenAI
