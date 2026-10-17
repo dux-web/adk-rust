@@ -21,6 +21,7 @@ playground versions are being finalized:
 - `examples/bedrock_test` — Bedrock smoke testing
 - `examples/payments` — agentic commerce scenario index for ACP/AP2 validation paths
 - `examples/developer_ergonomics` — developer ergonomics validation (RunnerConfigBuilder, ToolExecutionStrategy, SimpleToolContext, StatefulTool, run_str, #[tool] attributes)
+- `examples/approval_scoping` — approvals bound to the agent that held the call and the tool it was held for: two agents in a `SequentialAgent` sharing a tool name, a held MCP call whose name moves to another server or whose tool is redefined, and fingerprints reused across runs, over the SQLite approval store with a scripted OpenAI-compatible server and live OpenAI
 - `examples/acp_client_host` — vendor-neutral ACP client with streamed updates, async permissions, and a workspace-bounded filesystem
 - `examples/acp_kiro` — external coding-agent delegation, persistent sessions, and concurrent cancellation
 - `examples/acp_server` — expose a tool-using ADK-Rust agent to an editor through stable ACP v1
