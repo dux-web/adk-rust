@@ -1150,6 +1150,9 @@ impl LlmAgentBuilder {
     }
 
     /// Add a tool to this agent's toolbox.
+    ///
+    /// The model calls tools by name, so each tool added here needs a name of
+    /// its own: [`build`](Self::build) fails when two share one.
     pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
         self.tools.push(tool);
         self
@@ -1502,7 +1505,13 @@ impl LlmAgentBuilder {
         self
     }
 
-    /// Build the [`LlmAgent`], returning an error if no model was set.
+    /// Build the [`LlmAgent`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no model was set, when two sub-agents share a
+    /// name, or when two tools added with [`tool`](Self::tool) share a name
+    /// (code `agent.duplicate_tool_name`).
     pub fn build(self) -> Result<LlmAgent> {
         let model = self.model.ok_or_else(|| adk_core::AdkError::agent("Model is required"))?;
 
@@ -1515,6 +1524,7 @@ impl LlmAgentBuilder {
                 )));
             }
         }
+        adk_core::ensure_unique_tool_names(&self.name, &self.tools)?;
 
         // Validate: Gemini Interactions API + client-side sandbox tools conflict.
         // These provide competing filesystems and would produce nondeterministic behavior.
