@@ -310,7 +310,14 @@ pub mod scripted;
     feature = "ollama"
 ))]
 mod sse;
-#[cfg(any(feature = "openai", feature = "groq", feature = "ollama", feature = "openrouter"))]
+#[cfg(any(
+    feature = "openai",
+    feature = "deepseek",
+    feature = "azure-ai",
+    feature = "groq",
+    feature = "ollama",
+    feature = "openrouter"
+))]
 mod stream_error;
 #[cfg(any(
     feature = "openai",
