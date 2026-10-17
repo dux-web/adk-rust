@@ -694,18 +694,25 @@ impl IntegratedRealtimeRunner {
                             // screening live, so the unscreened result is withheld. The tool has
                             // already run, and the model is told so it does not repeat a side
                             // effect.
-                            tracing::error!(
-                                tool = tool.name(),
-                                error = %e,
-                                "after_tool_call plugin failed; withholding the tool result"
-                            );
-                            serde_json::json!({
-                                "error": format!(
-                                    "tool {} ran, but its after-tool plugin pipeline failed ({e}), \
-                                     so its result is withheld; do not call it again for this request.",
-                                    tool.name()
-                                )
-                            })
+                            if self.runner.records_payloads() {
+                                tracing::error!(
+                                    tool = tool.name(),
+                                    error = %e.diagnostics(),
+                                    error.message = %e.message,
+                                    "after_tool_call plugin failed; withholding the tool result"
+                                );
+                            } else {
+                                tracing::error!(
+                                    tool = tool.name(),
+                                    error = %e.diagnostics(),
+                                    "after_tool_call plugin failed; withholding the tool result"
+                                );
+                            }
+                            adk_core::result_withheld_response(
+                                tool.name(),
+                                &e,
+                                self.runner.exposes_tool_error_messages(),
+                            )
                         }
                     }
                 }
@@ -713,15 +720,29 @@ impl IntegratedRealtimeRunner {
                     // Fail closed. A before-tool plugin is where authorization, redaction, and
                     // policy live, so executing the tool when that pipeline fails turns a
                     // broken guard into no guard. The model receives the error instead.
-                    tracing::error!(
-                        tool = tool.name(),
-                        error = %e,
-                        "before_tool_call plugin failed; refusing the tool"
-                    );
+                    if self.runner.records_payloads() {
+                        tracing::error!(
+                            tool = tool.name(),
+                            error = %e.diagnostics(),
+                            error.message = %e.message,
+                            "before_tool_call plugin failed; refusing the tool"
+                        );
+                    } else {
+                        tracing::error!(
+                            tool = tool.name(),
+                            error = %e.diagnostics(),
+                            "before_tool_call plugin failed; refusing the tool"
+                        );
+                    }
+                    let failure = if self.runner.exposes_tool_error_messages() {
+                        e.to_string()
+                    } else {
+                        e.redacted()
+                    };
                     serde_json::json!({
                         "error": format!(
-                            "tool {} was refused: its before-tool plugin pipeline failed ({e}). \
-                             Execution is refused rather than proceeding without policy.",
+                            "tool {} was refused: its before-tool plugin pipeline failed with \
+                             {failure}. Execution is refused rather than proceeding without policy.",
                             tool.name()
                         )
                     })
@@ -730,6 +751,9 @@ impl IntegratedRealtimeRunner {
         } else {
             self.governed_execute(tool, &ctx, &call.call_id, call.arguments.clone()).await?
         };
+        // Screened after every plugin, so neither the transcript, the session, nor the model
+        // sees a result the screen did not pass.
+        let result = self.runner.screen_tool_result(&call.name, &call.arguments, result).await;
 
         // Record completed tool call in aggregator
         self.aggregator.write().await.record_tool_call(CompletedToolCall {
@@ -783,7 +807,27 @@ impl IntegratedRealtimeRunner {
                 let execution = tool.execute(ctx.clone() as Arc<dyn adk_core::ToolContext>, args);
                 match tokio::time::timeout(timeout, execution).await {
                     Ok(Ok(value)) => value,
-                    Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
+                    Ok(Err(e)) => {
+                        if self.runner.records_payloads() {
+                            tracing::warn!(
+                                tool = tool.name(),
+                                error = %e.diagnostics(),
+                                error.message = %e.message,
+                                "realtime tool failed"
+                            );
+                        } else {
+                            tracing::warn!(
+                                tool = tool.name(),
+                                error = %e.diagnostics(),
+                                "realtime tool failed"
+                            );
+                        }
+                        adk_core::tool_error_response(
+                            tool.name(),
+                            &e,
+                            self.runner.exposes_tool_error_messages(),
+                        )
+                    }
                     Err(_) => serde_json::json!({
                         "error": format!("Tool '{}' timed out after {timeout:?}", tool.name())
                     }),

@@ -230,6 +230,8 @@ pub struct RealtimeRunnerBuilder {
     event_handler: Option<Arc<dyn EventHandler>>,
     governance: Option<ToolGovernance>,
     tool_timeout: std::time::Duration,
+    tool_result_screen: Option<Arc<dyn adk_core::ToolResultScreen>>,
+    expose_tool_error_messages: bool,
 }
 
 impl Default for RealtimeRunnerBuilder {
@@ -250,6 +252,8 @@ impl RealtimeRunnerBuilder {
             event_handler: None,
             governance: None,
             tool_timeout: DEFAULT_REALTIME_TOOL_TIMEOUT,
+            tool_result_screen: None,
+            expose_tool_error_messages: false,
         }
     }
 
@@ -289,6 +293,43 @@ impl RealtimeRunnerBuilder {
     /// Defaults to [`DEFAULT_REALTIME_TOOL_TIMEOUT`].
     pub fn tool_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.tool_timeout = timeout;
+        self
+    }
+
+    /// Screens every tool result before it is sent to the model.
+    ///
+    /// The screen sees each handler's result, or its error response, before
+    /// `function_call_output` is sent. A result the screen rewrites is sent rewritten; a result it
+    /// withholds, or that it cannot decide on (`Err`), is replaced by
+    /// [`result_blocked_response`](adk_core::result_blocked_response), so the runner fails
+    /// closed. `adk-guardrail`'s `ToolGuardrailSet` is a screen.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_guardrail::{PiiRedactor, ResultTextGuardrail, ToolGuardrailSet};
+    ///
+    /// let runner = RealtimeRunner::builder()
+    ///     .model(model)
+    ///     .tool_fn(ToolDefinition::new("lookup_order"), lookup_order)
+    ///     .tool_result_screen(Arc::new(
+    ///         ToolGuardrailSet::new().with(ResultTextGuardrail::new(PiiRedactor::new())),
+    ///     ))
+    ///     .build()?;
+    /// ```
+    pub fn tool_result_screen(mut self, screen: Arc<dyn adk_core::ToolResultScreen>) -> Self {
+        self.tool_result_screen = Some(screen);
+        self
+    }
+
+    /// Sends the full message of a handler's error to the model.
+    ///
+    /// By default a handler that fails is answered with `tool '<name>' failed` only, because
+    /// the message can quote credentials, internal hosts, or upstream bodies, and the output is
+    /// sent to the provider and can be spoken to the user. Timeouts and policy refusals keep
+    /// their message.
+    pub fn expose_tool_error_messages(mut self, expose: bool) -> Self {
+        self.expose_tool_error_messages = expose;
         self
     }
 
@@ -404,6 +445,8 @@ impl RealtimeRunnerBuilder {
             response_closed_awaiting_tools: Arc::new(AtomicBool::new(false)),
             governance: self.governance,
             tool_timeout: self.tool_timeout,
+            tool_result_screen: self.tool_result_screen,
+            expose_tool_error_messages: self.expose_tool_error_messages,
         })
     }
 }
@@ -468,6 +511,10 @@ pub struct RealtimeRunner {
     governance: Option<ToolGovernance>,
     /// How long one tool call may run.
     tool_timeout: std::time::Duration,
+    /// Screens every tool result before it is sent to the model.
+    tool_result_screen: Option<Arc<dyn adk_core::ToolResultScreen>>,
+    /// Whether handler error messages reach the model.
+    expose_tool_error_messages: bool,
 }
 
 impl RealtimeRunner {
@@ -1142,6 +1189,31 @@ impl RealtimeRunner {
         self.tool_timeout
     }
 
+    /// Whether tool error messages reach the model.
+    #[cfg(feature = "integration")]
+    pub(crate) fn exposes_tool_error_messages(&self) -> bool {
+        self.expose_tool_error_messages
+    }
+
+    /// Runs the configured result screen, if any, on `result`.
+    pub(crate) async fn screen_tool_result(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        result: serde_json::Value,
+    ) -> serde_json::Value {
+        match &self.tool_result_screen {
+            Some(screen) => adk_core::screen_tool_result(screen.as_ref(), name, args, result).await,
+            None => result,
+        }
+    }
+
+    /// Whether tool error messages may be logged: the `record_payloads` of the config passed to
+    /// [`RealtimeRunnerBuilder::tool_governance`]. Without one, only content-free fields are.
+    pub(crate) fn records_payloads(&self) -> bool {
+        self.governance.as_ref().is_some_and(|governance| governance.config.record_payloads)
+    }
+
     /// Execute a tool call and optionally send the response.
     async fn execute_tool_call(&self, call_id: &str, name: &str, arguments: &str) -> Result<()> {
         let handler = self.tools.get(name).map(|(_, h)| h.clone());
@@ -1152,9 +1224,10 @@ impl RealtimeRunner {
                 serde_json::json!({ "error": format!("Tool '{name}' was not run: {reason}") })
             }
             (Some(handler), Ok(args)) => {
+                let screened_args = self.tool_result_screen.as_ref().map(|_| args.clone());
                 // Native handlers declare no read-only flag, so the policy treats them as
                 // having side effects.
-                match self
+                let result = match self
                     .authorize_tool_call(adk_core::GovernedCall::new(name, call_id, args))
                     .await?
                 {
@@ -1167,7 +1240,28 @@ impl RealtimeRunner {
                         match tokio::time::timeout(self.tool_timeout, handler.execute(&call)).await
                         {
                             Ok(Ok(value)) => value,
-                            Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
+                            Ok(Err(e)) => {
+                                // A message can quote credentials or internal hosts.
+                                if self.records_payloads() {
+                                    tracing::warn!(
+                                        tool.name = %name,
+                                        error.kind = e.kind(),
+                                        error.message = %e,
+                                        "realtime tool handler failed"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        tool.name = %name,
+                                        error.kind = e.kind(),
+                                        "realtime tool handler failed"
+                                    );
+                                }
+                                if self.expose_tool_error_messages {
+                                    serde_json::json!({ "error": e.to_string() })
+                                } else {
+                                    serde_json::json!({ "error": format!("tool '{name}' failed") })
+                                }
+                            }
                             Err(_) => serde_json::json!({
                                 "error": format!(
                                     "Tool '{name}' timed out after {:?}",
@@ -1180,6 +1274,10 @@ impl RealtimeRunner {
                     | adk_core::ToolAuthorization::Pending { reason, .. } => {
                         serde_json::json!({ "error": reason })
                     }
+                };
+                match screened_args {
+                    Some(args) => self.screen_tool_result(name, &args, result).await,
+                    None => result,
                 }
             }
         };
@@ -1487,6 +1585,140 @@ mod runner_tests {
         *runner.session.write().await =
             Some(Arc::new(RecordingSession { counts }) as Arc<dyn RealtimeSession>);
         runner
+    }
+
+    /// A runner whose `lookup` handler returns a customer record, or fails quoting a
+    /// credential, configured by `configure`.
+    async fn lookup_runner(
+        counts: Arc<Counts>,
+        fails: bool,
+        configure: impl FnOnce(RealtimeRunnerBuilder) -> RealtimeRunnerBuilder,
+    ) -> RealtimeRunner {
+        let builder = RealtimeRunner::builder().model(Arc::new(MockModel) as BoxedModel).tool_fn(
+            tool_def("lookup"),
+            move |_call| {
+                if fails {
+                    Err(RealtimeError::ToolError(
+                        "connect postgres://admin:hunter2@db.internal/prod failed".into(),
+                    ))
+                } else {
+                    Ok(serde_json::json!({ "ssn": "123-45-6789" }))
+                }
+            },
+        );
+        let runner = configure(builder).build().unwrap();
+        *runner.session.write().await =
+            Some(Arc::new(RecordingSession { counts }) as Arc<dyn RealtimeSession>);
+        runner
+    }
+
+    /// Withholds every result, or redacts its `ssn`.
+    struct SsnScreen {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl adk_core::ToolResultScreen for SsnScreen {
+        async fn screen_result(
+            &self,
+            _tool_name: &str,
+            _args: &serde_json::Value,
+            result: &serde_json::Value,
+        ) -> std::result::Result<serde_json::Value, String> {
+            if self.fail {
+                return Err("the screening service is unavailable".into());
+            }
+            let mut result = result.clone();
+            if result.get("ssn").is_some() {
+                result["ssn"] = serde_json::json!("[SSN REDACTED]");
+            }
+            Ok(result)
+        }
+    }
+
+    #[tokio::test]
+    async fn handler_errors_reach_the_model_redacted_unless_exposed() {
+        let counts = Arc::new(Counts::default());
+        let runner = lookup_runner(Arc::clone(&counts), true, |b| b).await;
+        runner.dispatch_tool_call("c1", "lookup", "{}").await.unwrap();
+        let output = counts.last_output.lock().clone().unwrap();
+        assert_eq!(output, serde_json::json!({ "error": "tool 'lookup' failed" }));
+
+        let runner =
+            lookup_runner(Arc::clone(&counts), true, |b| b.expose_tool_error_messages(true)).await;
+        runner.dispatch_tool_call("c2", "lookup", "{}").await.unwrap();
+        let output = counts.last_output.lock().clone().unwrap();
+        assert!(output["error"].as_str().unwrap_or_default().contains("hunter2"), "{output}");
+    }
+
+    /// Records every event field the runner logs.
+    #[derive(Clone, Default)]
+    struct Logged(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    struct LoggedValues<'a>(&'a mut Vec<String>);
+
+    impl tracing::field::Visit for LoggedValues<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push(format!("{}={value:?}", field.name()));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Logged {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            event.record(&mut LoggedValues(&mut self.0.lock()));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_error_messages_are_logged_only_under_the_payload_rule() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        for record_payloads in [false, true] {
+            let logged = Logged::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(logged.clone()),
+            );
+            let counts = Arc::new(Counts::default());
+            let config = adk_core::RunConfig { record_payloads, ..adk_core::RunConfig::default() };
+            let runner = lookup_runner(Arc::clone(&counts), true, |b| {
+                b.tool_governance(config, adk_core::ApprovalScope::new("voice", "user", "s"))
+            })
+            .await;
+            runner.dispatch_tool_call("c1", "lookup", "{}").await.unwrap();
+
+            let values = logged.0.lock().clone();
+            assert!(values.contains(&"error.kind=\"tool\"".to_string()), "{values:#?}");
+            assert_eq!(
+                values.iter().any(|value| value.contains("hunter2")),
+                record_payloads,
+                "the message is logged only when payloads are recorded: {values:#?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_result_screen_runs_before_the_output_is_sent() {
+        let counts = Arc::new(Counts::default());
+        let runner = lookup_runner(Arc::clone(&counts), false, |b| {
+            b.tool_result_screen(Arc::new(SsnScreen { fail: false }))
+        })
+        .await;
+        runner.dispatch_tool_call("c1", "lookup", "{}").await.unwrap();
+        let output = counts.last_output.lock().clone().unwrap();
+        assert_eq!(output, serde_json::json!({ "ssn": "[SSN REDACTED]" }));
+
+        let runner = lookup_runner(Arc::clone(&counts), false, |b| {
+            b.tool_result_screen(Arc::new(SsnScreen { fail: true }))
+        })
+        .await;
+        runner.dispatch_tool_call("c2", "lookup", "{}").await.unwrap();
+        let output = counts.last_output.lock().clone().unwrap();
+        assert_eq!(output["status"], adk_core::RESULT_WITHHELD_STATUS, "{output}");
+        assert!(!output.to_string().contains("123-45-6789"), "{output}");
     }
 
     #[tokio::test]
