@@ -92,6 +92,9 @@ impl Default for InteractionOptions {
 }
 
 /// Gemini model client wrapping the `adk-gemini` crate for the `Llm` trait.
+///
+/// The GenerateContent transport reads the string-array option
+/// `LlmRequest.config.extensions["gemini"]["response_modalities"]`.
 pub struct GeminiModel {
     client: Gemini,
     model_name: String,
@@ -1551,6 +1554,21 @@ impl GeminiModel {
 
         // Add generation config
         if let Some(config) = req.config {
+            let response_modalities = config
+                .extensions
+                .get("gemini")
+                .and_then(|options| options.get("response_modalities"))
+                .map(|value| serde_json::from_value::<Vec<String>>(value.clone()))
+                .transpose()
+                .map_err(|_| {
+                    adk_core::AdkError::new(
+                        ErrorComponent::Model,
+                        ErrorCategory::InvalidInput,
+                        "model.gemini.invalid_config",
+                        "Gemini response_modalities must be an array of strings",
+                    )
+                    .with_provider("gemini")
+                })?;
             let has_schema = config.response_schema.is_some();
             let gen_config = adk_gemini::GenerationConfig {
                 temperature: config.temperature,
@@ -1564,6 +1582,7 @@ impl GeminiModel {
                     None
                 },
                 thinking_config: self.thinking_config.clone(),
+                response_modalities,
                 ..Default::default()
             };
             builder = builder.with_generation_config(gen_config);
