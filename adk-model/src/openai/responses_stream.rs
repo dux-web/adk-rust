@@ -318,15 +318,10 @@ impl StreamState {
     }
 
     fn snapshot_parts(&self) -> Vec<Part> {
-        // Without terminal output, a done payload supersedes its streamed deltas
-        // and an unfinished part keeps the text already delivered to the caller.
-        let keys: BTreeSet<&TextKey> = self.emitted.keys().chain(self.finalized.keys()).collect();
+        // An omitted output retains done payloads, not unfinished streamed deltas.
         let mut parts: Vec<Result<Part, (u32, &str)>> = Vec::new();
         let mut messages: BTreeMap<(u32, &str), Vec<serde_json::Value>> = BTreeMap::new();
-        for key in keys {
-            let Some(text) = self.finalized.get(key).or_else(|| self.emitted.get(key)) else {
-                continue;
-            };
+        for (key, text) in &self.finalized {
             if text.is_empty() {
                 continue;
             }

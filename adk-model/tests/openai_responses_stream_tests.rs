@@ -390,20 +390,27 @@ mod output_recovery {
                 [Part::Text { text: "Final".into() }]
             );
 
-            let unfinished =
-                responses(&[delta("msg", 0, 0, "Draft"), completion(json!([]))], compatible, "")
-                    .await;
-            let terminal = unfinished.last().unwrap();
-            assert_eq!(terminal.provider_metadata.as_ref().unwrap()["content_complete"], true);
-            assert_eq!(
-                terminal.content.as_ref().unwrap().parts,
-                [Part::Text { text: "Draft".into() }]
-            );
+            for events in [
+                vec![delta("msg", 0, 0, "Draft"), completion(json!([]))],
+                vec![delta("msg", 0, 0, "Draft"), done("msg", 0, 0, ""), completion(json!([]))],
+                vec![
+                    delta("msg", 0, 0, "Draft"),
+                    json!({"type":"response.output_item.done", "sequence_number":2,
+                        "output_index":0, "item":message("msg", json!([]))}),
+                    completion(json!([])),
+                ],
+            ] {
+                let unfinished = responses(&events, compatible, "").await;
+                let terminal = unfinished.last().unwrap();
+                assert!(terminal.turn_complete);
+                assert_eq!(terminal.provider_metadata.as_ref().unwrap()["content_complete"], true);
+                assert!(terminal.content.as_ref().unwrap().parts.is_empty());
+            }
         }
     }
 
     #[tokio::test]
-    async fn empty_terminal_output_keeps_streamed_text() {
+    async fn empty_terminal_output_keeps_finalized_text() {
         for compatible in [false, true] {
             let results = responses(
                 &[
@@ -422,7 +429,7 @@ mod output_recovery {
             assert_eq!(terminal.provider_metadata.as_ref().unwrap()["content_complete"], true);
             assert_eq!(
                 terminal.content.as_ref().unwrap().parts,
-                [Part::Text { text: "Hello".into() }, Part::Text { text: "Done".into() }]
+                [Part::Text { text: "Done".into() }]
             );
         }
     }
