@@ -75,6 +75,7 @@ struct Failure {
     kind: Option<String>,
     message: Option<String>,
     param: Option<String>,
+    request_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,7 +120,16 @@ pub(in crate::openai) fn event(value: Value) -> Result<Event, AdkError> {
             Err(invalid("cancelled", "OpenAI Responses generation was cancelled"))
         }
         "error" => {
-            let failure: Failure = decode(value.clone(), &value, parse::Layer::StreamEvent)?;
+            let nested = value.get("error");
+            let mut failure: Failure = decode(
+                nested.cloned().unwrap_or_else(|| value.clone()),
+                &value,
+                parse::Layer::StreamEvent,
+            )?;
+            if nested.is_none() {
+                // The outer type names the event, not the provider's error category.
+                failure.kind = value.get("error_type").and_then(Value::as_str).map(str::to_owned);
+            }
             Err(failed(Some(failure)))
         }
         "response.output_item.added"
@@ -273,6 +283,7 @@ fn failed(failure: Option<Failure>) -> AdkError {
             kind: failure.kind,
             message: failure.message,
             param: failure.param,
+            request_id: failure.request_id,
             ..Default::default()
         }),
         None => error,
@@ -280,6 +291,25 @@ fn failed(failure: Option<Failure>) -> AdkError {
 }
 
 fn stream_error(code: Option<&str>) -> AdkError {
+    let sharing = match code {
+        Some("subscription_sharing_usage_limit_exceeded") => Some((
+            ErrorCategory::RateLimited,
+            "model.openai_responses.subscription_sharing_usage_limit_exceeded",
+            "ChatGPT shared usage limit exceeded",
+        )),
+        Some("subscription_sharing_usage_unavailable") => Some((
+            ErrorCategory::Unavailable,
+            "model.openai_responses.subscription_sharing_usage_unavailable",
+            "ChatGPT shared usage is unavailable",
+        )),
+        _ => None,
+    };
+    if let Some((category, diagnostic, message)) = sharing {
+        // These account usage failures do not authorize another model attempt.
+        return AdkError::new(ErrorComponent::Model, category, diagnostic, message)
+            .with_provider("openai-responses")
+            .with_retry(adk_core::RetryHint::default());
+    }
     let code =
         code.and_then(|code| DOCUMENTED_ERROR_CODES.iter().copied().find(|known| *known == code));
     let category = match code {
@@ -321,6 +351,79 @@ fn invalid(cause: &'static str, message: &'static str) -> AdkError {
 mod failures {
     use super::*;
     use std::error::Error;
+
+    #[test]
+    fn preserves_sharing_failure_policy() {
+        for (code, category) in [
+            ("subscription_sharing_usage_limit_exceeded", ErrorCategory::RateLimited),
+            ("subscription_sharing_usage_unavailable", ErrorCategory::Unavailable),
+        ] {
+            let detail = serde_json::json!({"code":code, "message":"Private account response"});
+            for value in [
+                serde_json::json!({"type":"error", "sequence_number":1, "error":detail}),
+                serde_json::json!({"type":"error", "sequence_number":1,
+                    "code":code, "message":detail["message"]}),
+                serde_json::json!({"type":"response.failed", "response":{"error":detail}}),
+            ] {
+                let error = match event(value) {
+                    Err(error) => error,
+                    Ok(_) => panic!("account usage failure must fail"),
+                };
+                assert_eq!(error.category, category);
+                assert_eq!(error.code, format!("model.openai_responses.{code}"));
+                assert!(!error.retry.should_retry);
+                assert_eq!(error.retry.retry_after_ms, None);
+                let details =
+                    error.source().unwrap().downcast_ref::<crate::ProviderErrorDetails>().unwrap();
+                assert_eq!(details.code.as_deref(), Some(code));
+                assert_eq!(details.message.as_deref(), Some("Private account response"));
+                assert!(!format!("{error:?}").contains("Private account response"));
+            }
+        }
+    }
+
+    #[test]
+    fn retains_nested_and_flat_diagnostics() {
+        let detail = serde_json::json!({
+            "code":"fixture_limit", "type":"invalid_request_error",
+            "message":"Upstream rejected the input 中文", "param":"input",
+            "request_id":"req_fixture"
+        });
+        for value in [
+            serde_json::json!({"type":"error", "sequence_number":1, "error":detail}),
+            serde_json::json!({"type":"error", "sequence_number":1,
+                "code":detail["code"], "error_type":detail["type"],
+                "message":detail["message"], "param":detail["param"],
+                "request_id":detail["request_id"]}),
+            serde_json::json!({"type":"response.failed", "sequence_number":1,
+                "response":{"error":detail}}),
+        ] {
+            let error = match event(value) {
+                Err(error) => error,
+                Ok(_) => panic!("error event must fail"),
+            };
+            assert_eq!(error.code, "model.openai_responses.response_failed");
+            assert!(!error.retry.should_retry);
+            let details =
+                error.source().unwrap().downcast_ref::<crate::ProviderErrorDetails>().unwrap();
+            assert_eq!(details.code.as_deref(), Some("fixture_limit"));
+            assert_eq!(details.kind.as_deref(), Some("invalid_request_error"));
+            assert_eq!(details.message.as_deref(), Some("Upstream rejected the input 中文"));
+            assert_eq!(details.param.as_deref(), Some("input"));
+            assert_eq!(details.request_id.as_deref(), Some("req_fixture"));
+            assert!(!format!("{error:?}").contains("Upstream rejected"));
+            assert!(!error.to_problem_json().to_string().contains("Upstream rejected"));
+        }
+        let error = match event(serde_json::json!({
+            "type":"error", "code":"fixture_limit", "message":"Plain failure"
+        })) {
+            Err(error) => error,
+            Ok(_) => panic!("error event must fail"),
+        };
+        let details =
+            error.source().unwrap().downcast_ref::<crate::ProviderErrorDetails>().unwrap();
+        assert_eq!(details.kind, None);
+    }
 
     #[test]
     fn missing_status_retains_private_error() {
