@@ -77,7 +77,11 @@ fn read_request(socket: &mut std::net::TcpStream) -> Value {
     }
 }
 
-async fn fragmented_stream(ending: &str, compatible: bool) -> Vec<LlmResponse> {
+async fn fragmented_stream(
+    ending: &str,
+    compatible: bool,
+    content_type: Option<&str>,
+) -> Vec<LlmResponse> {
     use std::io::Write;
     use std::net::TcpListener;
     use std::time::Duration;
@@ -99,9 +103,11 @@ async fn fragmented_stream(ending: &str, compatible: bool) -> Vec<LlmResponse> {
         message["status"] = json!("completed");
         message["content"][0]["annotations"] = json!([]);
     }
-    let body = format!(
-        "data: {delta}{ending}{ending}data: {completed}{ending}{ending}data: [DONE]{ending}{ending}"
-    );
+    let partial = format!("data: {delta}{ending}{ending}");
+    let terminal = format!("data: {completed}{ending}{ending}data: [DONE]{ending}{ending}");
+    let content_type =
+        content_type.map_or(String::new(), |value| format!("Content-Type: {value}\r\n"));
+    let (release, gate) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().expect("fixture should accept");
         socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -110,14 +116,20 @@ async fn fragmented_stream(ending: &str, compatible: bool) -> Vec<LlmResponse> {
         assert_eq!(received["metadata"]["fixture"], "adapted");
         socket
             .write_all(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                format!("HTTP/1.1 200 OK\r\n{content_type}Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n").as_bytes(),
             )
             .unwrap();
-        for chunk in body.as_bytes().chunks(11) {
-            socket.write_all(format!("{:X}\r\n", chunk.len()).as_bytes()).unwrap();
-            socket.write_all(chunk).unwrap();
-            socket.write_all(b"\r\n").unwrap();
-            std::thread::sleep(Duration::from_millis(1));
+        for (index, body) in [partial, terminal].into_iter().enumerate() {
+            for chunk in body.as_bytes().chunks(11) {
+                socket.write_all(format!("{:X}\r\n", chunk.len()).as_bytes()).unwrap();
+                socket.write_all(chunk).unwrap();
+                socket.write_all(b"\r\n").unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if index == 0 {
+                gate.recv_timeout(Duration::from_secs(5))
+                    .expect("partial must be published before completion");
+            }
         }
         socket.write_all(b"0\r\n\r\n").unwrap();
     });
@@ -128,7 +140,15 @@ async fn fragmented_stream(ending: &str, compatible: bool) -> Vec<LlmResponse> {
     });
     let client = client(&base_url, compatible).with_request_adapter(adapter);
     let result = tokio::time::timeout(Duration::from_secs(5), async {
-        client.generate_content(request(), true).await?.try_collect::<Vec<_>>().await
+        let mut stream = client.generate_content(request(), true).await?;
+        let partial = stream.try_next().await?.expect("first text delta");
+        assert!(partial.partial);
+        assert!(!partial.turn_complete);
+        assert_eq!(partial.content.as_ref().unwrap().parts[0].text(), Some("done"));
+        release.send(()).expect("fixture should still await completion");
+        let mut responses = vec![partial];
+        responses.extend(stream.try_collect::<Vec<_>>().await?);
+        Ok::<_, adk_core::AdkError>(responses)
     })
     .await
     .expect("stream should terminate")
@@ -142,7 +162,7 @@ async fn frames_fragmented_sse_without_content_type() {
     for (ending, compatible) in
         [("\n", true), ("\r\n", true), ("\r", true), ("\n", false), ("\r\n", false), ("\r", false)]
     {
-        let results = fragmented_stream(ending, compatible).await;
+        let results = fragmented_stream(ending, compatible, None).await;
         let text: String = results
             .iter()
             .filter_map(|response| response.content.as_ref())
@@ -156,6 +176,76 @@ async fn frames_fragmented_sse_without_content_type() {
         let final_response = results.last().expect("completion response");
         assert!(final_response.turn_complete);
         assert_eq!(final_response.usage_metadata.as_ref().unwrap().total_token_count, 3);
+    }
+}
+
+#[tokio::test]
+async fn streams_despite_incorrect_content_type() {
+    for compatible in [false, true] {
+        for content_type in ["application/octet-stream", "application/json"] {
+            for ending in ["\n", "\r\n", "\r"] {
+                let responses = fragmented_stream(ending, compatible, Some(content_type)).await;
+                let terminal = responses.last().unwrap();
+                assert!(terminal.turn_complete);
+                assert_eq!(terminal.usage_metadata.as_ref().unwrap().total_token_count, 3);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn retains_nested_and_flat_stream_errors() {
+    for compatible in [false, true] {
+        for code in [
+            "fixture_limit",
+            "subscription_sharing_usage_limit_exceeded",
+            "subscription_sharing_usage_unavailable",
+        ] {
+            let detail = json!({"code":code, "type":"invalid_request_error",
+            "message":"Upstream rejected input 中文", "param":"input"});
+            for event in [
+                json!({"type":"error", "sequence_number":1, "error":detail}),
+                json!({"type":"error", "sequence_number":1, "code":detail["code"],
+                "message":detail["message"], "param":detail["param"],
+                "error_type":detail["type"]}),
+                json!({"type":"response.failed", "sequence_number":1,
+                "response":{"error":detail}}),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/responses"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string(format!("data: {event}\n\ndata: [DONE]\n\n")),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let stream = client(&server.uri(), compatible)
+                    .generate_content(request(), true)
+                    .await
+                    .expect("stream should open");
+                let error = stream.try_collect::<Vec<_>>().await.expect_err("stream must fail");
+                let expected = if code == "fixture_limit" {
+                    "model.openai_responses.response_failed".to_string()
+                } else {
+                    format!("model.openai_responses.{code}")
+                };
+                assert_eq!(error.code, expected);
+                assert!(!error.retry.should_retry);
+                let details = std::error::Error::source(&error)
+                    .unwrap()
+                    .downcast_ref::<adk_model::ProviderErrorDetails>()
+                    .unwrap();
+                assert_eq!(details.code.as_deref(), Some(code));
+                assert_eq!(details.kind.as_deref(), Some("invalid_request_error"));
+                assert_eq!(details.message.as_deref(), Some("Upstream rejected input 中文"));
+                assert_eq!(details.param.as_deref(), Some("input"));
+                assert!(!format!("{error:?}").contains("Upstream rejected input"));
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            }
+        }
     }
 }
 

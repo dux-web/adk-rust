@@ -1,0 +1,3 @@
+- **Gemini response modalities reach the HTTP request** (`adk-model`): the Gemini request namespace forwards its typed response modalities to streaming and nonstreaming generation.
+- **Responses stream errors retain provider diagnostics** (`adk-model`): flat and nested failures retain private details and shared-account usage failures remain non-retryable.
+- **Requested Responses streams remain incremental** (`adk-model`): missing or incorrect response content types do not delay partial output until the socket closes.

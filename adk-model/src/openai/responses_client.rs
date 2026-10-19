@@ -528,19 +528,17 @@ async fn normalize_responses_response(
     if !response.status().is_success() {
         return responses_errors::normalize_response(response, open_responses_mode).await;
     }
-    // OpenAI's own stream framing needs no rewrite; the SDK's SSE parser handles it.
-    if !uses_max_reasoning && !open_responses_mode {
-        return Ok(response);
-    }
-
-    // Some compatible endpoints omit Content-Type even when a streaming
-    // request receives SSE. The adapted request is authoritative in that case.
+    // Streaming requests can receive SSE with a missing or incorrect Content-Type.
+    // Keep framing incremental instead of waiting for a body that is still streaming.
     let content_type = response
         .headers()
         .get(reqwest_openai::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
-    let is_event_stream =
-        content_type.map_or(requested_streaming, |value| value.starts_with("text/event-stream"));
+    let is_event_stream = requested_streaming
+        || content_type.is_some_and(|value| value.starts_with("text/event-stream"));
+    if !is_event_stream && !uses_max_reasoning && !open_responses_mode {
+        return Ok(response);
+    }
     let status = response.status();
     let version = response.version();
     let url = response.url().clone();
