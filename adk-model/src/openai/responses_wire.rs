@@ -71,6 +71,10 @@ struct Lifecycle {
 #[derive(Deserialize)]
 struct Failure {
     code: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    message: Option<String>,
+    param: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -104,19 +108,19 @@ pub(in crate::openai) fn event(value: Value) -> Result<Event, AdkError> {
             Ok(Event::Terminal(Box::new(projected)))
         }
         "response.failed" => {
-            let header: Header = decode(
-                value.get("response").cloned().unwrap_or(Value::Null),
+            let failure: Option<Failure> = decode(
+                value.pointer("/response/error").cloned().unwrap_or(Value::Null),
                 &value,
                 parse::Layer::StreamEvent,
             )?;
-            Err(stream_error(header.error.as_ref().and_then(|error| error.code.as_deref())))
+            Err(failed(failure))
         }
         "response.cancelled" | "response.canceled" => {
             Err(invalid("cancelled", "OpenAI Responses generation was cancelled"))
         }
         "error" => {
             let failure: Failure = decode(value.clone(), &value, parse::Layer::StreamEvent)?;
-            Err(stream_error(failure.code.as_deref()))
+            Err(failed(Some(failure)))
         }
         "response.output_item.added"
         | "response.output_item.done"
@@ -152,7 +156,7 @@ pub(in crate::openai) fn response(
 ) -> Result<Response, AdkError> {
     let header: Header = decode(value.clone(), body, layer)?;
     if header.status == Status::Failed {
-        return Err(stream_error(header.error.as_ref().and_then(|error| error.code.as_deref())));
+        return Err(failed(header.error));
     }
     let output_missing = value.get("output").is_none();
     if output_missing && !matches!(layer, parse::Layer::StreamEvent) {
@@ -261,6 +265,20 @@ pub(in crate::openai) const DOCUMENTED_ERROR_CODES: &[&str] = &[
     "image_file_not_found",
 ];
 
+fn failed(failure: Option<Failure>) -> AdkError {
+    let error = stream_error(failure.as_ref().and_then(|failure| failure.code.as_deref()));
+    match failure {
+        Some(failure) => error.with_source(crate::ProviderErrorDetails {
+            code: failure.code,
+            kind: failure.kind,
+            message: failure.message,
+            param: failure.param,
+            ..Default::default()
+        }),
+        None => error,
+    }
+}
+
 fn stream_error(code: Option<&str>) -> AdkError {
     let code =
         code.and_then(|code| DOCUMENTED_ERROR_CODES.iter().copied().find(|known| *known == code));
@@ -297,4 +315,25 @@ fn invalid(cause: &'static str, message: &'static str) -> AdkError {
     let category =
         if cause == "cancelled" { ErrorCategory::Cancelled } else { ErrorCategory::Internal };
     AdkError::new(ErrorComponent::Model, category, code, message).with_provider("openai-responses")
+}
+
+#[cfg(test)]
+mod failures {
+    use super::*;
+    use std::error::Error;
+
+    #[test]
+    fn missing_status_retains_private_error() {
+        let error = match event(serde_json::json!({"type":"response.failed","response":{
+            "error":{"code":"server_error","type":"upstream","message":"private provider reason","param":"field"}}}))
+        {
+            Err(error) => error,
+            Ok(_) => panic!("failed event must fail"),
+        };
+        assert_eq!(error.category, ErrorCategory::Unavailable);
+        let details =
+            error.source().unwrap().downcast_ref::<crate::ProviderErrorDetails>().unwrap();
+        assert_eq!(details.message.as_deref(), Some("private provider reason"));
+        assert!(!format!("{error:?}").contains("private provider reason"));
+    }
 }

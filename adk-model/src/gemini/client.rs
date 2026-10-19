@@ -175,7 +175,7 @@ impl GeminiBuiltinToolUses {
 ///
 /// The category comes from the HTTP status the transport reported, or, without one,
 /// from the RPC status code or the typed transport failure; error text never decides
-/// it. 500, 502, 503 and other 5xx statuses are `Unavailable` and 504 is `Timeout`, so
+/// it. 500, 502, 503 and other 5xx statuses are `Unavailable` including 504, so
 /// all are retried; 403 is `Forbidden`. The provider's own code is kept in
 /// `details.metadata["provider_error_code"]`: the first `ErrorInfo.reason`, then the
 /// error object's string `code`, then its `status`.
@@ -213,7 +213,7 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
         Some(401) => (ErrorCategory::Unauthorized, "model.gemini.unauthorized"),
         Some(403) => (ErrorCategory::Forbidden, "model.gemini.forbidden"),
         Some(404) => (ErrorCategory::NotFound, "model.gemini.not_found"),
-        Some(408 | 504) => (ErrorCategory::Timeout, "model.gemini.timeout"),
+        Some(408) => (ErrorCategory::Timeout, "model.gemini.timeout"),
         Some(429) => (ErrorCategory::RateLimited, "model.gemini.rate_limited"),
         Some(529) => (ErrorCategory::Unavailable, "model.gemini.overloaded"),
         Some(400..=499) => (ErrorCategory::InvalidInput, "model.gemini.bad_request"),
@@ -257,7 +257,19 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
         }
         _ => None,
     };
-    crate::error_metadata::with_code(err, provider_code.as_deref())
+    let err = crate::error_metadata::with_code(err, provider_code.as_deref());
+    let err = if let adk_gemini::ClientError::BadResponse { retry_after: Some(header), .. } = e {
+        crate::retry::with_retry_after(err, crate::retry::parse_retry_after(header))
+    } else {
+        err
+    };
+    match e {
+        adk_gemini::ClientError::BadResponse { description: Some(body), .. }
+        | adk_gemini::ClientError::ErrorInResponse { description: body, .. } => {
+            crate::error_metadata::from_body(err, body)
+        }
+        _ => err,
+    }
 }
 
 /// Whether a google-cloud-gax error without a status is a failed connection or
@@ -271,6 +283,19 @@ fn is_gax_connection_failure(message: &str) -> bool {
 
 /// Classify failures with no HTTP response without inventing an upstream status.
 fn error_without_status(error: &adk_gemini::ClientError) -> (ErrorCategory, &'static str) {
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+            if error.is_timeout() {
+                return (ErrorCategory::Timeout, "model.gemini.timeout");
+            }
+            if !error.is_decode() {
+                return (ErrorCategory::Unavailable, "model.gemini.unavailable");
+            }
+        }
+        source = error.source();
+    }
+
     match error {
         adk_gemini::ClientError::InvalidGenerationConfig { .. } => {
             (ErrorCategory::InvalidInput, "model.gemini.invalid_config")
@@ -547,13 +572,32 @@ impl GeminiModel {
         model: impl Into<String>,
         base_url: impl AsRef<str>,
     ) -> Result<Self> {
+        Self::new_with_base_url_and_timeouts(
+            api_key,
+            model,
+            base_url,
+            crate::HttpTimeouts::default(),
+        )
+    }
+
+    /// Creates a Studio model with explicit HTTP connect and raw-byte read deadlines.
+    pub fn new_with_base_url_and_timeouts(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+        timeouts: crate::HttpTimeouts,
+    ) -> Result<Self> {
         let model_name = model.into();
         let base_url = base_url
             .as_ref()
             .parse()
             .map_err(|_| adk_core::AdkError::model("Invalid Gemini base URL"))?;
-        let client = Gemini::with_model_and_base_url(api_key.into(), model_name.clone(), base_url)
-            .map_err(|e| adk_core::AdkError::model(e.to_string()))?;
+        let client = adk_gemini::GeminiBuilder::new(api_key.into())
+            .with_model(model_name.clone())
+            .with_base_url(base_url)
+            .with_http_client(timeouts.apply(reqwest::Client::builder()))
+            .build()
+            .map_err(|error| gemini_error_to_adk(&error))?;
         Ok(Self::from_client(client, model_name))
     }
 
@@ -1577,6 +1621,7 @@ impl GeminiModel {
                 let mut saw_partial_chunk = false;
                 // Only a chunk with `finishReason` (or a prompt block) ends a Gemini turn.
                 let mut finished = false;
+                let mut terminal: Option<LlmResponse> = None;
                 // Gemini reports usage cumulatively per chunk; built-in tool uses follow suit.
                 let mut builtin_uses = GeminiBuiltinToolUses::default();
                 while let Some(result) = stream.try_next().await.transpose() {
@@ -1589,6 +1634,22 @@ impl GeminiModel {
                                         usage.builtin_tool_uses = builtin_uses.uses();
                                     }
                                     finished |= llm_resp.finish_reason.is_some();
+                                    if let Some(response) = &mut terminal {
+                                        if let Some(usage) = llm_resp.usage_metadata {
+                                            response.usage_metadata = Some(usage);
+                                        }
+                                        if let Some(content) = llm_resp.content {
+                                            response.content.get_or_insert_with(|| Content::new("model"))
+                                                .parts.extend(content.parts);
+                                        }
+                                        continue;
+                                    }
+                                    if llm_resp.finish_reason.is_some() {
+                                        // finishReason stops token generation, not the HTTP
+                                        // stream. A later response can carry final usage.
+                                        terminal = Some(llm_resp);
+                                        continue;
+                                    }
                                     let (chunks, next_saw_partial) =
                                         Self::stream_chunks_from_response(llm_resp, saw_partial_chunk);
                                     saw_partial_chunk = next_saw_partial;
@@ -1619,6 +1680,11 @@ impl GeminiModel {
                         "Gemini stream ended before any chunk carried a finish reason",
                     )
                     .with_provider("gemini"));
+                } else if let Some(response) = terminal {
+                    let (chunks, _) = Self::stream_chunks_from_response(response, saw_partial_chunk);
+                    for chunk in chunks {
+                        yield Ok(chunk);
+                    }
                 }
             };
 
@@ -2324,7 +2390,7 @@ mod tests {
             (408, ErrorCategory::Timeout, "model.gemini.timeout"),
             (429, ErrorCategory::RateLimited, "model.gemini.rate_limited"),
             (500, ErrorCategory::Unavailable, "model.gemini.unavailable"),
-            (504, ErrorCategory::Timeout, "model.gemini.timeout"),
+            (504, ErrorCategory::Unavailable, "model.gemini.unavailable"),
             (529, ErrorCategory::Unavailable, "model.gemini.overloaded"),
         ] {
             let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
@@ -2336,6 +2402,7 @@ mod tests {
                     }})
                     .to_string(),
                 ),
+                retry_after: None,
             });
             assert_eq!(error.category, category);
             assert_eq!(error.code, code);
@@ -2371,8 +2438,7 @@ mod tests {
         ] {
             let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
                 code: 400,
-                description: Some(body),
-            });
+                description: Some(body), retry_after: None });
             let actual = error
                 .details
                 .metadata
@@ -2397,6 +2463,7 @@ mod tests {
         let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
             code: 429,
             description: Some(body.to_string()),
+            retry_after: None,
         });
         assert_eq!(error.details.metadata["provider_error_code"], "RATE_LIMIT_EXCEEDED");
 
@@ -2407,6 +2474,7 @@ mod tests {
         let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
             code: 429,
             description: Some(without_reason.to_string()),
+            retry_after: None,
         });
         assert_eq!(error.details.metadata["provider_error_code"], "RESOURCE_EXHAUSTED");
     }

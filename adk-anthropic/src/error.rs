@@ -22,6 +22,8 @@ pub enum Error {
         message: String,
         /// Request ID for debugging and support.
         request_id: Option<String>,
+        /// Raw Retry-After header for the model retry owner.
+        retry_after: Option<String>,
     },
 
     /// Authentication error.
@@ -177,7 +179,7 @@ impl Error {
         message: String,
         request_id: Option<String>,
     ) -> Self {
-        Error::Api { status_code, error_type, message, request_id }
+        Error::Api { status_code, error_type, message, request_id, retry_after: None }
     }
 
     /// Creates a new authentication error.
@@ -311,7 +313,7 @@ impl Error {
 
     /// Returns true if this error is related to rate limiting.
     pub fn is_rate_limit(&self) -> bool {
-        matches!(self, Error::RateLimit { .. })
+        matches!(self, Error::RateLimit { .. } | Error::Api { status_code: 429, .. })
     }
 
     /// Returns true if this error is a bad request.
@@ -321,7 +323,7 @@ impl Error {
 
     /// Returns true if this error is a timeout.
     pub fn is_timeout(&self) -> bool {
-        matches!(self, Error::Timeout { .. })
+        matches!(self, Error::Timeout { .. } | Error::Api { status_code: 408, .. })
     }
 
     /// Returns true if this error is an abort.
@@ -336,7 +338,12 @@ impl Error {
 
     /// Returns true if this error is a server error.
     pub fn is_server_error(&self) -> bool {
-        matches!(self, Error::InternalServer { .. } | Error::ServiceUnavailable { .. })
+        matches!(
+            self,
+            Error::InternalServer { .. }
+                | Error::ServiceUnavailable { .. }
+                | Error::Api { status_code: 500..=599, .. }
+        )
     }
 
     /// Returns true if this error is retryable.

@@ -229,7 +229,7 @@ async fn carries_retry_after_hints() {
         ("2", Some(2_000)),
         ("1.5", Some(1_500)),
         ("invalid", None),
-        ("18446744073709551616", Some(u64::MAX)),
+        ("18446744073709551616", None),
     ] {
         let error = failed(
             503,
@@ -261,7 +261,7 @@ async fn retry_attempts_follow_header_validity() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    // An oversized delay is capped at `max_delay` like any other server delay.
+    // Invalid or overflowing delays use the configured backoff without losing a retry.
     for (header, expected_attempts) in [("0", 2), ("invalid", 2), ("18446744073709551616", 2)] {
         let server = MockServer::start().await;
         let attempts = Arc::new(AtomicUsize::new(0));

@@ -45,10 +45,31 @@ pub(crate) fn with_first_code<'a>(
 }
 
 /// Records the first bounded code from a JSON error body, see [`code_from_body`].
-#[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "openai"))]
+#[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "gemini", feature = "openai"))]
 pub(crate) fn from_body(error: AdkError, body: &str) -> AdkError {
     let code = code_from_body(body);
-    with_code(error, code.as_deref())
+    let error = with_code(error, code.as_deref());
+    if body.len() > MAX_BODY_LEN {
+        return error;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return error;
+    };
+    let Some(fields) =
+        value.get("error").or_else(|| value.get(0).and_then(|entry| entry.get("error")))
+    else {
+        return error;
+    };
+    let text = |key| fields.get(key).and_then(Value::as_str).map(str::to_owned);
+    let status = error.details.upstream_status_code;
+    error.with_source(crate::ProviderErrorDetails {
+        code: text("code"),
+        kind: text("type").or_else(|| text("status")),
+        message: text("message"),
+        param: text("param"),
+        status,
+        request_id: None,
+    })
 }
 
 /// Extracts the provider code from a JSON body shaped `{"error": {...}}` or, as Gemini's
@@ -193,7 +214,7 @@ mod tests {
         assert_eq!(body_code(body).as_deref(), Some("RATE_LIMIT_EXCEEDED"));
     }
 
-    #[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "openai"))]
+    #[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "gemini", feature = "openai"))]
     #[test]
     fn from_body_records_the_code() {
         assert_eq!(

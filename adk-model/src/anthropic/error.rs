@@ -61,6 +61,13 @@ impl From<AnthropicApiError> for AdkError {
     /// which can echo the request.
     fn from(err: AnthropicApiError) -> Self {
         use adk_core::ErrorComponent;
+        let details = crate::ProviderErrorDetails {
+            kind: Some(err.error_type.clone()),
+            message: Some(err.message.clone()),
+            status: Some(err.status_code),
+            request_id: err.request_id.clone(),
+            ..Default::default()
+        };
         let msg = AnthropicApiError {
             message: adk_core::upstream_excerpt(&err.message).to_string(),
             ..err.clone()
@@ -75,7 +82,7 @@ impl From<AnthropicApiError> for AdkError {
         if let Some(ref rid) = err.request_id {
             adk_err = adk_err.with_request_id(rid.clone());
         }
-        crate::error_metadata::with_code(adk_err, Some(&err.error_type))
+        crate::error_metadata::with_code(adk_err, Some(&err.error_type)).with_source(details)
     }
 }
 

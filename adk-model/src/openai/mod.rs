@@ -34,6 +34,7 @@ pub mod schema_adapter;
 #[cfg(feature = "openai-ws")]
 pub mod ws_transport;
 
+pub use crate::ProviderErrorDetails;
 pub use crate::openai_compatible::{
     OpenAICompatible, OpenAICompatibleConfig, ReasoningReplayField,
 };

@@ -1716,6 +1716,7 @@ fn map_api_error(status: reqwest::StatusCode, body: &str) -> Error {
             error_type: Some(error_type),
             message,
             request_id: None,
+            retry_after: None,
         },
     }
 }

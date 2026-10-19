@@ -349,11 +349,12 @@ impl Llm for DeepSeekClient {
                 let mut byte_stream = response.bytes_stream();
                 let mut buffer = Vec::new();
                 let mut finished = false;
+                let mut terminal: Option<LlmResponse> = None;
                 let mut tool_call_accumulators: std::collections::HashMap<u32, (String, String, String)> =
                     std::collections::HashMap::new();
                 let mut reasoning_buffer = String::new();
 
-                while let Some(chunk_result) = byte_stream.next().await {
+                'body: while let Some(chunk_result) = byte_stream.next().await {
                     let chunk = chunk_result.map_err(|error| {
                         crate::stream_error::interrupted("deepseek", INCOMPLETE_STREAM, &error)
                     })?;
@@ -362,7 +363,11 @@ impl Llm for DeepSeekClient {
 
                     while let Some(line) = crate::sse::take_line(&mut buffer)? {
 
-                        if line.is_empty() || line == "data: [DONE]" {
+                        if line == "data: [DONE]" {
+                            buffer.clear();
+                            break 'body;
+                        }
+                        if line.is_empty() {
                             continue;
                         }
 
@@ -375,6 +380,14 @@ impl Llm for DeepSeekClient {
                             }
                             match serde_json::from_value::<ChatCompletionResponse>(value) {
                                 Ok(chunk_response) => {
+                                    if finished {
+                                        if let Some(usage) = chunk_response.usage.as_ref().and_then(convert::usage)
+                                            && let Some(response) = &mut terminal
+                                        {
+                                            response.usage_metadata = Some(usage);
+                                        }
+                                        continue;
+                                    }
                                     if let Some(choice) = chunk_response.choices.first() {
                                         if let Some(delta) = &choice.delta {
                                             // Accumulate reasoning content
@@ -462,7 +475,7 @@ impl Llm for DeepSeekClient {
                                                     tool_reasoning,
                                                 );
                                                 response.usage_metadata = chunk_response.usage.as_ref().and_then(convert::usage);
-                                                yield response;
+                                                terminal = Some(response);
                                                 continue;
                                             }
 
@@ -485,14 +498,16 @@ impl Llm for DeepSeekClient {
                                                 .as_ref()
                                                 .is_none_or(|c| !c.has_function_calls());
 
-                                            yield LlmResponse {
+                                            // Keep the final response until accounting and
+                                            // protocol validation have reached DONE or EOF.
+                                            terminal = Some(LlmResponse {
                                                 content,
                                                 usage_metadata: chunk_response.usage.as_ref().and_then(convert::usage),
                                                 finish_reason,
                                                 partial: false,
                                                 turn_complete,
                                                 ..Default::default()
-                                            };
+                                            });
                                         } else {
                                             // Emit partial text content and accumulate
                                             if let Some(delta) = &choice.delta
@@ -527,10 +542,13 @@ impl Llm for DeepSeekClient {
                         "the response finished",
                     ))?;
                 }
+                if let Some(response) = terminal {
+                    yield response;
+                }
             } else {
                 // Non-streaming mode
                 let response_text = response.text().await
-                    .map_err(|e| AdkError::model(format!("failed to read response: {e}")))?;
+                    .map_err(|error| crate::stream_error::interrupted("deepseek", INCOMPLETE_STREAM, &error))?;
 
                 let chat_response: ChatCompletionResponse = serde_json::from_str(&response_text)
                     .map_err(|e| AdkError::model(format!(

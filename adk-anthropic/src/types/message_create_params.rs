@@ -15,7 +15,6 @@ const MAX_STOP_SEQUENCES: usize = 100;
 const MAX_STOP_SEQUENCE_LENGTH: usize = 1000;
 /// Text bytes in the system prompt (100 KB).
 const MAX_SYSTEM_PROMPT_LENGTH: usize = 100_000;
-const MAX_TOOLS_COUNT: usize = 100;
 /// Largest image the Messages API accepts (5 MB), compared against the decoded size.
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 /// Largest PDF the Messages API accepts (32 MB), compared against the decoded size.
@@ -480,16 +479,6 @@ impl MessageCreateParams {
                     Some("system".to_string()),
                 ));
             }
-        }
-
-        // Validate tools count
-        if let Some(ref tools) = self.tools
-            && tools.len() > MAX_TOOLS_COUNT
-        {
-            return Err(crate::Error::validation(
-                format!("Tools count {} exceeds limit of {}", tools.len(), MAX_TOOLS_COUNT),
-                Some("tools".to_string()),
-            ));
         }
 
         // Validate thinking config with security checks
@@ -1044,5 +1033,28 @@ mod tests {
         let params = MessageCreateParams::simple("Hi", KnownModel::ClaudeSonnet46)
             .with_system("s".repeat(MAX_SYSTEM_PROMPT_LENGTH + 1));
         assert!(params.validate().is_err(), "a system prompt above the limit is rejected");
+    }
+}
+
+#[cfg(test)]
+mod tool_rosters {
+    use super::*;
+    #[test]
+    fn validates_each_tool_without_count_limit() {
+        let tool = serde_json::json!({"type":"custom","name":"lookup","description":"lookup","input_schema":{"type":"object","properties":{}}});
+        let tools = (0..150)
+            .map(|index| {
+                let mut value = tool.clone();
+                value["name"] = format!("lookup_{index}").into();
+                serde_json::from_value(value).unwrap()
+            })
+            .collect();
+        let params = MessageCreateParams::new(
+            1024,
+            vec![MessageParam::user("hello")],
+            Model::Custom("fixture".into()),
+        )
+        .with_tools(tools);
+        params.validate().unwrap();
     }
 }

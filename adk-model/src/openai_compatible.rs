@@ -972,7 +972,7 @@ impl Llm for OpenAICompatible {
                 let mut refused = false;
                 let mut ended = false;
 
-                while !ended {
+                'body: while !ended {
                     match byte_stream.next().await {
                         Some(chunk) => buffer.extend_from_slice(&chunk.map_err(|error| {
                             crate::stream_error::interrupted(
@@ -1003,18 +1003,11 @@ impl Llm for OpenAICompatible {
                                 ))?;
                             }
                             finished = true;
-                            if let Some(response) = pending_final_response.take() {
-                                yield response;
-                            }
-                            continue;
+                            break 'body;
                         }
 
                         {
                             let parsed = serde_json::from_str::<serde_json::Value>(data);
-                            // A cut-off trailer after a finished response loses nothing.
-                            if parsed.is_err() && ended && finished {
-                                continue;
-                            }
                             let chunk_json = parsed.map_err(|error| {
                                 crate::stream_error::undecodable(
                                     &provider_name,
@@ -1037,10 +1030,9 @@ impl Llm for OpenAICompatible {
                                 Some(c) => c,
                                 None => {
                                     if let Some(usage_metadata) = usage_metadata
-                                        && let Some(mut response) = pending_final_response.take()
+                                        && let Some(response) = pending_final_response.as_mut()
                                     {
                                         response.usage_metadata = Some(usage_metadata);
-                                        yield response;
                                     }
                                     continue;
                                 }
@@ -1201,11 +1193,7 @@ impl Llm for OpenAICompatible {
                                         model: None,
                                         provider: None,
                                     };
-                                    if response.usage_metadata.is_some() {
-                                        yield response;
-                                    } else {
-                                        pending_final_response = Some(response);
-                                    }
+                                    pending_final_response = Some(response);
                                     continue;
                                 }
 
@@ -1236,11 +1224,7 @@ impl Llm for OpenAICompatible {
                                     model: None,
                                     provider: None,
                                 };
-                                if response.usage_metadata.is_some() {
-                                    yield response;
-                                } else {
-                                    pending_final_response = Some(response);
-                                }
+                                pending_final_response = Some(response);
                                 continue;
                             }
 
@@ -1341,6 +1325,9 @@ impl Llm for OpenAICompatible {
                         let http_resp = send_request(&http, &target, &body).await?;
 
                         let raw_json: serde_json::Value = http_resp.json().await.map_err(|e| {
+                            if !e.is_decode() || e.is_timeout() {
+                                return crate::stream_error::interrupted(&provider_name, error_codes.request, &e);
+                            }
                             AdkError::new(
                                 ErrorComponent::Model,
                                 ErrorCategory::Internal,

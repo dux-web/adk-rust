@@ -8,50 +8,19 @@ use adk_core::{AdkError, LlmResponseStream};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::Span;
 
 pub(super) fn responses<S>(events: S) -> LlmResponseStream
 where
     S: Stream<Item = Result<MessageStreamEvent, adk_anthropic::Error>> + Send + 'static,
 {
     Box::pin(async_stream::try_stream! {
-        // The accumulator turns a mid-stream `error` event into an `Err` item, the
-        // same shape as a transport failure; this flag tells the two apart.
-        let saw_error_event = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&saw_error_event);
-        let events = events.inspect(move |event| {
-            if matches!(event, Ok(MessageStreamEvent::StreamError { .. })) {
-                flag.store(true, Ordering::Relaxed);
-            }
-        });
         let (mut events, _) = AccumulatingStream::new(events);
         // Client tool calls by block index: id, name and the streamed argument JSON.
         let mut tool_calls: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
         while let Some(event) = events.next().await {
             let event = match event {
                 Ok(event) => event,
-                // A mid-stream `error` event (for example `overloaded_error`) aborts
-                // the message; it fails the stream with the category the same error
-                // gets as an HTTP response, so retry policy can act on it.
-                Err(error) if saw_error_event.load(Ordering::Relaxed) => {
-                    Err(convert_anthropic_error(error))?
-                }
-                Err(error) => {
-                    let error = super::client::to_anthropic_api_error(&error);
-                    if let Some(request_id) = &error.request_id {
-                        Span::current().record("anthropic.request_id", request_id.as_str());
-                    }
-                    // The message can echo the request, so only the content-free part is logged.
-                    tracing::error!(
-                        error.type_ = %error.error_type,
-                        error.status_code = error.status_code,
-                        "anthropic stream error"
-                    );
-                    yield convert::from_stream_error(&error.error_type, &error.message);
-                    return;
-                }
+                Err(error) => Err(convert_anthropic_error(error))?,
             };
             match event {
                 MessageStreamEvent::ContentBlockStart(start) => match start.content_block {
@@ -129,6 +98,6 @@ where
                 _ => {}
             }
         }
-        Err(AdkError::model("Anthropic stream ended before message_stop"))?;
+        Err(crate::stream_error::incomplete("anthropic", "model.anthropic.unfinished_stream", "message_stop"))?;
     })
 }

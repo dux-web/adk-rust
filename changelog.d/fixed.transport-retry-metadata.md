@@ -1,0 +1,3 @@
+Model transports retain raw-byte idle deadlines, typed timeout failures, exact upstream statuses and private provider diagnostics. Anthropic HTTP timeout mode replaces its independent header/SSE timers; Gemini and OpenCode accept explicit transport deadlines. Retry-After is not shortened to the exponential backoff cap, and 520–524 remain retryable server failures.
+
+`adk-anthropic::Error::Api` and `adk-gemini::ClientError::BadResponse` retain an optional raw `retry_after` header for the model retry owner. Direct enum constructors must initialize it; exhaustive field patterns should use `..`. Responses failure events no longer require successful-response fields. The unsupported Anthropic tool-count cap is removed while individual tool validation remains.

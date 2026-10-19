@@ -20,7 +20,7 @@ use crate::observability::{
     CLIENT_REQUEST_DURATION, CLIENT_REQUEST_ERRORS, CLIENT_REQUEST_RETRIES, CLIENT_REQUESTS,
     CLIENT_RETRY_BACKOFF,
 };
-use crate::sse::{process_json_sse, process_sse};
+
 use crate::types::{
     BatchRequest, BatchResultItem, FileObject, Message, MessageBatch, MessageCountTokensParams,
     MessageCreateParams, MessageStreamEvent, MessageTokensCount, ModelInfo, ModelListParams,
@@ -109,6 +109,9 @@ const ENV_INSECURE_HTTP_OPT_IN: &str =
 /// | Streaming, until response headers | the same timeout |
 /// | Streaming body | a 30-second inactivity timeout between chunks, plus the optional total bound from [`with_stream_timeout`](Self::with_stream_timeout) |
 ///
+/// [`with_http_timeouts`](Self::with_http_timeouts) selects HTTP-only connect/read
+/// deadlines instead of these default total/header/SSE bounds.
+///
 /// The `Debug` output redacts the API key.
 #[derive(Clone)]
 pub struct Anthropic {
@@ -119,6 +122,7 @@ pub struct Anthropic {
     base_url: String,
     timeout: Duration,
     stream_timeout: Option<Duration>,
+    http_timeouts: bool,
     max_retries: usize,
     throughput_ops_sec: f64,
     reserve_capacity: f64,
@@ -323,6 +327,7 @@ impl Anthropic {
             base_url,
             timeout,
             stream_timeout: None,
+            http_timeouts: false,
             max_retries: 3,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
@@ -499,6 +504,7 @@ impl Anthropic {
     /// Returns an HTTP client error when the underlying client cannot be built.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.timeout = timeout;
+        self.http_timeouts = false;
         self.client = Self::build_http_client(Some(timeout), timeout)?;
         self.stream_client = Self::build_http_client(None, timeout)?;
         Ok(self)
@@ -539,6 +545,29 @@ impl Anthropic {
     pub fn with_stream_timeout(mut self, stream_timeout: Option<Duration>) -> Self {
         self.stream_timeout = stream_timeout;
         self
+    }
+
+    /// Uses connect and raw-byte read deadlines without a total request deadline.
+    ///
+    /// This explicitly replaces the header and SSE idle timers. Non-streaming and
+    /// streaming responses share the same HTTP read deadline, which resets on bytes.
+    pub fn with_http_timeouts(mut self, connect: Duration, idle: Duration) -> Result<Self> {
+        let client = ReqwestClient::builder()
+            .connect_timeout(connect)
+            .read_timeout(idle)
+            .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(10)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Duration::from_secs(60))
+            .build()
+            .map_err(|error| {
+                Error::http_client("Failed to build HTTP client", Some(Box::new(error)))
+            })?;
+        self.client = client.clone();
+        self.stream_client = client;
+        self.http_timeouts = true;
+        self.stream_timeout = None;
+        Ok(self)
     }
 
     /// Set the maximum number of retries for this client.
@@ -729,6 +758,9 @@ impl Anthropic {
 
                     // Get retry-after from error if available
                     let header_backoff_duration = match &error {
+                        Error::Api { retry_after: Some(header), .. } => {
+                            header.parse::<u64>().ok().map(Duration::from_secs)
+                        }
                         Error::RateLimit { retry_after: Some(seconds), .. } => {
                             Some(Duration::from_secs(*seconds))
                         }
@@ -772,7 +804,7 @@ impl Anthropic {
             .headers()
             .get("retry-after")
             .and_then(|val| val.to_str().ok())
-            .and_then(|val| val.parse::<u64>().ok());
+            .map(str::to_owned);
 
         // Try to parse error response body
         #[derive(Deserialize)]
@@ -816,12 +848,13 @@ impl Anthropic {
             401 => Error::authentication(error_message),
             403 => Error::permission(error_message),
             404 => Error::not_found(error_message, None, None),
-            408 => Error::timeout(error_message, None),
-            429 => Error::rate_limit(error_message, retry_after),
-            500 => Error::internal_server(error_message, request_id),
-            502..=504 => Error::service_unavailable(error_message, retry_after),
-            529 => Error::rate_limit(error_message, retry_after),
-            _ => Error::api(status_code, error_type, error_message, request_id),
+            _ => Error::Api {
+                status_code,
+                error_type,
+                message: error_message,
+                request_id,
+                retry_after,
+            },
         }
     }
 
@@ -859,6 +892,9 @@ impl Anthropic {
         }
 
         response.json::<T>().await.map_err(|e| {
+            if e.is_timeout() {
+                return self.map_request_error(e);
+            }
             Error::serialization(format!("Failed to parse response: {e}"), Some(Box::new(e)))
         })
     }
@@ -879,18 +915,22 @@ impl Anthropic {
             request = request.timeout(stream_timeout);
         }
 
-        let response = tokio::time::timeout(self.timeout, request.send())
-            .await
-            .map_err(|_| {
-                Error::timeout(
-                    format!(
-                        "Timed out after {} seconds waiting for the streaming response headers",
-                        self.timeout.as_secs_f64()
-                    ),
-                    Some(self.timeout.as_secs_f64()),
-                )
-            })?
-            .map_err(|e| self.map_request_error(e))?;
+        let response = if self.http_timeouts {
+            request.send().await.map_err(|error| self.map_request_error(error))?
+        } else {
+            tokio::time::timeout(self.timeout, request.send())
+                .await
+                .map_err(|_| {
+                    Error::timeout(
+                        format!(
+                            "Timed out after {} seconds waiting for the streaming response headers",
+                            self.timeout.as_secs_f64()
+                        ),
+                        Some(self.timeout.as_secs_f64()),
+                    )
+                })?
+                .map_err(|e| self.map_request_error(e))?
+        };
 
         if !response.status().is_success() {
             return Err(Self::process_error_response(response).await);
@@ -919,6 +959,9 @@ impl Anthropic {
         }
 
         response.json::<T>().await.map_err(|e| {
+            if e.is_timeout() {
+                return self.map_request_error(e);
+            }
             Error::serialization(format!("Failed to parse response: {e}"), Some(Box::new(e)))
         })
     }
@@ -1136,7 +1179,10 @@ impl Anthropic {
         let stream = response.bytes_stream();
 
         // Create an SSE processor
-        Ok(process_sse(stream))
+        Ok(crate::sse::process_sse_with_timeout(
+            stream,
+            if self.http_timeouts { None } else { Some(Duration::from_secs(30)) },
+        ))
     }
 
     /// Send a message to the API and stream response events.
@@ -1263,7 +1309,10 @@ impl Anthropic {
                 return Err(error);
             }
         };
-        Ok(process_json_sse(response.bytes_stream()))
+        Ok(crate::sse::process_json_sse_with_timeout(
+            response.bytes_stream(),
+            if self.http_timeouts { None } else { Some(Duration::from_secs(30)) },
+        ))
     }
 
     /// Send a message to the API with logging and get a streaming response.
@@ -1807,6 +1856,7 @@ mod tests {
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             stream_timeout: None,
+            http_timeouts: false,
             max_retries: 2,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
@@ -1844,6 +1894,7 @@ mod tests {
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             stream_timeout: None,
+            http_timeouts: false,
             max_retries: 2,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
@@ -1879,6 +1930,7 @@ mod tests {
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             stream_timeout: None,
+            http_timeouts: false,
             max_retries: 2,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
@@ -1915,6 +1967,7 @@ mod tests {
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             stream_timeout: None,
+            http_timeouts: false,
             max_retries: 2,
             throughput_ops_sec: 1.0 / 60.0,
             reserve_capacity: 1.0 / 60.0,
@@ -2402,6 +2455,7 @@ mod tests {
             base_url: "http://localhost".to_string(),
             timeout: Duration::from_secs(1),
             stream_timeout: None,
+            http_timeouts: false,
             max_retries: 1,
             throughput_ops_sec: 1.0,
             reserve_capacity: 1.0,

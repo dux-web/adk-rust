@@ -46,6 +46,7 @@ pub struct OpenCodeConfig {
     pub(super) thinking: Option<ThinkingMode>,
     pub(super) anthropic_effort: Option<Effort>,
     pub(super) retry: RetryConfig,
+    pub(super) timeouts: crate::HttpTimeouts,
 }
 
 impl std::fmt::Debug for OpenCodeConfig {
@@ -59,6 +60,12 @@ impl std::fmt::Debug for OpenCodeConfig {
 }
 
 impl OpenCodeConfig {
+    /// Sets HTTP connect and raw-byte read deadlines for the selected transport.
+    pub fn with_timeouts(mut self, timeouts: crate::HttpTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
     /// Creates a config with the selected service's official URL and model routing.
     pub fn new(
         service: OpenCodeService,
@@ -78,6 +85,7 @@ impl OpenCodeConfig {
             thinking: None,
             anthropic_effort: None,
             retry: RetryConfig::default(),
+            timeouts: crate::HttpTimeouts::default(),
         }
     }
 

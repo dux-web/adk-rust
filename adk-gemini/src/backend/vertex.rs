@@ -89,8 +89,13 @@ impl VertexBackend {
     async fn check_response(response: reqwest::Response) -> Result<reqwest::Response, Error> {
         let status = response.status();
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|header| header.to_str().ok())
+                .map(str::to_owned);
             let description = response.text().await.ok();
-            BadResponseSnafu { code: status.as_u16(), description }.fail()
+            BadResponseSnafu { code: status.as_u16(), description, retry_after }.fail()
         } else {
             Ok(response)
         }
@@ -218,7 +223,7 @@ impl VertexBackend {
         let stream = response
             .bytes_stream()
             .eventsource()
-            .map_err(|e| Error::BadPart { source: e })
+            .map_err(Error::from_event_stream)
             .and_then(|event| async move { super::decode_generation_response(&event.data) });
 
         Ok(Box::pin(stream))

@@ -24,6 +24,7 @@ const MAX_BUFFER_SIZE: usize = 1024 * 1024;
 const MAX_EVENT_SIZE: usize = 64 * 1024;
 
 /// Longest wait for the next chunk from the server before the stream fails (30 seconds).
+#[cfg(test)]
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
@@ -61,25 +62,39 @@ struct SseState {
 ///   at `debug` level and surfaced as [`MessageStreamEvent::Unknown`] with its
 ///   JSON payload, so a new server-side event type never fails the stream
 /// - UTF-8 validation with partial byte handling
-pub fn process_sse<S>(byte_stream: S) -> impl Stream<Item = Result<MessageStreamEvent>>
+#[cfg(test)]
+fn process_sse<S>(byte_stream: S) -> impl Stream<Item = Result<MessageStreamEvent>>
 where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
 {
-    process_sse_with(byte_stream, parse_standard_event, CHUNK_TIMEOUT)
+    process_sse_with_timeout(byte_stream, Some(CHUNK_TIMEOUT))
 }
 
-pub(crate) fn process_json_sse<S, T>(byte_stream: S) -> impl Stream<Item = Result<T>>
+pub(crate) fn process_sse_with_timeout<S>(
+    byte_stream: S,
+    timeout: Option<Duration>,
+) -> impl Stream<Item = Result<MessageStreamEvent>>
+where
+    S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
+{
+    process_sse_with(byte_stream, parse_standard_event, timeout)
+}
+
+pub(crate) fn process_json_sse_with_timeout<S, T>(
+    byte_stream: S,
+    timeout: Option<Duration>,
+) -> impl Stream<Item = Result<T>>
 where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
     T: DeserializeOwned + 'static,
 {
-    process_sse_with(byte_stream, parse_json_event::<T>, CHUNK_TIMEOUT)
+    process_sse_with(byte_stream, parse_json_event::<T>, timeout)
 }
 
 fn process_sse_with<S, T, P>(
     byte_stream: S,
     parser: P,
-    chunk_timeout: Duration,
+    chunk_timeout: Option<Duration>,
 ) -> impl Stream<Item = Result<T>>
 where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin + 'static,
@@ -88,8 +103,13 @@ where
 {
     // Convert reqwest errors to our error type
     let stream = byte_stream.map(|result| {
-        result
-            .map_err(|e| Error::streaming(format!("Error in HTTP stream: {e}"), Some(Box::new(e))))
+        result.map_err(|e| {
+            if e.is_timeout() {
+                Error::timeout("HTTP response read timed out", None)
+            } else {
+                Error::streaming(format!("Error in HTTP stream: {e}"), Some(Box::new(e)))
+            }
+        })
     });
 
     // Initialize state with production hardening
@@ -107,6 +127,14 @@ where
             return None;
         }
         loop {
+            // SSE comments carry transport activity, not dispatched events.
+            if let Some(end) = state.buffer.find("\n\n")
+                && !state.buffer[..end].is_empty()
+                && state.buffer[..end].lines().all(|line| line.starts_with(':'))
+            {
+                state.buffer.drain(..end + 2);
+                continue;
+            }
             // Check if we have a complete event in the buffer
             match extract_event(&state.buffer, parser) {
                 Ok(Some((event, remaining))) => {
@@ -140,19 +168,26 @@ where
 
             // Only the wait on the server is timed, so a consumer that pauses
             // between polls never trips the inactivity timeout.
-            let Ok(next) = tokio::time::timeout(chunk_timeout, stream.next()).await else {
-                STREAM_ERRORS.click();
-                state.finished = true;
-                return Some((
-                    Err(Error::timeout(
-                        format!(
-                            "SSE stream timeout: no data received for {} seconds",
-                            chunk_timeout.as_secs_f64()
-                        ),
-                        Some(chunk_timeout.as_secs_f64()),
-                    )),
-                    (stream, state),
-                ));
+            let next = if let Some(timeout) = chunk_timeout {
+                match tokio::time::timeout(timeout, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        STREAM_ERRORS.click();
+                        state.finished = true;
+                        return Some((
+                            Err(Error::timeout(
+                                format!(
+                                    "SSE stream idle timeout after {} seconds",
+                                    timeout.as_secs_f64()
+                                ),
+                                Some(timeout.as_secs_f64()),
+                            )),
+                            (stream, state),
+                        ));
+                    }
+                }
+            } else {
+                stream.next().await
             };
             match next {
                 Some(Ok(bytes)) => {
@@ -550,8 +585,11 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     async fn stalled_server_times_out_and_ends_the_stream() {
         let stream = Box::pin(stream::pending::<std::result::Result<Bytes, reqwest::Error>>());
 
-        let mut sse_stream =
-            Box::pin(process_sse_with(stream, parse_standard_event, Duration::from_millis(50)));
+        let mut sse_stream = Box::pin(process_sse_with(
+            stream,
+            parse_standard_event,
+            Some(Duration::from_millis(50)),
+        ));
 
         let error = sse_stream.next().await.unwrap().unwrap_err();
         assert!(error.is_timeout(), "expected a timeout error, got {error:?}");
@@ -565,8 +603,11 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
             Ok(Bytes::from_static(b"event: ping\ndata: {}\n\n")),
         ]));
 
-        let mut sse_stream =
-            Box::pin(process_sse_with(stream, parse_standard_event, Duration::from_millis(50)));
+        let mut sse_stream = Box::pin(process_sse_with(
+            stream,
+            parse_standard_event,
+            Some(Duration::from_millis(50)),
+        ));
 
         assert!(matches!(sse_stream.next().await, Some(Ok(MessageStreamEvent::Ping))));
         tokio::time::sleep(Duration::from_millis(150)).await;

@@ -10,9 +10,7 @@ pub struct RetryConfig {
     pub max_retries: u32,
     /// Initial delay before the first retry.
     pub initial_delay: Duration,
-    /// Maximum delay between retries. Caps both exponential growth and a
-    /// server-provided `Retry-After` delay, so a large `Retry-After` never
-    /// stalls an agent run for longer than this.
+    /// Maximum exponential backoff delay. A valid server Retry-After is not shortened.
     pub max_delay: Duration,
     /// Multiplier applied to the delay after each retry.
     pub backoff_multiplier: f32,
@@ -69,7 +67,7 @@ impl RetryConfig {
 /// Returns `true` if the HTTP status code indicates a transient error worth retrying.
 #[must_use]
 pub fn is_retryable_status_code(status_code: u16) -> bool {
-    matches!(status_code, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+    matches!(status_code, 408 | 429 | 500 | 502 | 503 | 504 | 520..=524 | 529)
 }
 
 /// Maps an upstream HTTP error status to the [`ErrorCategory`] provider clients report.
@@ -96,7 +94,7 @@ pub fn category_for_status_code(status_code: u16) -> ErrorCategory {
         404 => ErrorCategory::NotFound,
         408 => ErrorCategory::Timeout,
         429 => ErrorCategory::RateLimited,
-        500 | 502 | 503 | 504 | 529 => ErrorCategory::Unavailable,
+        500 | 502 | 503 | 504 | 520..=524 | 529 => ErrorCategory::Unavailable,
         500..=599 => ErrorCategory::Internal,
         _ => ErrorCategory::InvalidInput,
     }
@@ -106,8 +104,8 @@ pub fn category_for_status_code(status_code: u16) -> ErrorCategory {
 ///
 /// Seconds may be fractional. An HTTP-date in any of the three formats of
 /// RFC 9110 yields the time remaining until that date, or zero when it has
-/// passed. A delay too large to represent in milliseconds saturates, and
-/// [`execute_with_retry`] caps every server delay at [`RetryConfig::max_delay`].
+/// passed. A delay too large to represent in milliseconds is invalid.
+/// Retry callers may decline a delay, but must not retry earlier than it.
 /// Returns `None` for any other value.
 ///
 /// # Example
@@ -124,19 +122,20 @@ pub fn category_for_status_code(status_code: u16) -> ErrorCategory {
 #[must_use]
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
     // `RetryHint` stores whole milliseconds as `u64`.
-    let max = Duration::from_millis(u64::MAX);
     let value = value.trim();
     if let Ok(seconds) = value.parse::<f64>() {
         if !seconds.is_finite() || seconds < 0.0 {
             return None;
         }
-        return Some(Duration::try_from_secs_f64(seconds).map_or(max, |delay| delay.min(max)));
+        let delay = Duration::try_from_secs_f64(seconds).ok()?;
+        u64::try_from(delay.as_millis()).ok()?;
+        return Some(delay);
     }
     let date = httpdate::parse_http_date(value).ok()?;
     let delay = date.duration_since(std::time::SystemTime::now()).unwrap_or(Duration::ZERO);
     // Round up so a retry never starts before the requested date.
     let millis = delay.as_nanos().div_ceil(1_000_000);
-    Some(u64::try_from(millis).map_or(max, Duration::from_millis))
+    u64::try_from(millis).ok().map(Duration::from_millis)
 }
 
 /// Attaches a server-provided `Retry-After` delay to a retryable error.
@@ -208,8 +207,7 @@ fn next_retry_delay(current: Duration, retry_config: &RetryConfig) -> Duration {
     }
 
     let multiplier = retry_config.backoff_multiplier.max(1.0) as f64;
-    let scaled = Duration::from_secs_f64(current.as_secs_f64() * multiplier);
-    scaled.min(retry_config.max_delay)
+    Duration::from_secs_f64(current.as_secs_f64() * multiplier).min(retry_config.max_delay)
 }
 
 /// Hint from the server about when to retry.
@@ -253,8 +251,7 @@ where
 /// instead of the exponential backoff calculation. This respects server-provided
 /// timing from `retry-after` headers (Requirement 5.1).
 ///
-/// A server-provided delay, from the error or from `server_hint`, is capped at
-/// [`RetryConfig::max_delay`].
+/// A server-provided delay is not shortened to the backoff cap.
 pub async fn execute_with_retry_hint<T, Op, Fut, Classify>(
     retry_config: &RetryConfig,
     classify_error: Classify,
@@ -265,6 +262,29 @@ where
     Op: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
     Classify: Fn(&AdkError) -> bool,
+{
+    execute_with_retry_observer(retry_config, classify_error, server_hint, operation, |_, _, _| {
+        std::future::ready(Ok(()))
+    })
+    .await
+}
+
+/// Executes the shared retry policy, observing each accepted retry before waiting.
+///
+/// Returning an error from the observer cancels the retry without replaying the operation.
+pub async fn execute_with_retry_observer<T, Op, Fut, Classify, Observe, ObserveFut>(
+    retry_config: &RetryConfig,
+    classify_error: Classify,
+    server_hint: Option<&ServerRetryHint>,
+    operation: &mut Op,
+    mut observe: Observe,
+) -> Result<T>
+where
+    Op: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+    Classify: Fn(&AdkError) -> bool,
+    Observe: FnMut(u32, u32, Duration) -> ObserveFut,
+    ObserveFut: Future<Output = Result<()>>,
 {
     if !retry_config.enabled {
         return operation().await;
@@ -283,12 +303,11 @@ where
                 attempt += 1;
 
                 // Priority: 1) structured retry_after from AdkError, 2) server hint, 3) backoff.
-                // A server delay is capped so `Retry-After: 3600` cannot stall the run.
                 let error_retry_after = error.retry.retry_after();
                 let effective_delay = if let Some(d) = error_retry_after {
-                    d.min(retry_config.max_delay)
+                    d
                 } else if attempt == 1 {
-                    server_delay.map_or(delay, |d| d.min(retry_config.max_delay))
+                    server_delay.unwrap_or(delay)
                 } else {
                     delay
                 };
@@ -302,6 +321,10 @@ where
                     error = %error.diagnostics(),
                     "provider request failed with a retryable error; retrying"
                 );
+                if tokio::time::Instant::now().checked_add(effective_delay).is_none() {
+                    return Err(error);
+                }
+                observe(attempt, retry_config.max_retries, effective_delay).await?;
                 tokio::time::sleep(effective_delay).await;
                 delay = next_retry_delay(delay, retry_config);
             }
@@ -394,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_retry_after_is_capped_at_max_delay() {
+    async fn server_retry_after_is_not_shortened() {
         let retry_config = RetryConfig::default()
             .with_max_retries(1)
             .with_initial_delay(Duration::ZERO)
@@ -412,7 +435,7 @@ mod tests {
                         "model.test.unavailable",
                         "overloaded",
                     );
-                    return Err(with_retry_after(error, Some(Duration::from_secs(3600))));
+                    return Err(with_retry_after(error, Some(Duration::from_millis(80))));
                 }
                 Ok("ok")
             }
@@ -420,16 +443,16 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap(), "ok");
-        assert!(started.elapsed() < Duration::from_secs(5), "delay was not capped");
+        assert!(started.elapsed() >= Duration::from_millis(80), "server delay was shortened");
     }
 
     #[tokio::test]
-    async fn server_hint_is_capped_at_max_delay() {
+    async fn server_hint_is_not_shortened() {
         let retry_config = RetryConfig::default()
             .with_max_retries(1)
             .with_initial_delay(Duration::ZERO)
             .with_max_delay(Duration::from_millis(20));
-        let hint = ServerRetryHint { retry_after: Some(Duration::from_secs(3600)) };
+        let hint = ServerRetryHint { retry_after: Some(Duration::from_millis(80)) };
         let attempts = Arc::new(AtomicU32::new(0));
         let started = std::time::Instant::now();
 
@@ -450,12 +473,12 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap(), "ok");
-        assert!(started.elapsed() < Duration::from_secs(5), "delay was not capped");
+        assert!(started.elapsed() >= Duration::from_millis(80), "server delay was shortened");
     }
 
     #[test]
     fn transient_server_statuses_map_to_retryable_unavailable() {
-        for status in [500, 502, 503, 504, 529] {
+        for status in [500, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
             assert_eq!(category_for_status_code(status), ErrorCategory::Unavailable, "{status}");
         }
         assert_eq!(category_for_status_code(501), ErrorCategory::Internal);
@@ -490,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_after_accepts_http_dates_and_saturates() {
+    fn accepts_dates_and_rejects_overflow() {
         let future = std::time::SystemTime::now() + Duration::from_secs(30);
         for date in [
             httpdate::fmt_http_date(future),
@@ -502,10 +525,9 @@ mod tests {
         }
         assert!(parse_retry_after(&httpdate::fmt_http_date(future)).unwrap() > Duration::ZERO);
 
-        let max = Some(Duration::from_millis(u64::MAX));
-        assert_eq!(parse_retry_after("18446744073709551616"), max);
-        assert_eq!(parse_retry_after("1e300"), max);
-        for invalid in ["", "soon", "inf", "NaN", "-0.5"] {
+        assert_eq!(parse_retry_after("61"), Some(Duration::from_secs(61)));
+        assert_eq!(parse_retry_after("1.5"), Some(Duration::from_millis(1500)));
+        for invalid in ["", "soon", "inf", "NaN", "-0.5", "18446744073709551616", "1e300"] {
             assert_eq!(parse_retry_after(invalid), None, "{invalid:?}");
         }
     }
@@ -622,5 +644,31 @@ mod tests {
 
         // Gap 2 should be roughly double gap 1 (with tolerance for scheduling).
         assert!(gap2 >= gap1, "backoff should increase: gap2={gap2:?} should be >= gap1={gap1:?}");
+    }
+}
+
+#[cfg(test)]
+mod observation {
+    use super::*;
+    #[tokio::test]
+    async fn cancellation_prevents_replay() {
+        let mut attempts = 0;
+        let error = execute_with_retry_observer(
+            &RetryConfig::default(),
+            |_| true,
+            None,
+            &mut || {
+                attempts += 1;
+                std::future::ready(Err::<(), _>(AdkError::model("transient")))
+            },
+            |attempt, limit, _| {
+                assert_eq!((attempt, limit), (1, 3));
+                std::future::ready(Err(AdkError::model("cancelled")))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(error.message, "cancelled");
     }
 }

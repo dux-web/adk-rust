@@ -124,8 +124,15 @@ impl OpenAIResponsesClient {
         let (transport, http) = responses_http_clients(&http::HeaderMap::new(), timeouts)?;
         // ADK owns retry policy. async-openai's default executor has another
         // retry layer, including when this model's retries are disabled.
-        let client =
-            with_transport(client, &transport, uses_max_reasoning, open_responses_mode, None, None);
+        let client = with_transport(
+            client,
+            &transport,
+            uses_max_reasoning,
+            open_responses_mode,
+            None,
+            None,
+            None,
+        );
 
         let base_url =
             config.base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string());
@@ -218,6 +225,7 @@ impl OpenAIResponsesClient {
             self.open_responses_mode,
             self.adapter.clone(),
             self.observer.clone(),
+            None,
         );
         Ok(self)
     }
@@ -259,6 +267,7 @@ impl OpenAIResponsesClient {
             self.open_responses_mode,
             self.adapter.clone(),
             self.observer.clone(),
+            None,
         );
         self
     }
@@ -302,6 +311,7 @@ impl OpenAIResponsesClient {
             self.open_responses_mode,
             self.adapter.clone(),
             self.observer.clone(),
+            None,
         );
         self
     }
@@ -386,6 +396,7 @@ fn with_transport(
     open_responses_mode: bool,
     adapter: Option<super::RequestAdapter>,
     observer: Option<super::ResponseObserver>,
+    timed_out: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> async_openai::Client<async_openai::config::OpenAIConfig> {
     use async_openai::error::OpenAIError;
     use async_openai::middleware::{HttpRequestFactory, ReqwestService};
@@ -396,6 +407,7 @@ fn with_transport(
         let transport = transport.clone();
         let adapter = adapter.clone();
         let observer = observer.clone();
+        let timed_out = timed_out.clone();
         async move {
             let streaming = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let requested_streaming = streaming.clone();
@@ -444,7 +456,11 @@ fn with_transport(
                     Ok(request)
                 }
             });
+            if let Some(marker) = &timed_out {
+                marker.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             let response = transport.oneshot(rewritten).await?;
+            let response = preserve_timeout(response, timed_out);
             if response.url().path().ends_with("/responses")
                 && let Some(observer) = observer
             {
@@ -461,6 +477,44 @@ fn with_transport(
     });
 
     client.with_http_service(service)
+}
+
+// async-openai stringifies SSE I/O errors. Keep only their typed timeout fact,
+// scoped to this generation request; do not inspect error text or model content.
+fn preserve_timeout(
+    response: reqwest_openai::Response,
+    marker: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> reqwest_openai::Response {
+    use reqwest_openai::ResponseBuilderExt;
+    let Some(marker) = marker else { return response };
+    let mut builder = http::Response::builder()
+        .status(response.status())
+        .version(response.version())
+        .url(response.url().clone());
+    *builder.headers_mut().expect("response headers") = response.headers().clone();
+    let chunks = response.bytes_stream().inspect(move |chunk| {
+        if let Err(error) = chunk
+            && error.is_timeout()
+        {
+            marker.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    builder.body(reqwest_openai::Body::wrap_stream(chunks)).expect("valid response").into()
+}
+
+fn request_error(
+    error: async_openai::error::OpenAIError,
+    layer: parse::Layer,
+    timed_out: &std::sync::atomic::AtomicBool,
+) -> AdkError {
+    let mut mapped = map_error(error, layer);
+    if timed_out.load(std::sync::atomic::Ordering::Relaxed) {
+        mapped.category = ErrorCategory::Timeout;
+        mapped.code = "model.openai_responses.timeout";
+        mapped.message = "OpenAI Responses response read timed out".into();
+        mapped.retry.should_retry = true;
+    }
+    mapped
 }
 
 async fn normalize_responses_response(
@@ -848,10 +902,10 @@ fn map_error(e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkErr
     }
 
     // Reqwest / network errors → Unavailable (retryable)
-    if let async_openai::error::OpenAIError::Reqwest(_) = e {
+    if let async_openai::error::OpenAIError::Reqwest(ref source) = e {
         return AdkError::new(
             ErrorComponent::Model,
-            ErrorCategory::Unavailable,
+            if source.is_timeout() { ErrorCategory::Timeout } else { ErrorCategory::Unavailable },
             "model.openai_responses.request",
             format!("OpenAI Responses API network error: {error_string}"),
         )
@@ -910,6 +964,16 @@ impl Llm for OpenAIResponsesClient {
         request: LlmRequest,
         stream: bool,
     ) -> Result<LlmResponseStream, AdkError> {
+        let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = with_transport(
+            self.client.clone(),
+            &self.transport,
+            matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
+            self.open_responses_mode,
+            self.adapter.clone(),
+            self.observer.clone(),
+            Some(timed_out.clone()),
+        );
         let usage_span = adk_telemetry::llm_generate_span("openai-responses", &self.model, stream);
 
         let create_request = responses_convert::build_create_response(
@@ -930,14 +994,17 @@ impl Llm for OpenAIResponsesClient {
 
             let event_stream =
                 execute_with_retry(&self.retry_config, is_retryable_model_error, || {
-                    let client = self.client.clone();
+                    let client = client.clone();
                     let request = create_request.clone();
+                    let timed_out = timed_out.clone();
                     async move {
                         client
                             .responses()
                             .create_stream_byot::<_, serde_json::Value>(request)
                             .await
-                            .map_err(|error| map_error(error, parse::Layer::StreamSetup))
+                            .map_err(|error| {
+                                request_error(error, parse::Layer::StreamSetup, &timed_out)
+                            })
                     }
                 })
                 .await?;
@@ -947,7 +1014,7 @@ impl Llm for OpenAIResponsesClient {
                 futures::pin_mut!(event_stream);
                 while let Some(event_result) = event_stream.next().await {
                     let value = event_result
-                        .map_err(|error| map_error(error, parse::Layer::StreamEvent))?;
+                        .map_err(|error| request_error(error, parse::Layer::StreamEvent, &timed_out))?;
                     match wire::event(value)? {
                         wire::Event::Terminal(response) => {
                             yield state.finish(&response)?;
@@ -978,7 +1045,7 @@ impl Llm for OpenAIResponsesClient {
             ))
         } else {
             // Non-streaming path
-            let client = self.client.clone();
+            let client = client.clone();
             let retry_config = self.retry_config.clone();
 
             let response_stream = try_stream! {
@@ -988,13 +1055,14 @@ impl Llm for OpenAIResponsesClient {
                     || {
                         let client = client.clone();
                         let mut req = create_request.clone();
+                        let timed_out = timed_out.clone();
                         req.stream = Some(false);
                         async move {
                             client
                                 .responses()
                                 .create_byot::<_, serde_json::Value>(req)
                                 .await
-                                .map_err(map_openai_error)
+                                .map_err(|error| request_error(error, parse::Layer::ResponseBody, &timed_out))
                         }
                     },
                 )

@@ -125,6 +125,7 @@ impl OpenCodeClient {
                                 .with_provider_name(service.provider()),
                             config.reasoning_effort,
                         )?
+                        .with_timeouts(config.timeouts)?
                         .with_reasoning_replay(true)
                         .with_default_headers(headers)?
                         .with_retry_config(config.retry),
@@ -139,7 +140,12 @@ impl OpenCodeClient {
                         }
                         None => OpenAIResponsesClient::new(native),
                     }?;
-                    Arc::new(client.with_default_headers(headers)?.with_retry_config(config.retry))
+                    Arc::new(
+                        client
+                            .with_timeouts(config.timeouts)?
+                            .with_default_headers(headers)?
+                            .with_retry_config(config.retry),
+                    )
                 }
             }
             OpenCodeApi::Messages => {
@@ -158,6 +164,7 @@ impl OpenCodeClient {
                 }
                 Arc::new(
                     AnthropicClient::new(native)?
+                        .with_timeouts(config.timeouts)?
                         .with_default_headers(headers)
                         .with_retry_config(config.retry),
                 )
@@ -172,7 +179,9 @@ impl OpenCodeClient {
                 let client = adk_gemini::GeminiBuilder::new(config.api_key)
                     .with_model(adk_gemini::Model::Custom(format!("models/{}", config.model)))
                     .with_base_url(endpoint)
-                    .with_http_client(reqwest::Client::builder().default_headers(headers))
+                    .with_http_client(
+                        config.timeouts.apply(reqwest::Client::builder()).default_headers(headers),
+                    )
                     .build()
                     .map_err(|err| crate::gemini::client::gemini_error_to_adk(&err))?;
                 let mut model =

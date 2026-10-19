@@ -337,6 +337,8 @@ pub enum Error {
         code: u16,
         /// An optional error description from the server.
         description: Option<String>,
+        /// Raw Retry-After header for the caller's retry policy.
+        retry_after: Option<String>,
     },
 
     /// A successful (2xx) response, or one event of a response stream, carried a
@@ -525,6 +527,16 @@ pub enum Error {
         /// Description of the validation failure.
         message: String,
     },
+}
+
+impl Error {
+    pub(crate) fn from_event_stream(source: EventStreamError<reqwest::Error>) -> Self {
+        match source {
+            // EventStreamError does not expose its transport through Error::source.
+            EventStreamError::Transport(source) => Self::DecodeResponse { source },
+            source => Self::BadPart { source },
+        }
+    }
 }
 
 /// Logs a failed call by its kind and status.

@@ -122,11 +122,19 @@ pub(super) fn map_api_error(api_err: &ApiErrorResponse) -> AdkError {
         404 => (ErrorCategory::NotFound, "model.openai_responses.not_found"),
         408 => (ErrorCategory::Timeout, "model.openai_responses.timeout"),
         429 => (ErrorCategory::RateLimited, "model.openai_responses.rate_limited"),
-        500 | 502 | 503 | 504 | 529 => {
+        500 | 502 | 503 | 504 | 520..=524 | 529 => {
             (ErrorCategory::Unavailable, "model.openai_responses.unavailable")
         }
         400..=499 => (ErrorCategory::InvalidInput, "model.openai_responses.invalid_request"),
         _ => (ErrorCategory::Internal, "model.openai_responses.api_error"),
+    };
+    let details = crate::ProviderErrorDetails {
+        code: api_err.api_error.code.clone(),
+        kind: api_err.api_error.r#type.clone(),
+        message: Some(api_err.api_error.message.clone()),
+        param: api_err.api_error.param.clone(),
+        status: Some(status_code),
+        request_id: None,
     };
     let mut mapped = AdkError::new(
         ErrorComponent::Model,
@@ -136,7 +144,8 @@ pub(super) fn map_api_error(api_err: &ApiErrorResponse) -> AdkError {
         format!("OpenAI Responses API error: {}", adk_core::upstream_excerpt(&api_err.to_string())),
     )
     .with_provider("openai-responses")
-    .with_upstream_status(status_code);
+    .with_upstream_status(status_code)
+    .with_source(details);
     if let Some(provider_code) = api_err.api_error.code.as_deref().and_then(identifier) {
         mapped.details.metadata.insert(
             "provider_error_code".to_string(),

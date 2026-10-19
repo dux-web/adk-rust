@@ -274,6 +274,8 @@ pub mod deepseek;
     feature = "openrouter"
 ))]
 mod error_metadata;
+mod provider_error;
+pub use provider_error::ProviderErrorDetails;
 /// Gemini model provider (Google AI Studio and Vertex AI).
 #[cfg(feature = "gemini")]
 pub mod gemini;

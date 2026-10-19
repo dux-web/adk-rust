@@ -138,8 +138,13 @@ impl StudioBackend {
     async fn check_response(response: Response) -> Result<Response, Error> {
         let status = response.status();
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|header| header.to_str().ok())
+                .map(str::to_owned);
             let description = response.text().await.ok();
-            BadResponseSnafu { code: status.as_u16(), description }.fail()
+            BadResponseSnafu { code: status.as_u16(), description, retry_after }.fail()
         } else {
             Ok(response)
         }
@@ -194,6 +199,7 @@ impl StudioBackend {
                 v.to_str().map(str::to_string).map_err(|_| Error::BadResponse {
                     code: 500,
                     description: Some("Missing upload URL in response".to_string()),
+                    retry_after: None,
                 })
             })
             .and_then(|url| Url::parse(&url).context(UrlParseSnafu))
@@ -246,7 +252,7 @@ impl GeminiBackend for StudioBackend {
         let stream = response
             .bytes_stream()
             .eventsource()
-            .map_err(|e| Error::BadPart { source: e })
+            .map_err(Error::from_event_stream)
             .and_then(|event| async move { super::decode_generation_response(&event.data) });
 
         Ok(Box::pin(stream))
@@ -507,14 +513,13 @@ impl GeminiBackend for StudioBackend {
             .context(PerformRequestNewSnafu)?;
         let response = Self::check_response(response).await?;
 
-        let stream = response
-            .bytes_stream()
-            .eventsource()
-            .map_err(|e| Error::BadPart { source: e })
-            .and_then(|event| async move {
-                serde_json::from_str::<crate::interactions::InteractionSseEvent>(&event.data)
-                    .context(crate::client::DeserializeSnafu)
-            });
+        let stream =
+            response.bytes_stream().eventsource().map_err(Error::from_event_stream).and_then(
+                |event| async move {
+                    serde_json::from_str::<crate::interactions::InteractionSseEvent>(&event.data)
+                        .context(crate::client::DeserializeSnafu)
+                },
+            );
 
         Ok(Box::pin(stream))
     }

@@ -52,6 +52,7 @@ impl Default for HttpTimeouts {
 
 #[cfg(any(
     feature = "openai",
+    feature = "gemini",
     feature = "groq",
     feature = "deepseek",
     feature = "azure-ai",

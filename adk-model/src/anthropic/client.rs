@@ -37,6 +37,15 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
+    /// Sets one HTTP connect/read deadline owner for streaming and complete responses.
+    pub fn with_timeouts(mut self, timeouts: crate::HttpTimeouts) -> Result<Self, AdkError> {
+        self.client = self
+            .client
+            .with_http_timeouts(timeouts.connect, timeouts.idle)
+            .map_err(convert_anthropic_error)?;
+        Ok(self)
+    }
+
     fn rejects_sampling(model: &str) -> bool {
         [
             "claude-fable-5",
@@ -483,8 +492,34 @@ fn merge_consecutive_messages(messages: &mut Vec<adk_anthropic::MessageParam>) {
 /// request ID, when present, is also recorded on the current tracing span as
 /// `anthropic.request_id` (Requirement 4.2).
 pub(super) fn convert_anthropic_error(e: adk_anthropic::Error) -> AdkError {
+    let transport_category = match &e {
+        adk_anthropic::Error::Timeout { .. } => Some(adk_core::ErrorCategory::Timeout),
+        adk_anthropic::Error::Connection { .. } | adk_anthropic::Error::Streaming { .. } => {
+            Some(adk_core::ErrorCategory::Unavailable)
+        }
+        _ => None,
+    };
+    if let Some(category) = transport_category {
+        return AdkError::new(
+            adk_core::ErrorComponent::Model,
+            category,
+            if category == adk_core::ErrorCategory::Timeout {
+                "model.anthropic.timeout"
+            } else {
+                "model.anthropic.transport"
+            },
+            adk_core::upstream_excerpt(&e.to_string()),
+        )
+        .with_provider("anthropic");
+    }
+
     let api_error = to_anthropic_api_error(&e);
-    let retry_after = extract_retry_hint(&e).and_then(|hint| hint.retry_after);
+    let retry_after = match &e {
+        adk_anthropic::Error::Api { retry_after: Some(header), .. } => {
+            crate::retry::parse_retry_after(header)
+        }
+        _ => extract_retry_hint(&e).and_then(|hint| hint.retry_after),
+    };
 
     // Requirement 4.2: record request-id on the active tracing span when present
     if let Some(ref rid) = api_error.request_id {
@@ -505,7 +540,7 @@ pub(super) fn convert_anthropic_error(e: adk_anthropic::Error) -> AdkError {
 /// capture the request-id header value.
 pub(super) fn to_anthropic_api_error(e: &adk_anthropic::Error) -> AnthropicApiError {
     match e {
-        adk_anthropic::Error::Api { status_code, error_type, message, request_id } => {
+        adk_anthropic::Error::Api { status_code, error_type, message, request_id, .. } => {
             AnthropicApiError {
                 error_type: error_type.clone().unwrap_or_else(|| "api_error".to_string()),
                 message: message.clone(),
@@ -1575,6 +1610,7 @@ mod tests {
             error_type: Some("invalid_request_error".to_string()),
             message: "Invalid model specified".to_string(),
             request_id: Some("req_abc123".to_string()),
+            retry_after: None,
         };
         let api_err = to_anthropic_api_error(&err);
         assert_eq!(api_err.error_type, "invalid_request_error");
@@ -1591,6 +1627,7 @@ mod tests {
             error_type: None,
             message: "Internal error".to_string(),
             request_id: None,
+            retry_after: None,
         };
         let api_err = to_anthropic_api_error(&err);
         assert_eq!(api_err.error_type, "api_error");
@@ -1654,6 +1691,7 @@ mod tests {
             error_type: Some("rate_limit_error".to_string()),
             message: "Rate limited".to_string(),
             request_id: Some("req_test".to_string()),
+            retry_after: None,
         };
         let adk_err = convert_anthropic_error(err);
         let msg = adk_err.to_string();

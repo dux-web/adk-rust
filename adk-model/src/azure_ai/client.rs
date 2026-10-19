@@ -228,7 +228,7 @@ impl Llm for AzureAIClient {
                 let mut tool_call_accumulators: std::collections::HashMap<u32, (String, String, String)> =
                     std::collections::HashMap::new();
 
-                while let Some(chunk_result) = byte_stream.next().await {
+                'body: while let Some(chunk_result) = byte_stream.next().await {
                     let chunk = chunk_result.map_err(|error| {
                         crate::stream_error::interrupted("azure-ai", INCOMPLETE_STREAM, &error)
                     })?;
@@ -237,7 +237,11 @@ impl Llm for AzureAIClient {
 
                     while let Some(line) = crate::sse::take_line(&mut buffer)? {
 
-                        if line.is_empty() || line == "data: [DONE]" {
+                        if line == "data: [DONE]" {
+                            buffer.clear();
+                            break 'body;
+                        }
+                        if line.is_empty() {
                             continue;
                         }
 
@@ -322,9 +326,7 @@ impl Llm for AzureAIClient {
                 }
             } else {
                 let response_text = response.text().await
-                    .map_err(|e| AdkError::model(format!(
-                        "Azure AI response parse failed: {e}"
-                    )))?;
+                    .map_err(|error| crate::stream_error::interrupted("azure-ai", INCOMPLETE_STREAM, &error))?;
 
                 let response_json: Value = serde_json::from_str(&response_text)
                     .map_err(|e| AdkError::model(format!(

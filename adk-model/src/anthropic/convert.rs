@@ -486,27 +486,6 @@ pub fn from_thinking_delta(thinking_text: &str) -> LlmResponse {
     }
 }
 
-/// Create an LlmResponse representing a streaming error event.
-///
-/// The message is cut to [`adk_core::UPSTREAM_EXCERPT_BYTES`], since it can echo the request.
-pub fn from_stream_error(error_type: &str, message: &str) -> LlmResponse {
-    LlmResponse {
-        content: None,
-        usage_metadata: None,
-        finish_reason: None,
-        citation_metadata: None,
-        partial: false,
-        turn_complete: true,
-        interrupted: false,
-        error_code: Some(error_type.to_string()),
-        error_message: Some(adk_core::upstream_excerpt(message).to_string()),
-        provider_metadata: None,
-        interaction_id: None,
-        model: None,
-        provider: None,
-    }
-}
-
 /// Extract cache usage tokens from an adk-anthropic `Usage` into provider metadata.
 pub fn extract_cache_usage(usage: &adk_anthropic::Usage) -> HashMap<String, String> {
     let mut metadata = HashMap::new();
