@@ -118,27 +118,34 @@ impl OpenCodeClient {
                     return Err(invalid("Chat and Responses reasoning uses with_reasoning_effort"));
                 }
                 if api == OpenCodeApi::ChatCompletions {
+                    let mut client = OpenAICompatible::new_with_reasoning_effort(
+                        OpenAICompatibleConfig::new(config.api_key, config.model)
+                            .with_base_url(base_url)
+                            .with_provider_name(service.provider()),
+                        config.reasoning_effort,
+                    )?;
+                    if let Some(timeouts) = config.timeouts {
+                        client = client.with_timeouts(timeouts)?;
+                    }
                     Arc::new(
-                        OpenAICompatible::new_with_reasoning_effort(
-                            OpenAICompatibleConfig::new(config.api_key, config.model)
-                                .with_base_url(base_url)
-                                .with_provider_name(service.provider()),
-                            config.reasoning_effort,
-                        )?
-                        .with_reasoning_replay(true)
-                        .with_default_headers(headers)?
-                        .with_retry_config(config.retry),
+                        client
+                            .with_reasoning_replay(true)
+                            .with_default_headers(headers)?
+                            .with_retry_config(config.retry),
                     )
                 } else {
                     let native = OpenAIResponsesConfig::new(config.api_key, config.model)
                         .with_base_url(base_url)
                         .with_open_responses_mode(true);
-                    let client = match config.reasoning_effort {
+                    let mut client = match config.reasoning_effort {
                         Some(effort) => {
                             OpenAIResponsesClient::new_with_reasoning_effort(native, effort)
                         }
                         None => OpenAIResponsesClient::new(native),
                     }?;
+                    if let Some(timeouts) = config.timeouts {
+                        client = client.with_timeouts(timeouts)?;
+                    }
                     Arc::new(client.with_default_headers(headers)?.with_retry_config(config.retry))
                 }
             }
@@ -156,11 +163,11 @@ impl OpenCodeClient {
                 if let Some(effort) = config.anthropic_effort {
                     native = native.with_effort(effort);
                 }
-                Arc::new(
-                    AnthropicClient::new(native)?
-                        .with_default_headers(headers)
-                        .with_retry_config(config.retry),
-                )
+                let mut client = AnthropicClient::new(native)?;
+                if let Some(timeouts) = config.timeouts {
+                    client = client.with_timeouts(timeouts)?;
+                }
+                Arc::new(client.with_default_headers(headers).with_retry_config(config.retry))
             }
             OpenCodeApi::GenerateContent => {
                 if config.reasoning_effort.is_some()
@@ -169,10 +176,15 @@ impl OpenCodeClient {
                 {
                     return Err(invalid("GenerateContent reasoning uses with_gemini_thinking"));
                 }
+                let http = reqwest::Client::builder().default_headers(headers);
+                let http = match config.timeouts {
+                    Some(timeouts) => timeouts.apply(http),
+                    None => http,
+                };
                 let client = adk_gemini::GeminiBuilder::new(config.api_key)
                     .with_model(adk_gemini::Model::Custom(format!("models/{}", config.model)))
                     .with_base_url(endpoint)
-                    .with_http_client(reqwest::Client::builder().default_headers(headers))
+                    .with_http_client(http)
                     .build()
                     .map_err(|err| crate::gemini::client::gemini_error_to_adk(&err))?;
                 let mut model =
