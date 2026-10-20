@@ -529,6 +529,31 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Returns the underlying HTTP transport failure, when present.
+    ///
+    /// API responses, JSON errors and SSE framing errors return `None`. This
+    /// preserves `reqwest::Error::is_timeout` through the SSE transport wrapper.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_gemini::ClientError;
+    ///
+    /// let error = ClientError::Validation { message: "invalid request".into() };
+    /// assert!(error.request_error().is_none());
+    /// ```
+    pub fn request_error(&self) -> Option<&reqwest::Error> {
+        match self {
+            Self::PerformRequestNew { source }
+            | Self::PerformRequest { source, .. }
+            | Self::BadPart { source: EventStreamError::Transport(source) } => Some(source),
+            Self::DecodeResponse { source } if source.is_timeout() => Some(source),
+            _ => None,
+        }
+    }
+}
+
 /// Logs a failed call by its kind and status.
 ///
 /// A response body or error message can echo the request — prompts, tool arguments, file
