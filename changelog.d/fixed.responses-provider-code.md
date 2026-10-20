@@ -1,0 +1,1 @@
+- Preserve bounded provider error codes from Responses generation failures without changing retry classification.
