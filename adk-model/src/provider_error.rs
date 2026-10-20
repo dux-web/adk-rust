@@ -136,12 +136,7 @@ impl ProviderErrorDetails {
         if body.len() > 64 * 1024 {
             return Self::default();
         }
-        let mut details =
-            serde_json::from_str(body).ok().as_ref().map(Self::from_value).unwrap_or_default();
-        if details.message.is_none() {
-            details.message = bounded(body);
-        }
-        details
+        serde_json::from_str(body).ok().as_ref().map(Self::from_value).unwrap_or_default()
     }
 }
 

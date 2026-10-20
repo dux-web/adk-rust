@@ -96,3 +96,27 @@ fn omits_oversized_fields_without_cutting_secrets() {
     assert_eq!(details.code.as_deref(), Some("limit"));
     assert!(!enabled());
 }
+
+#[test]
+fn retains_only_structured_messages() {
+    for body in [
+        "private provider response SECRET",
+        "<html>private provider response SECRET</html>",
+        r#"{"error":{"code":"denied","debug":"SECRET"}}"#,
+        r#"{"debug":"SECRET"}"#,
+    ] {
+        assert!(ProviderErrorDetails::from_body(body).message.is_none());
+    }
+    for body in [
+        r#"{"message":"provider message"}"#,
+        r#"{"error":{"message":"provider message","code":"denied"}}"#,
+        r#"{"response":{"error":{"detail":"provider message"}}}"#,
+    ] {
+        assert_eq!(
+            ProviderErrorDetails::from_body(body).message.as_deref(),
+            Some("provider message")
+        );
+    }
+    let details = ProviderErrorDetails::from_body(r#"{"error":{"code":"denied"}}"#);
+    assert_eq!(details.code.as_deref(), Some("denied"));
+}
