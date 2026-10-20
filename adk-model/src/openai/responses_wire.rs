@@ -68,17 +68,23 @@ struct Lifecycle {
     response: Identity,
 }
 
-#[derive(Deserialize)]
 struct Failure {
     code: Option<String>,
-    #[serde(rename = "type")]
     kind: Option<String>,
+}
+
+impl Failure {
+    fn from_value(value: &Value) -> Self {
+        Self {
+            code: value.get("code").and_then(Value::as_str).map(str::to_owned),
+            kind: value.get("type").and_then(Value::as_str).map(str::to_owned),
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct Header {
     status: Status,
-    error: Option<Failure>,
 }
 
 pub(in crate::openai) fn event(value: Value) -> Result<Event, AdkError> {
@@ -108,22 +114,15 @@ pub(in crate::openai) fn event(value: Value) -> Result<Event, AdkError> {
         "response.failed" => {
             // A failure is not a successful response: identity, output, and status
             // fields are not needed to classify its error.
-            let failure: Option<Failure> = decode(
-                value.pointer("/response/error").cloned().unwrap_or(Value::Null),
-                &value,
-                parse::Layer::StreamEvent,
-            )?;
-            Err(stream_error(failure.as_ref()))
+            let failure =
+                Failure::from_value(value.pointer("/response/error").unwrap_or(&Value::Null));
+            Err(stream_error(Some(&failure)))
         }
         "response.cancelled" | "response.canceled" => {
             Err(invalid("cancelled", "OpenAI Responses generation was cancelled"))
         }
         "error" => {
-            let failure: Failure = decode(
-                value.get("error").cloned().unwrap_or_else(|| value.clone()),
-                &value,
-                parse::Layer::StreamEvent,
-            )?;
+            let failure = Failure::from_value(value.get("error").unwrap_or(&value));
             Err(stream_error(Some(&failure)))
         }
         "response.output_item.added"
@@ -160,7 +159,8 @@ pub(in crate::openai) fn response(
 ) -> Result<Response, AdkError> {
     let header: Header = decode(value.clone(), body, layer)?;
     if header.status == Status::Failed {
-        return Err(stream_error(header.error.as_ref()));
+        let failure = Failure::from_value(value.get("error").unwrap_or(&Value::Null));
+        return Err(stream_error(Some(&failure)));
     }
     let output_missing = value.get("output").is_none();
     if output_missing && !matches!(layer, parse::Layer::StreamEvent) {
