@@ -69,10 +69,26 @@ where
     }))
 }
 
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "deepseek",
+    feature = "azure-ai",
+    test
+))]
 pub(crate) fn enabled() -> bool {
     ADAPTER.try_with(|_| ()).is_ok()
 }
 
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "deepseek",
+    feature = "azure-ai",
+    test
+))]
 pub(crate) fn adapt(error: AdkError, details: impl FnOnce() -> ProviderErrorDetails) -> AdkError {
     match ADAPTER.try_with(Arc::clone) {
         Ok(adapter) => adapter(error, details()),
@@ -80,10 +96,25 @@ pub(crate) fn adapt(error: AdkError, details: impl FnOnce() -> ProviderErrorDeta
     }
 }
 
+#[cfg(any(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "deepseek",
+    feature = "azure-ai",
+    test
+))]
 pub(crate) fn bounded(value: &str) -> Option<String> {
     (value.len() <= 64 * 1024).then(|| value.to_owned())
 }
 
+#[cfg(any(
+    feature = "openai",
+    feature = "gemini",
+    feature = "deepseek",
+    feature = "azure-ai",
+    test
+))]
 impl ProviderErrorDetails {
     pub(crate) fn from_value(value: &serde_json::Value) -> Self {
         let failure = value
