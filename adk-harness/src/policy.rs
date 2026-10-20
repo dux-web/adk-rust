@@ -6,7 +6,7 @@
 //! governed path (spec 3.1 §6 D-2).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use adk_core::audit_log::{AuditActor, AuditTrail};
 use adk_core::{
@@ -57,43 +57,61 @@ pub(crate) const HARNESS_TOOL_NAMES: &[&str] = &[
     "memory_delete",
 ];
 
-/// Whether `policy` is, or composes, the harness policy (spec 3.1 §7.3).
+/// Run policies a harness layer composed, each with the harness it belongs to.
+static COMPOSED_LAYERS: Mutex<Vec<(usize, Weak<dyn ToolPolicy>)>> = Mutex::new(Vec::new());
+
+fn address(policy: &dyn ToolPolicy) -> *const () {
+    std::ptr::from_ref(policy).cast::<()>()
+}
+
+/// Records `policy` as the run policy the harness `owner` composed.
+pub(crate) fn register_composed_layer(owner: usize, policy: &Arc<dyn ToolPolicy>) {
+    let mut layers = COMPOSED_LAYERS.lock().unwrap_or_else(|e| e.into_inner());
+    layers.retain(|(_, layer)| layer.strong_count() > 0);
+    layers.push((owner, Arc::downgrade(policy)));
+}
+
+/// The harness whose layer composed `policy`, if one did.
+pub(crate) fn composed_layer_owner(policy: &dyn ToolPolicy) -> Option<usize> {
+    let target = address(policy);
+    let layers = COMPOSED_LAYERS.lock().unwrap_or_else(|e| e.into_inner());
+    layers
+        .iter()
+        .find(|(_, layer)| layer.strong_count() > 0 && layer.as_ptr().cast::<()>() == target)
+        .map(|(owner, _)| *owner)
+}
+
+/// Whether `policy` is a run policy that a harness layer composed (spec 3.1 §7.3, §9.2 I17).
 ///
-/// The run's policy is a trait object, so this applies
-/// [`StrictestPolicy::contains_ref`](adk_core::StrictestPolicy::contains_ref) to it as the
-/// single layer of a composition: its `policy_ref` names the harness, alone or among the
-/// `+`-joined names of a composition.
+/// The check is bound to the policy instance the layer installed, never to its name: a
+/// policy that merely calls itself `adk-harness` is not the harness, so `bash`,
+/// `exit_plan_mode` and a nested harness's run refuse it.
 ///
 /// # Example
 ///
 /// ```rust
-/// use adk_core::{DeclarativePolicy, StrictestPolicy, ToolPolicy};
+/// use adk_core::{DeclarativePolicy, StrictestPolicy};
+/// use adk_harness::{HarnessAgent, InstructionsConfig};
+/// use adk_model::{ScriptedLlm, ScriptedResponse};
 /// use std::sync::Arc;
 ///
-/// let plain = DeclarativePolicy::builder().name("ops").build();
-/// assert!(!adk_harness::has_harness_layer(&plain));
 /// let named = DeclarativePolicy::builder().name("adk-harness").build();
-/// let both = StrictestPolicy::new(vec![Arc::new(plain), Arc::new(named)]);
-/// assert!(adk_harness::has_harness_layer(&both));
+/// assert!(!adk_harness::has_harness_layer(&named));
+/// let composed = StrictestPolicy::new(vec![Arc::new(named)]);
+/// assert!(!adk_harness::has_harness_layer(&composed));
+///
+/// let dir = tempfile::tempdir().unwrap();
+/// let harness = HarnessAgent::builder("harness")
+///     .model(Arc::new(ScriptedLlm::new("scripted", Vec::<ScriptedResponse>::new())))
+///     .workspace(adk_devtools::Workspace::new(dir.path()))
+///     .project_instructions(InstructionsConfig { user_file: None, ..InstructionsConfig::default() })
+///     .build()
+///     .unwrap();
+/// let config = harness.run_config();
+/// assert!(adk_harness::has_harness_layer(config.tool_policy.as_deref().unwrap()));
 /// ```
 pub fn has_harness_layer(policy: &dyn ToolPolicy) -> bool {
-    struct Named(Option<String>);
-    impl std::fmt::Debug for Named {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("Named")
-        }
-    }
-    #[async_trait]
-    impl ToolPolicy for Named {
-        async fn evaluate(&self, _request: &ToolPolicyRequest) -> PolicyDecision {
-            PolicyDecision::Allow
-        }
-        fn policy_ref(&self) -> Option<String> {
-            self.0.clone()
-        }
-    }
-    adk_core::StrictestPolicy::new(vec![Arc::new(Named(policy.policy_ref()))])
-        .contains_ref(HARNESS_POLICY_REF)
+    composed_layer_owner(policy).is_some()
 }
 
 /// Where a shell call runs, as the policy classes it (spec 3.1 §7.4).
@@ -613,6 +631,8 @@ pub(crate) struct PromptContext {
     pub(crate) harness_held: bool,
     /// The other layers of the run's policy, for the handler's re-check.
     pub(crate) peers: Option<Arc<dyn ToolPolicy>>,
+    /// The run's kill switches; a freeze abandons an open prompt (I20).
+    pub(crate) governance: Vec<adk_core::GovernanceControl>,
     pub(crate) app_name: String,
     pub(crate) user_id: String,
     pub(crate) session_id: String,
@@ -775,6 +795,7 @@ pub struct HarnessPolicy {
     pub(crate) inner: Arc<PolicyInner>,
     audit: Option<AuditTrail>,
     peers: Option<Arc<dyn ToolPolicy>>,
+    governance: Vec<adk_core::GovernanceControl>,
 }
 
 impl std::fmt::Debug for HarnessPolicy {
@@ -789,12 +810,17 @@ impl std::fmt::Debug for HarnessPolicy {
 
 impl HarnessPolicy {
     pub(crate) fn new(inner: PolicyInner) -> Self {
-        Self { inner: Arc::new(inner), audit: None, peers: None }
+        Self { inner: Arc::new(inner), audit: None, peers: None, governance: Vec::new() }
     }
 
     /// This policy, recording `harness.rule.*` evaluations through `audit`.
     pub(crate) fn with_audit(&self, audit: Option<AuditTrail>) -> Self {
-        Self { inner: self.inner.clone(), audit, peers: self.peers.clone() }
+        Self {
+            inner: self.inner.clone(),
+            audit,
+            peers: self.peers.clone(),
+            governance: self.governance.clone(),
+        }
     }
 
     /// This policy as one layer of a run's policy whose other layers are `peers`, which the
@@ -802,6 +828,18 @@ impl HarnessPolicy {
     pub(crate) fn with_peers(mut self, peers: Option<Arc<dyn ToolPolicy>>) -> Self {
         self.peers = peers;
         self
+    }
+
+    /// This policy as a layer of a run whose kill switches are `governance`, which the
+    /// confirmation handler watches while a person decides (spec 3.1 §9.2 I20).
+    pub(crate) fn with_governance(mut self, governance: Vec<adk_core::GovernanceControl>) -> Self {
+        self.governance = governance;
+        self
+    }
+
+    /// Identifies the harness this policy belongs to; every clone of the harness shares it.
+    pub(crate) fn owner_id(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
     }
 
     /// The default mode of sessions with no mode record.
@@ -1190,6 +1228,7 @@ impl HarnessPolicy {
                 PromptContext {
                     harness_held: matches!(decision, PolicyDecision::RequireApproval { .. }),
                     peers: self.peers.clone(),
+                    governance: self.governance.clone(),
                     app_name: request.app_name.clone(),
                     user_id: request.user_id.clone(),
                     session_id: request.session_id.clone(),
