@@ -266,6 +266,11 @@ async fn preserves_status_and_provider_codes() {
             Some("upstream_unavailable"),
         ),
         (502, "malformed provider body", true, ErrorCategory::Unavailable, None),
+        (520, "malformed provider body", false, ErrorCategory::Unavailable, None),
+        (521, "malformed provider body", false, ErrorCategory::Unavailable, None),
+        (522, "malformed provider body", false, ErrorCategory::Unavailable, None),
+        (523, "malformed provider body", false, ErrorCategory::Unavailable, None),
+        (524, "malformed provider body", false, ErrorCategory::Unavailable, None),
         (401, "malformed provider body", false, ErrorCategory::Unauthorized, None),
     ] {
         let error = failed(status, body, compatible, None).await;
@@ -281,12 +286,9 @@ async fn preserves_status_and_provider_codes() {
 
 #[tokio::test]
 async fn carries_retry_after_hints() {
-    for (header, delay) in [
-        ("2", Some(2_000)),
-        ("1.5", Some(1_500)),
-        ("invalid", None),
-        ("18446744073709551616", Some(u64::MAX)),
-    ] {
+    for (header, delay) in
+        [("2", Some(2_000)), ("1.5", None), ("invalid", None), ("18446744073709551616", None)]
+    {
         let error = failed(
             503,
             r#"{"error":{"message":"unavailable","type":"server_error","code":"upstream_busy"}}"#,
@@ -317,8 +319,17 @@ async fn retry_attempts_follow_header_validity() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    // An oversized delay is capped at `max_delay` like any other server delay.
-    for (header, expected_attempts) in [("0", 2), ("invalid", 2), ("18446744073709551616", 2)] {
+    // Invalid hints use ordinary backoff; valid hints above the limit are refused.
+    for (header, expected_attempts) in [
+        ("0", 2),
+        ("invalid", 2),
+        ("18446744073709551616", 2),
+        ("1.5", 2),
+        ("+1", 2),
+        ("-1", 2),
+        ("61", 1),
+        ("3600", 1),
+    ] {
         let server = MockServer::start().await;
         let attempts = Arc::new(AtomicUsize::new(0));
         let observed = attempts.clone();
