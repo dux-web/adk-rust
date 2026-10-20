@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::approvals::StandingRuleStore;
-use crate::approvals::matcher::is_protected_path;
+use crate::approvals::matcher::is_protected_target;
 use crate::audit::HarnessAudit;
 use crate::instructions::{ProjectInstructions, WorkspaceTrustStore};
 use crate::mode::{HarnessMode, ModeStore};
@@ -101,6 +101,7 @@ pub struct HarnessRuntime {
     pub(crate) ledger: Arc<dyn ShellLedger>,
     pub(crate) approval_store: Arc<dyn ApprovalStore>,
     pub(crate) approval_service: Option<Arc<dyn ApprovalService>>,
+    pub(crate) ledgers: crate::ledger::HarnessLedgers,
     pub(crate) handler: Option<Arc<dyn ToolConfirmationHandler>>,
     pub(crate) confirmation_timeout: Duration,
     pub(crate) budget: Option<RunBudget>,
@@ -180,6 +181,12 @@ impl HarnessRuntime {
         self.approval_service.as_ref()
     }
 
+    /// Where non-idempotent calls are recorded when a run carries no ledger of its own
+    /// (spec 3.1 §7.12).
+    pub fn action_ledger(&self) -> &Arc<dyn adk_core::ActionLedger> {
+        self.ledgers.store()
+    }
+
     /// The live confirmation handler: the configured one, or the prompting handler over
     /// the configured prompter.
     pub fn confirmation_handler(&self) -> Option<&Arc<dyn ToolConfirmationHandler>> {
@@ -236,6 +243,7 @@ impl HarnessRuntime {
 /// | Compose, never replace | the run's policy and the operator policy are kept; the strictest decision wins |
 /// | Idempotent | a config that already carries the harness policy is left as it is |
 /// | Approvals | the approval service and store are filled only when empty or identical; otherwise the run's own are kept with a warning |
+/// | Action ledger | the harness's ledger when the run carries none; a run's own keeps the records, with resumed held calls keyed alike (spec 3.1 §7.12) |
 /// | Non-waivable | `tool_approvals` entries naming non-waivable calls are removed |
 /// | Run-owned fields | `durable_run_id`, the confirmation handler and call-ID decisions are never touched |
 ///
@@ -252,8 +260,13 @@ pub struct HarnessLayer<'a> {
 }
 
 /// Whether the `tool_approvals` key `fingerprint` names a call no fingerprint approval may
-/// authorize (spec 3.1 §7.3, §9.2 I7). Anything that does not parse is removed too.
-pub(crate) fn names_non_waivable(fingerprint: &str, non_waivable: &BTreeSet<String>) -> bool {
+/// authorize (spec 3.1 §7.3, §9.2 I7). Anything that does not parse is removed too. An
+/// edit's path is judged at the target it resolves to under `root` (I11, I29).
+pub(crate) fn names_non_waivable(
+    fingerprint: &str,
+    non_waivable: &BTreeSet<String>,
+    root: &std::path::Path,
+) -> bool {
     let parts: Vec<&str> = fingerprint.splitn(5, '\u{1f}').collect();
     if parts.iter().any(|part| non_waivable.contains(*part)) {
         return true;
@@ -266,9 +279,10 @@ pub(crate) fn names_non_waivable(fingerprint: &str, non_waivable: &BTreeSet<Stri
     };
     match *tool {
         "bash" => args.get("unsandboxed").is_some_and(|value| *value != Value::Bool(false)),
-        "write_file" | "edit_file" => {
-            args.get("path").and_then(Value::as_str).is_none_or(is_protected_path)
-        }
+        "write_file" | "edit_file" => args
+            .get("path")
+            .and_then(Value::as_str)
+            .is_none_or(|path| is_protected_target(root, path)),
         _ => false,
     }
 }
@@ -297,7 +311,11 @@ impl HarnessLayer<'_> {
             if let Some(operator) = &runtime.operator_policy {
                 layers.push(operator.clone());
             }
-            layers.push(Arc::new(runtime.policy.with_audit(config.audit.clone())));
+            let peers = (!layers.is_empty()).then(|| {
+                Arc::new(adk_core::StrictestPolicy::new(layers.clone())) as Arc<dyn ToolPolicy>
+            });
+            layers
+                .push(Arc::new(runtime.policy.with_audit(config.audit.clone()).with_peers(peers)));
             config.tool_policy = Some(Arc::new(adk_core::StrictestPolicy::new(layers)));
         }
 
@@ -323,10 +341,17 @@ impl HarnessLayer<'_> {
             Some(_) => {}
         }
 
+        // Non-idempotent harness calls run at most once across crashes, retries and resumes
+        // (§7.12, I37); a ledger the run carries keeps the records. Per run only, like the
+        // policy: a runner installs its own ledger on a run config that carries none.
+        if compose_policy {
+            config.action_ledger = Some(runtime.ledgers.for_run(config.action_ledger.as_ref()));
+        }
+
         let before = config.tool_approvals.len();
-        config
-            .tool_approvals
-            .retain(|fingerprint, _| !names_non_waivable(fingerprint, &runtime.non_waivable_tools));
+        config.tool_approvals.retain(|fingerprint, _| {
+            !names_non_waivable(fingerprint, &runtime.non_waivable_tools, runtime.workspace.root())
+        });
         if config.tool_approvals.len() != before {
             tracing::warn!(
                 removed = before - config.tool_approvals.len(),
@@ -559,6 +584,12 @@ impl Agent for HarnessAgent {
                 )
                 .await?;
         }
+        let held = ctx.session().held_tool_calls(self.root.name(), ctx.branch());
+        self.runtime.ledgers.note_resumable(
+            (ctx.app_name(), ctx.user_id(), ctx.session_id()),
+            ctx.invocation_id(),
+            &held,
+        );
         #[cfg(feature = "observe")]
         {
             let mode = crate::observe::run_mode(
@@ -603,11 +634,31 @@ mod tests {
         let key = |tool: &str, args: &str| {
             format!("agent\u{1f}static\u{1f}sha256:x\u{1f}{tool}\u{1f}{args}")
         };
-        assert!(names_non_waivable(&key("exit_plan_mode", "{}"), &nw()));
-        assert!(names_non_waivable(&key("bash", r#"{"command":"ls","unsandboxed":true}"#), &nw()));
-        assert!(!names_non_waivable(&key("bash", r#"{"command":"ls"}"#), &nw()));
-        assert!(names_non_waivable(&key("write_file", r#"{"path":"AGENTS.md"}"#), &nw()));
-        assert!(!names_non_waivable(&key("write_file", r#"{"path":"src/a.rs"}"#), &nw()));
-        assert!(names_non_waivable("garbage", &nw()));
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let strip = |fingerprint: &str| names_non_waivable(fingerprint, &nw(), &root);
+        assert!(strip(&key("exit_plan_mode", "{}")));
+        assert!(strip(&key("bash", r#"{"command":"ls","unsandboxed":true}"#)));
+        assert!(!strip(&key("bash", r#"{"command":"ls"}"#)));
+        assert!(strip(&key("write_file", r#"{"path":"AGENTS.md"}"#)));
+        assert!(!strip(&key("write_file", r#"{"path":"src/a.rs"}"#)));
+        assert!(strip("garbage"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_approval_of_a_write_through_a_symlink_to_a_protected_file_is_stripped() {
+        let key =
+            |args: &str| format!("agent\u{1f}static\u{1f}sha256:x\u{1f}write_file\u{1f}{args}");
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "rules").unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::os::unix::fs::symlink("../AGENTS.md", root.join("docs/notes.md")).unwrap();
+        std::os::unix::fs::symlink(".git", root.join("cfg")).unwrap();
+        assert!(names_non_waivable(&key(r#"{"path":"docs/notes.md"}"#), &nw(), &root));
+        assert!(names_non_waivable(&key(r#"{"path":"cfg/hooks/pre-commit"}"#), &nw(), &root));
+        assert!(!names_non_waivable(&key(r#"{"path":"docs/other.md"}"#), &nw(), &root));
     }
 }
