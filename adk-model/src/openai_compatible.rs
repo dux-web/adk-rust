@@ -1181,10 +1181,12 @@ impl Llm for OpenAICompatible {
                                         })
                                         .collect();
 
+                                    let mut buffered = text_tool_buffer.flush();
+                                    buffered.extend(parts);
                                     let response = LlmResponse {
                                         content: Some(Content {
                                             role: "model".to_string(),
-                                            parts,
+                                            parts: buffered,
                                         }),
                                         usage_metadata,
                                         finish_reason,
@@ -1205,8 +1207,8 @@ impl Llm for OpenAICompatible {
                                     continue;
                                 }
 
-                                // Final response without tool calls.
-                                let mut parts = Vec::new();
+                                // Flush literal prefixes before the final becomes authoritative.
+                                let mut parts = text_tool_buffer.flush();
                                 if let Some(text) = delta.get("content").and_then(|v| v.as_str())
                                     && !text.is_empty() {
                                         parts.push(Part::Text { text: text.to_string() });
