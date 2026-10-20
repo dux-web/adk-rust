@@ -149,12 +149,16 @@ impl std::fmt::Debug for Anthropic {
 
 fn retry_after(value: &str) -> Option<u64> {
     let value = value.trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return Some(seconds);
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        let seconds = value.parse::<u64>().ok()?;
+        return seconds.checked_mul(1000).map(|_| seconds);
     }
     let deadline = httpdate::parse_http_date(value).ok()?;
     let delay = deadline.duration_since(std::time::SystemTime::now()).unwrap_or(Duration::ZERO);
-    delay.as_secs().checked_add(u64::from(delay.subsec_nanos() > 0))
+    delay
+        .as_secs()
+        .checked_add(u64::from(delay.subsec_nanos() > 0))
+        .filter(|seconds| seconds.checked_mul(1000).is_some())
 }
 
 impl Anthropic {
