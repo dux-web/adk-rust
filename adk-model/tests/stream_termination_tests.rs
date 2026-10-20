@@ -1122,7 +1122,7 @@ mod terminal_usage {
     }
 
     #[tokio::test]
-    async fn reported_tail_failures_are_not_hidden() {
+    async fn reported_tail_failures_preserve_completion() {
         for wire in wires() {
             let mut writes = wire.finished(false);
             let failure = if wire.gemini() {
@@ -1134,12 +1134,42 @@ mod terminal_usage {
             let base = serve("text/event-stream", writes).await;
             let (responses, error) =
                 collect(wire.model(base).as_ref(), request("scripted"), true).await;
-            assert!(error.is_some(), "{wire:?}");
             assert!(
-                responses.iter().all(|r| r.partial),
-                "failed generation must not publish its pending final: {wire:?}"
+                error.is_none(),
+                "the runner's completed answer is authoritative: {wire:?}: {error:?}"
+            );
+            assert_eq!(
+                responses.iter().filter(|response| !response.partial).count(),
+                1,
+                "{wire:?}"
+            );
+            assert!(
+                responses.last().unwrap().usage_metadata.is_none(),
+                "a failed usage trailer is unreported: {wire:?}"
             );
         }
+    }
+
+    #[cfg(feature = "openai")]
+    #[tokio::test]
+    async fn retains_buffered_literal_prefixes() {
+        let mut writes =
+            chat::sse(&[chat::text_chunk("<tool"), chat::chunk(json!({}), Some("stop"))]);
+        writes.push(Wire::Chat.usage());
+        writes.push(chat::done());
+        let base = serve("text/event-stream", writes).await;
+        let mut input = request("scripted");
+        input.tools.insert("get_weather".into(), json!({"type": "object", "properties": {}}));
+        let (responses, error) = collect(Wire::Chat.model(base).as_ref(), input, true).await;
+        assert!(error.is_none(), "{error:?}");
+        let text: String = responses
+            .iter()
+            .filter_map(|response| response.content.as_ref())
+            .flat_map(|content| &content.parts)
+            .filter_map(Part::text)
+            .collect();
+        assert_eq!(text, "<tool");
+        assert_eq!(function_calls(&responses), 0);
     }
 
     #[tokio::test]

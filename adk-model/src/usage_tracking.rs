@@ -33,6 +33,7 @@ pub(crate) fn with_terminal_usage(mut stream: LlmResponseStream) -> LlmResponseS
             match next {
                 Some(Ok(response)) => {
                     if response.error_code.is_some() || response.error_message.is_some() || response.interrupted {
+                        if final_response.is_some() { break; }
                         yield Ok(response);
                         return;
                     }
@@ -54,8 +55,9 @@ pub(crate) fn with_terminal_usage(mut stream: LlmResponseStream) -> LlmResponseS
                     }
                 }
                 Some(Err(error)) => {
-                    // Transport tails are handled by their typed provider boundary.
-                    // A reported provider failure must not be hidden by a pending answer.
+                    // The runner already stops at a completed response. Observing an
+                    // optional usage trailer must not turn that answer into a failure.
+                    if final_response.is_some() { break; }
                     yield Err(error);
                     return;
                 }
