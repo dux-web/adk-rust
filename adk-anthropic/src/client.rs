@@ -775,6 +775,11 @@ impl Anthropic {
                         break;
                     }
 
+                    // Return the original error rather than retrying before a long server delay.
+                    if error.retry_after().is_some_and(|seconds| seconds > 60) {
+                        return Err(error);
+                    }
+
                     // Calculate backoff duration
                     let exp_backoff_duration = backoff.next();
 
