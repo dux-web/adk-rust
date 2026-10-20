@@ -374,3 +374,93 @@ async fn streaming_failures_keep_status_and_retry_hints() {
         assert!(error.retry.should_retry);
     }
 }
+#[tokio::test]
+async fn private_failure_fields_require_an_adapter() {
+    use std::sync::Mutex;
+    for nested in [false, true] {
+        for inspect in [false, true] {
+            let failure = json!({"code": "SECRET_CODE", "type": "SECRET_KIND", "message": "request includes SECRET_TOKEN", "param": "SECRET_PARAM"});
+            let event = if nested {
+                json!({"type": "response.failed", "response": {"error": failure}})
+            } else {
+                json!({"type": "error", "error": failure})
+            };
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(format!("data: {event}\n\n"), "text/event-stream"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let captured = Arc::new(Mutex::new(None));
+            let model = client(&server.uri(), true);
+            let mut error_adapter: Option<adk_model::ErrorAdapter> = None;
+            if inspect {
+                let captured = captured.clone();
+                error_adapter = Some(Arc::new(move |error, details| {
+                    assert!(!format!("{details:?}").contains("SECRET"));
+                    let safe =
+                        details.message.as_deref().unwrap().replace("SECRET_TOKEN", "[redacted]");
+                    *captured.lock().unwrap() = Some((details.code, details.kind, details.param));
+                    error.with_source(std::io::Error::other(safe))
+                }));
+            }
+            let opening = model.generate_content(request(), true);
+            let stream = match error_adapter {
+                Some(adapter) => adk_model::inspect_errors(adapter, opening).await,
+                None => opening.await,
+            }
+            .unwrap();
+            let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+            assert!(!format!("{error:?}").contains("SECRET"));
+            assert!(!error.to_string().contains("SECRET"));
+            assert!(!serde_json::to_string(&error.details).unwrap().contains("SECRET"));
+            let source = std::error::Error::source(&error);
+            if inspect {
+                assert_eq!(source.unwrap().to_string(), "request includes [redacted]");
+                assert_eq!(
+                    *captured.lock().unwrap(),
+                    Some((
+                        Some("SECRET_CODE".into()),
+                        Some("SECRET_KIND".into()),
+                        Some("SECRET_PARAM".into())
+                    ))
+                );
+            } else {
+                assert!(source.is_none());
+                assert!(captured.lock().unwrap().is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_details_are_redacted_before_application_exposure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/responses"))
+        .respond_with(ResponseTemplate::new(503).insert_header("x-request-id", "req_private")
+            .set_body_json(json!({"error": {"code": "fixture_limit", "type": "server_error", "message": "SECRET_TOKEN is unavailable", "param": "input"}})))
+        .expect(1).mount(&server).await;
+    let model = client(&server.uri(), false);
+    let adapter: adk_model::ErrorAdapter = Arc::new(|mut error, details| {
+        assert_eq!(details.status, Some(503));
+        assert_eq!(details.request_id.as_deref(), Some("req_private"));
+        assert_eq!(details.code.as_deref(), Some("fixture_limit"));
+        assert_eq!(details.kind.as_deref(), Some("server_error"));
+        assert_eq!(details.param.as_deref(), Some("input"));
+        let safe = details.message.unwrap().replace("SECRET_TOKEN", "[redacted]");
+        // The application owns both its sanitized public message and source.
+        error.message = safe.clone();
+        error.with_source(std::io::Error::other(safe))
+    });
+    let stream =
+        adk_model::inspect_errors(adapter, model.generate_content(request(), false)).await.unwrap();
+    let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+    assert!(!format!("{error:?}").contains("SECRET_TOKEN"));
+    assert_eq!(error.message, "[redacted] is unavailable");
+    assert_eq!(std::error::Error::source(&error).unwrap().to_string(), "[redacted] is unavailable");
+    assert_eq!(error.details.upstream_status_code, Some(503));
+}

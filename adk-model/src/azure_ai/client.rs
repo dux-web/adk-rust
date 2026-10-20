@@ -202,7 +202,7 @@ impl Llm for AzureAIClient {
                             "model.azure_ai.api_error",
                             format!(
                                 "Azure AI error for endpoint={endpoint}, status={status}: {}",
-                                adk_core::upstream_excerpt(&error_text)
+                                if crate::provider_error::enabled() { "provider request failed" } else { adk_core::upstream_excerpt(&error_text) }
                             ),
                         ).with_upstream_status(status_code).with_provider("azure-ai");
                         return Err(crate::retry::with_retry_after(

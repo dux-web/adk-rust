@@ -368,3 +368,99 @@ fn anthropic_api_errors_quote_a_bounded_message() {
     assert!(!error.message.contains(TAIL));
     assert!(error.message.contains("[request_id=req_1]"), "{}", error.message);
 }
+
+#[cfg(all(
+    feature = "openai",
+    feature = "anthropic",
+    feature = "deepseek",
+    feature = "azure-ai",
+    feature = "gemini"
+))]
+#[tokio::test]
+async fn scoped_adapters_redact_native_http_failures() {
+    use adk_model::anthropic::{AnthropicClient, AnthropicConfig};
+    use adk_model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig};
+    use adk_model::{
+        AzureAIClient, AzureAIConfig, DeepSeekClient, DeepSeekConfig, GeminiModel,
+        OpenAICompatible, OpenAICompatibleConfig, RetryConfig,
+    };
+    let server = upstream(400, json!({"error": {
+        "code": "invalid_value", "type": "invalid_request_error", "message": echoed(), "param": "input"
+    }})).await;
+    let models: Vec<Box<dyn Llm>> = vec![
+        Box::new(
+            OpenAICompatible::new(
+                OpenAICompatibleConfig::new("key", "model").with_base_url(server.uri()),
+            )
+            .unwrap()
+            .with_retry_config(RetryConfig::disabled()),
+        ),
+        Box::new(
+            OpenAIResponsesClient::new(
+                OpenAIResponsesConfig::new("key", "model").with_base_url(server.uri()),
+            )
+            .unwrap()
+            .with_retry_config(RetryConfig::disabled()),
+        ),
+        Box::new(
+            DeepSeekClient::new(DeepSeekConfig::new("key", "model").with_base_url(server.uri()))
+                .unwrap()
+                .with_retry_config(RetryConfig::disabled()),
+        ),
+        Box::new(
+            AzureAIClient::new(AzureAIConfig::new(server.uri(), "key", "model"))
+                .unwrap()
+                .with_retry_config(RetryConfig::disabled()),
+        ),
+        Box::new(
+            GeminiModel::new_with_base_url("key", "model", format!("{}/v1beta/", server.uri()))
+                .unwrap()
+                .with_retry_config(RetryConfig::disabled()),
+        ),
+        Box::new(
+            AnthropicClient::new(AnthropicConfig::new("key", "model").with_base_url(server.uri()))
+                .unwrap()
+                .with_retry_config(RetryConfig::disabled()),
+        ),
+    ];
+    for model in models {
+        for streaming in [false, true] {
+            let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let seen = called.clone();
+            let adapter: adk_model::ErrorAdapter = Arc::new(move |mut error, details| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(details.status, Some(400));
+                assert!(!format!("{details:?}").contains(SECRET));
+                let raw = details.message.unwrap();
+                assert!(raw.contains(SECRET) && raw.ends_with(TAIL));
+                let safe = raw.replace(SECRET, "[redacted]");
+                error.message = adk_core::upstream_excerpt(&safe).to_owned();
+                error
+            });
+            let logs = Recorded::default();
+            let _guard =
+                tracing::subscriber::set_default(tracing_subscriber::registry().with(logs.clone()));
+            let request = LlmRequest::new("model", vec![Content::new("user").with_text("Hello")]);
+            let error = match adk_model::inspect_errors(
+                adapter,
+                model.generate_content(request, streaming),
+            )
+            .await
+            {
+                Err(error) => error,
+                Ok(mut responses) => loop {
+                    if let Some(Err(error)) = responses.next().await {
+                        break error;
+                    }
+                },
+            };
+            assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1, "{}", model.name());
+            assert!(!format!("{error:?}").contains(SECRET));
+            assert!(!error.to_string().contains(SECRET));
+            assert!(!serde_json::to_string(&error.details).unwrap().contains(SECRET));
+            assert!(std::error::Error::source(&error).is_none());
+            assert!(logs.leaks().is_empty());
+            assert_eq!(error.category, adk_core::ErrorCategory::InvalidInput);
+        }
+    }
+}

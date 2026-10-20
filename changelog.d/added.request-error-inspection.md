@@ -1,0 +1,1 @@
+- Add an explicit request-scoped provider error adapter for application-owned secret redaction, without attaching raw details to error sources or changing default diagnostics.
