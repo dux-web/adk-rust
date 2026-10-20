@@ -448,6 +448,61 @@ async fn retries_failures_without_known_permanent_codes() {
 }
 
 #[tokio::test]
+async fn tolerates_malformed_failure_details() {
+    use adk_core::ErrorCategory;
+
+    for (detail, category, code) in [
+        (json!({"code":503}), ErrorCategory::Unavailable, None),
+        (json!("upstream failure"), ErrorCategory::Unavailable, None),
+        (Value::Null, ErrorCategory::Unavailable, None),
+        (json!({"type":503}), ErrorCategory::Unavailable, None),
+        (json!({"code":"future_failure"}), ErrorCategory::Unavailable, Some("future_failure")),
+        (
+            json!({"code":"stream_timeout","type":503}),
+            ErrorCategory::Timeout,
+            Some("stream_timeout"),
+        ),
+        (
+            json!({"code":503,"type":"authentication_error"}),
+            ErrorCategory::Unauthorized,
+            Some("authentication_error"),
+        ),
+    ] {
+        let mut failed = response(json!([]));
+        failed["status"] = json!("failed");
+        failed["error"] = detail.clone();
+        let mut errors = vec![
+            unary(&failed).await.unwrap_err(),
+            events(&[json!({"type":"response.failed","response":failed})]).await.unwrap_err(),
+            events(&[json!({"type":"response.failed","response":{"error":detail}})])
+                .await
+                .unwrap_err(),
+            events(&[json!({"type":"error","error":detail})]).await.unwrap_err(),
+        ];
+        if detail.get("type").is_none()
+            && let Some(mut flat) = detail.as_object().cloned()
+        {
+            flat.insert("type".to_owned(), json!("error"));
+            errors.push(events(&[Value::Object(flat)]).await.unwrap_err());
+        }
+        for error in errors {
+            assert_eq!(error.code, "model.openai_responses.response_failed");
+            assert_eq!(error.category, category, "{detail}");
+            assert_eq!(
+                error.retry.should_retry,
+                matches!(category, ErrorCategory::Unavailable | ErrorCategory::Timeout),
+                "{detail}"
+            );
+            assert_eq!(
+                error.details.metadata.get("provider_error_code").and_then(Value::as_str),
+                code,
+                "{detail}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn permanent_error_types_prevent_retry() {
     for (kind, category) in [
         ("authentication_error", adk_core::ErrorCategory::Unauthorized),
