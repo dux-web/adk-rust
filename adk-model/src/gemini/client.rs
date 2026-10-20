@@ -192,11 +192,14 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
     }
 
     // A response body can echo the request, so the message quotes a bounded excerpt.
-    let message = if crate::provider_error::enabled() {
-        "Gemini API request failed".to_owned()
-    } else {
-        format_error_chain(e)
-    };
+    let inspected = crate::provider_error::enabled()
+        && matches!(
+            e,
+            adk_gemini::ClientError::BadResponse { description: Some(_), .. }
+                | adk_gemini::ClientError::ErrorInResponse { .. }
+        );
+    let message =
+        if inspected { "Gemini API request failed".to_owned() } else { format_error_chain(e) };
     let message = adk_core::upstream_excerpt(&message);
 
     // Response text can mention a different status; only the transport may
@@ -2394,6 +2397,21 @@ mod tests {
         time::Duration,
     };
 
+    pub(super) fn assert_error(actual: &AdkError, expected: &AdkError) {
+        assert_eq!(actual.component, expected.component);
+        assert_eq!(actual.category, expected.category);
+        assert_eq!(actual.code, expected.code);
+        assert_eq!(actual.message, expected.message);
+        assert_eq!(
+            serde_json::to_value(&actual.details).unwrap(),
+            serde_json::to_value(&expected.details).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&actual.retry).unwrap(),
+            serde_json::to_value(&expected.retry).unwrap()
+        );
+    }
+
     #[test]
     fn response_status_ignores_misleading_text() {
         for (status, category, code) in [
@@ -2422,6 +2440,87 @@ mod tests {
             assert_eq!(error.code, code);
             assert_eq!(error.details.upstream_status_code, Some(status));
             assert_eq!(error.details.metadata["provider_error_code"], "unsupported_capability");
+        }
+    }
+
+    #[tokio::test]
+    async fn retains_unadapted_errors() {
+        let request_error = || reqwest::Client::new().get("://fixture").build().unwrap_err();
+        let errors = [
+            adk_gemini::ClientError::PerformRequestNew { source: request_error() },
+            adk_gemini::ClientError::PerformRequest {
+                source: request_error(),
+                url: "https://fixture.invalid/models".parse().unwrap(),
+            },
+            adk_gemini::ClientError::BadResponse {
+                code: 429,
+                description: None,
+                retry_after: Some("61".into()),
+            },
+            adk_gemini::ClientError::BadResponse {
+                code: 503,
+                description: None,
+                retry_after: None,
+            },
+            adk_gemini::ClientError::InvalidGenerationConfig {
+                message: "invalid fixture configuration".into(),
+            },
+        ];
+        for error in errors {
+            let expected = gemini_error_to_adk(&error);
+            let calls = Arc::new(AtomicU32::new(0));
+            let observed = calls.clone();
+            let adapter: crate::ErrorAdapter = Arc::new(move |error, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                error
+            });
+            let actual = crate::inspect_errors(adapter, async { Err(gemini_error_to_adk(&error)) })
+                .await
+                .err()
+                .expect("mapped failure");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_error(&actual, &expected);
+            assert_ne!(actual.message, "Gemini API request failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn adapts_response_bodies() {
+        let body =
+            serde_json::json!({"error":{"code":"limit","message":"message SECRET"}}).to_string();
+        let errors = [
+            adk_gemini::ClientError::BadResponse {
+                code: 429,
+                description: Some(body.clone()),
+                retry_after: Some("61".into()),
+            },
+            adk_gemini::ClientError::ErrorInResponse {
+                code: Some(503),
+                status: Some("UNAVAILABLE".into()),
+                message: Some("message SECRET".into()),
+                description: body,
+            },
+        ];
+        for error in errors {
+            let mut expected = gemini_error_to_adk(&error);
+            expected.message = "message [redacted]".into();
+            let calls = Arc::new(AtomicU32::new(0));
+            let observed = calls.clone();
+            let adapter: crate::ErrorAdapter = Arc::new(move |mut error, details| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(error.message, "Gemini API request failed");
+                assert_eq!(details.message.as_deref(), Some("message SECRET"));
+                error.message = details.message.unwrap().replace("SECRET", "[redacted]");
+                error
+            });
+            let actual = crate::inspect_errors(adapter, async { Err(gemini_error_to_adk(&error)) })
+                .await
+                .err()
+                .expect("mapped failure");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_error(&actual, &expected);
+            assert!(!format!("{actual:?}").contains("SECRET"));
+            assert!(std::error::Error::source(&actual).is_none());
         }
     }
 
@@ -3237,6 +3336,29 @@ mod vertex_transport_tests {
         Error as GaxError,
         rpc::{Code, Status, StatusDetails},
     };
+
+    #[tokio::test]
+    async fn retains_unadapted_errors() {
+        let status = Status::default()
+            .set_code(Code::ResourceExhausted)
+            .set_message("fixture quota exhausted");
+        for source in [
+            GaxError::connect(std::io::Error::other("fixture DNS failure")),
+            GaxError::service_with_http_metadata(status, Some(429), None),
+        ] {
+            let error = adk_gemini::ClientError::GoogleCloudRequest { source };
+            let expected = gemini_error_to_adk(&error);
+            let adapter: crate::ErrorAdapter = std::sync::Arc::new(|_, _| {
+                panic!("unadapted Vertex error must not invoke the adapter")
+            });
+            let actual = crate::inspect_errors(adapter, async { Err(gemini_error_to_adk(&error)) })
+                .await
+                .err()
+                .expect("mapped failure");
+            super::tests::assert_error(&actual, &expected);
+            assert_ne!(actual.message, "Gemini API request failed");
+        }
+    }
 
     #[test]
     fn service_status_and_reason_are_preserved() {

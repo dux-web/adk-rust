@@ -1,1 +1,1 @@
-Only inspect explicit structured provider error messages; omit unstructured response bodies from private error inspection.
+Only inspect explicit structured provider error messages; omit unstructured response bodies from private error inspection. Preserve Gemini transport and bodyless error messages when no private conversion runs.
