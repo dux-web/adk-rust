@@ -1538,6 +1538,7 @@ impl GeminiModel {
                 response_logprobs: config.top_logprobs.map(|_| true),
                 logprobs: config.top_logprobs.map(i32::from),
                 response_schema: config.response_schema,
+                response_modalities: config.response_modalities,
                 response_mime_type: if has_schema {
                     Some("application/json".to_string())
                 } else {
