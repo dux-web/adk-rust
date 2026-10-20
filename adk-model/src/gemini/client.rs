@@ -277,6 +277,15 @@ fn is_gax_connection_failure(message: &str) -> bool {
 
 /// Classify failures with no HTTP response without inventing an upstream status.
 fn error_without_status(error: &adk_gemini::ClientError) -> (ErrorCategory, &'static str) {
+    if let Some(error) = error.request_error() {
+        let category = crate::http_timeouts::transport_category(error);
+        let code = if category == ErrorCategory::Timeout {
+            "model.gemini.timeout"
+        } else {
+            "model.gemini.unavailable"
+        };
+        return (category, code);
+    }
     match error {
         adk_gemini::ClientError::InvalidGenerationConfig { .. } => {
             (ErrorCategory::InvalidInput, "model.gemini.invalid_config")
@@ -286,18 +295,6 @@ fn error_without_status(error: &adk_gemini::ClientError) -> (ErrorCategory, &'st
         }
         adk_gemini::ClientError::InvalidApiKey { .. } => {
             (ErrorCategory::Unauthorized, "model.gemini.unauthorized")
-        }
-        adk_gemini::ClientError::PerformRequestNew { source }
-        | adk_gemini::ClientError::PerformRequest { source, .. }
-            if source.is_timeout() =>
-        {
-            (ErrorCategory::Timeout, "model.gemini.timeout")
-        }
-        adk_gemini::ClientError::PerformRequestNew { source }
-        | adk_gemini::ClientError::PerformRequest { source, .. }
-            if source.is_connect() =>
-        {
-            (ErrorCategory::Unavailable, "model.gemini.unavailable")
         }
         #[cfg(feature = "gemini-vertex")]
         adk_gemini::ClientError::GoogleCloudRequest { source } if source.is_timeout() => {
@@ -560,6 +557,43 @@ impl GeminiModel {
             .map_err(|_| adk_core::AdkError::model("Invalid Gemini base URL"))?;
         let client = Gemini::with_model_and_base_url(api_key.into(), model_name.clone(), base_url)
             .map_err(|e| adk_core::AdkError::model(e.to_string()))?;
+        Ok(Self::from_client(client, model_name))
+    }
+
+    /// Create an API-key model with explicit connect and byte-idle timeouts.
+    ///
+    /// Existing constructors keep the standalone SDK's defaults. This constructor
+    /// uses the same SDK builder and adds no response-level or total-request timer.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::{GeminiModel, HttpTimeouts};
+    /// use std::time::Duration;
+    ///
+    /// let model = GeminiModel::new_with_base_url_and_timeouts(
+    ///     "api-key", "gemini-3.7-flash", "https://gateway.example.com/v1beta/",
+    ///     HttpTimeouts::new(Duration::from_secs(30), Duration::from_secs(300)),
+    /// )?;
+    /// # Ok::<(), adk_core::AdkError>(())
+    /// ```
+    pub fn new_with_base_url_and_timeouts(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl AsRef<str>,
+        timeouts: crate::HttpTimeouts,
+    ) -> Result<Self> {
+        let model_name = model.into();
+        let base_url = base_url
+            .as_ref()
+            .parse()
+            .map_err(|_| adk_core::AdkError::model("Invalid Gemini base URL"))?;
+        let client = adk_gemini::GeminiBuilder::new(api_key.into())
+            .with_model(model_name.clone())
+            .with_base_url(base_url)
+            .with_http_client(timeouts.apply(reqwest::Client::builder()))
+            .build()
+            .map_err(|error| gemini_error_to_adk(&error))?;
         Ok(Self::from_client(client, model_name))
     }
 
