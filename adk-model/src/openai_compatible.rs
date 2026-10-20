@@ -667,6 +667,17 @@ pub(crate) fn build_request_json(
         request_builder.reasoning_effort(effort);
     }
 
+    crate::generation_config::reject_unsupported(
+        "openai-compatible",
+        request.config.as_ref(),
+        crate::generation_config::Supports {
+            stop_sequences: true,
+            seed: true,
+            penalties: true,
+            top_logprobs: true,
+        },
+    )?;
+
     if let Some(config) = &request.config {
         if let Some(temp) = config.temperature {
             request_builder.temperature(temp);

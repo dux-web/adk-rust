@@ -257,7 +257,13 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
         }
         _ => None,
     };
-    crate::error_metadata::with_code(err, provider_code.as_deref())
+    let err = crate::error_metadata::with_code(err, provider_code.as_deref());
+    match e {
+        adk_gemini::ClientError::BadResponse { retry_after: Some(header), .. } => {
+            crate::retry::with_retry_after(err, crate::retry::parse_retry_after(header))
+        }
+        _ => err,
+    }
 }
 
 /// Whether a google-cloud-gax error without a status is a failed connection or
@@ -1532,6 +1538,7 @@ impl GeminiModel {
                 response_logprobs: config.top_logprobs.map(|_| true),
                 logprobs: config.top_logprobs.map(i32::from),
                 response_schema: config.response_schema,
+                response_modalities: config.response_modalities,
                 response_mime_type: if has_schema {
                     Some("application/json".to_string())
                 } else {
@@ -2356,6 +2363,7 @@ mod tests {
             (529, ErrorCategory::Unavailable, "model.gemini.overloaded"),
         ] {
             let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+                retry_after: None,
                 code: status,
                 description: Some(
                     serde_json::json!({"error": {
@@ -2398,6 +2406,7 @@ mod tests {
             ),
         ] {
             let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+                retry_after: None,
                 code: 400,
                 description: Some(body),
             });
@@ -2423,6 +2432,7 @@ mod tests {
             }]
         }});
         let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+            retry_after: None,
             code: 429,
             description: Some(body.to_string()),
         });
@@ -2433,6 +2443,7 @@ mod tests {
             "status": "RESOURCE_EXHAUSTED"
         }});
         let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+            retry_after: None,
             code: 429,
             description: Some(without_reason.to_string()),
         });
