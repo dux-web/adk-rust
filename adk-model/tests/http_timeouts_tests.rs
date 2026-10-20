@@ -405,3 +405,29 @@ async fn gemini_comments_reset_byte_idle() {
         "no model chunk arrived for more than the byte-idle window"
     );
 }
+
+#[cfg(feature = "opencode")]
+#[tokio::test]
+async fn opencode_forwards_timeouts_to_every_protocol() {
+    use adk_model::{OpenCodeApi, OpenCodeClient, OpenCodeConfig, OpenCodeService};
+    for api in [
+        OpenCodeApi::ChatCompletions,
+        OpenCodeApi::Responses,
+        OpenCodeApi::Messages,
+        OpenCodeApi::GenerateContent,
+    ] {
+        headers_and_body_time_out(|base| {
+            OpenCodeClient::new(
+                OpenCodeConfig::new(OpenCodeService::Go, "key", "m")
+                    .with_api(api)
+                    .with_base_url(format!("{base}/v1"))
+                    .with_user_agent("adk-test/1.0")
+                    .with_session_id("fixture")
+                    .with_timeouts(timeouts())
+                    .with_retry_config(adk_model::RetryConfig::disabled()),
+            )
+            .unwrap()
+        })
+        .await;
+    }
+}
