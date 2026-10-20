@@ -1,0 +1,1 @@
+- Add `OpenCodeConfig::with_timeouts` to forward shared connect and byte-idle limits to the selected existing protocol client; leaving it unset preserves standalone SDK defaults.

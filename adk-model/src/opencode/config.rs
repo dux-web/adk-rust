@@ -46,6 +46,7 @@ pub struct OpenCodeConfig {
     pub(super) thinking: Option<ThinkingMode>,
     pub(super) anthropic_effort: Option<Effort>,
     pub(super) retry: RetryConfig,
+    pub(super) timeouts: Option<crate::HttpTimeouts>,
 }
 
 impl std::fmt::Debug for OpenCodeConfig {
@@ -78,6 +79,7 @@ impl OpenCodeConfig {
             thinking: None,
             anthropic_effort: None,
             retry: RetryConfig::default(),
+            timeouts: None,
         }
     }
 
@@ -128,6 +130,22 @@ impl OpenCodeConfig {
     /// Sets thinking for Gemini GenerateContent models.
     pub fn with_gemini_thinking(mut self, thinking: ThinkingConfig) -> Self {
         self.gemini_thinking = Some(thinking);
+        self
+    }
+
+    /// Sets connect and byte-idle timeouts on the selected protocol client.
+    /// Existing SDK defaults remain unchanged when this option is unset.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use adk_model::{HttpTimeouts, OpenCodeConfig, OpenCodeService};
+    /// use std::time::Duration;
+    /// let config = OpenCodeConfig::new(OpenCodeService::Go, "key", "model")
+    ///     .with_timeouts(HttpTimeouts::new(Duration::from_secs(30), Duration::from_secs(300)));
+    /// ```
+    pub fn with_timeouts(mut self, timeouts: crate::HttpTimeouts) -> Self {
+        self.timeouts = Some(timeouts);
         self
     }
 
