@@ -399,7 +399,12 @@ async fn failures_keep_known_codes_and_their_categories() {
 
 #[tokio::test]
 async fn retries_failures_without_known_permanent_codes() {
-    for code in [None, Some(SECRET)] {
+    for code in [
+        None,
+        Some("future_failure"),
+        Some("subscription_sharing_usage_limit_exceeded"),
+        Some("subscription_sharing_usage_unavailable"),
+    ] {
         let mut failed = response(json!([]));
         failed["status"] = json!("failed");
         failed["error"] = json!({"code":code, "message":SECRET});
@@ -430,6 +435,10 @@ async fn retries_failures_without_known_permanent_codes() {
             assert!(error.retry.should_retry);
             assert!(adk_model::retry::is_retryable_model_error(&error));
             assert_eq!(error.message, "OpenAI Responses generation failed");
+            assert_eq!(
+                error.details.metadata.get("provider_error_code").and_then(Value::as_str),
+                code
+            );
             assert!(!error.to_string().contains(SECRET));
             assert!(!format!("{error:?}").contains(SECRET));
             assert!(!serde_json::to_string(&error.details.metadata).unwrap().contains(SECRET));
@@ -446,11 +455,11 @@ async fn permanent_error_types_prevent_retry() {
         ("invalid_request_error", adk_core::ErrorCategory::InvalidInput),
     ] {
         let error = events(&[json!({"type":"error","error":{
-            "code":SECRET,"type":kind,"message":SECRET}})])
+            "code":"future_failure","type":kind,"message":SECRET}})])
         .await
         .unwrap_err();
         assert_eq!(error.category, category);
-        assert_eq!(error.details.metadata["provider_error_code"], kind);
+        assert_eq!(error.details.metadata["provider_error_code"], "future_failure");
         safe(&error);
     }
 }

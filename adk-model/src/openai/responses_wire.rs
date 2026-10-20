@@ -301,8 +301,8 @@ pub(in crate::openai) const DOCUMENTED_ERROR_CODES: &[&str] = &[
 ];
 
 fn stream_error(failure: Option<&Failure>) -> AdkError {
-    // Only recognized codes or types leave this boundary. An unknown failure is
-    // recoverable, but arbitrary provider text is never copied into diagnostics.
+    // Classification uses recognized codes and types. Preserve a provider's own
+    // code separately so embedding applications can apply their existing policy.
     let recognized = failure
         .into_iter()
         .flat_map(|failure| [failure.code.as_deref(), failure.kind.as_deref()])
@@ -338,7 +338,10 @@ fn stream_error(failure: Option<&Failure>) -> AdkError {
         message,
     )
     .with_provider("openai-responses");
-    crate::error_metadata::with_code(error, code)
+    crate::error_metadata::with_first_code(
+        error,
+        [failure.and_then(|failure| failure.code.as_deref()), code],
+    )
 }
 
 fn invalid(cause: &'static str, message: &'static str) -> AdkError {
