@@ -2579,6 +2579,17 @@ impl ToolExecutor<'_> {
 
     async fn execute_inner(&self, call: PendingToolCall) -> Result<ToolExecutionResult> {
         let PendingToolCall { index, name, args, id, function_call_id, resumes } = call;
+        // A resumed held call runs under a later invocation, so it is ledgered under its
+        // original identity, which every resumption of it shares (spec 3.1 §7.12, I37).
+        let resumed_ledger_key = resumes.as_ref().map(|held| {
+            crate::tool_ledger::held_call_ledger_key(
+                self.ctx.app_name(),
+                self.ctx.user_id(),
+                self.ctx.session_id(),
+                &function_call_id,
+                &held.fingerprint(),
+            )
+        });
         let mut tool_actions = EventActions::default();
         let mut response_content: Option<Content> = None;
         let mut run_after_tool_callbacks = true;
@@ -2854,7 +2865,7 @@ impl ToolExecutor<'_> {
                 let ledgered = match crate::tool_ledger::begin_ledgered_call(
                     self.ctx.as_ref(),
                     effect,
-                    tool_ctx.idempotency_key(),
+                    resumed_ledger_key.unwrap_or_else(|| tool_ctx.idempotency_key()),
                     &name,
                     &final_args,
                 )
@@ -3493,7 +3504,7 @@ impl Agent for LlmAgent {
             // dispatched again as the same call before the first model call, so the
             // decision applies whether or not the model would issue the call again. It
             // runs the whole tool path, where the governed path finds the decision.
-            let mut resumed_calls = Vec::new();
+            let mut resumed_calls = Vec::<PendingToolCall>::new();
             {
                 let gate = ToolGate::for_context(ctx.as_ref());
                 for held in ctx.session().held_tool_calls(&agent_name, ctx.branch()) {
@@ -3501,14 +3512,23 @@ impl Agent for LlmAgent {
                         continue;
                     };
                     match adk_core::confirmation_decision_available(&gate, &held.request).await {
-                        Ok(true) => resumed_calls.push(PendingToolCall {
-                            index: resumed_calls.len(),
-                            name: held.name,
-                            args: held.args,
-                            id: held.id,
-                            function_call_id,
-                            resumes: Some(held.request),
-                        }),
+                        // An agent tool holds its one call for every call its delegate holds,
+                        // so the call runs once, for its latest request with a decision, and
+                        // the delegate resumes each of its calls that has one (spec 3.1 §10 F4).
+                        Ok(true) => match resumed_calls
+                            .iter_mut()
+                            .find(|resumed| resumed.function_call_id == function_call_id)
+                        {
+                            Some(resumed) => resumed.resumes = Some(held.request),
+                            None => resumed_calls.push(PendingToolCall {
+                                index: resumed_calls.len(),
+                                name: held.name,
+                                args: held.args,
+                                id: held.id,
+                                function_call_id,
+                                resumes: Some(held.request),
+                            }),
+                        },
                         Ok(false) => {}
                         Err(error) => {
                             yield Err(error);
