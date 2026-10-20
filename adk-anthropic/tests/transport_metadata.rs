@@ -92,3 +92,35 @@ async fn parses_http_date_delays() {
         }
     }
 }
+
+#[tokio::test]
+async fn rejects_invalid_delay_numbers() {
+    for header in ["+2", "-2", "1.5", "18446744073709552", "18446744073709551616"] {
+        let client = Anthropic::new_with_base_url("fixture-key", endpoint(429, header).await)
+            .unwrap()
+            .with_max_retries(0);
+        let error = client
+            .send(MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet46))
+            .await
+            .unwrap_err();
+        assert!(error.is_rate_limit());
+        assert!(error.is_retryable());
+        assert_eq!(error.status_code(), Some(429));
+        assert_eq!(error.retry_after(), None, "{header}");
+    }
+    for (header, seconds) in [("0", 0), ("61", 61), ("18446744073709551", u64::MAX / 1000)] {
+        let client = Anthropic::new_with_base_url("fixture-key", endpoint(529, header).await)
+            .unwrap()
+            .with_max_retries(0);
+        let error = client
+            .send(MessageCreateParams::simple("Hello", KnownModel::ClaudeSonnet46))
+            .await
+            .unwrap_err();
+        assert!(error.is_rate_limit());
+        assert!(error.is_retryable());
+        assert_eq!(error.status_code(), Some(529));
+        assert_eq!(error.retry_after(), Some(seconds));
+        let delay = std::time::Duration::from_secs(seconds);
+        assert!(u64::try_from(delay.as_millis()).is_ok());
+    }
+}
