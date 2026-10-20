@@ -877,11 +877,11 @@ pub(super) fn map_openai_error(e: async_openai::error::OpenAIError) -> AdkError 
     map_error(e, parse::Layer::ResponseBody)
 }
 
-fn map_error(e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkError {
+fn map_error(mut e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkError {
     if let async_openai::error::OpenAIError::JSONDeserialize(error, body) = e {
         return parse::error(&error, &body, layer);
     }
-    if let Some(error) = responses_errors::mapped_http_error(&e) {
+    if let Some(error) = responses_errors::mapped_http_error(&mut e) {
         return error;
     }
     // An unknown stream event quotes its data, which can carry generated text.

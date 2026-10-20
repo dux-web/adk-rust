@@ -45,10 +45,18 @@ pub(crate) fn with_first_code<'a>(
 }
 
 /// Records the first bounded code from a JSON error body, see [`code_from_body`].
-#[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "openai"))]
+#[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "gemini", feature = "openai"))]
 pub(crate) fn from_body(error: AdkError, body: &str) -> AdkError {
     let code = code_from_body(body);
-    with_code(error, code.as_deref())
+    let status = error.details.upstream_status_code;
+    let request_id = error.details.request_id.clone();
+    let error = with_code(error, code.as_deref());
+    crate::provider_error::adapt(error, || {
+        let mut details = crate::ProviderErrorDetails::from_body(body);
+        details.status = status;
+        details.request_id = request_id;
+        details
+    })
 }
 
 /// Extracts the provider code from a JSON body shaped `{"error": {...}}` or, as Gemini's

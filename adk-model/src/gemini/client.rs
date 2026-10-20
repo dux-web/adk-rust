@@ -192,7 +192,11 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
     }
 
     // A response body can echo the request, so the message quotes a bounded excerpt.
-    let message = format_error_chain(e);
+    let message = if crate::provider_error::enabled() {
+        "Gemini API request failed".to_owned()
+    } else {
+        format_error_chain(e)
+    };
     let message = adk_core::upstream_excerpt(&message);
 
     // Response text can mention a different status; only the transport may
@@ -257,7 +261,14 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
         }
         _ => None,
     };
-    crate::error_metadata::with_code(err, provider_code.as_deref())
+    let err = crate::error_metadata::with_code(err, provider_code.as_deref());
+    match e {
+        adk_gemini::ClientError::BadResponse { description: Some(body), .. }
+        | adk_gemini::ClientError::ErrorInResponse { description: body, .. } => {
+            crate::error_metadata::from_body(err, body)
+        }
+        _ => err,
+    }
 }
 
 /// Whether a google-cloud-gax error without a status is a failed connection or

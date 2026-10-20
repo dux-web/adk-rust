@@ -12,6 +12,7 @@ struct HttpError {
     request_id: Option<String>,
     /// The provider's code, read from the raw body by the rule every client shares.
     provider_code: Option<String>,
+    private_details: Option<crate::ProviderErrorDetails>,
 }
 
 impl fmt::Debug for HttpError {
@@ -46,11 +47,30 @@ pub(super) async fn normalize_response(
     let request_id = header(http::HeaderName::from_static("x-request-id"))
         .and_then(identifier)
         .map(str::to_owned);
+    let mut private_details = None;
     let (api_error, provider_code) = match response.bytes().await {
-        Ok(bytes) => (
-            api_error(status, &bytes, open_responses_mode),
-            crate::error_metadata::code_from_body(&String::from_utf8_lossy(&bytes)),
-        ),
+        Ok(bytes) => {
+            if crate::provider_error::enabled() {
+                let mut details =
+                    crate::ProviderErrorDetails::from_body(&String::from_utf8_lossy(&bytes));
+                details.status = Some(status.as_u16());
+                details.request_id = request_id.clone();
+                private_details = Some(details);
+            }
+            (
+                if private_details.is_some() {
+                    ApiError {
+                        message: "provider request failed".into(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }
+                } else {
+                    api_error(status, &bytes, open_responses_mode)
+                },
+                crate::error_metadata::code_from_body(&String::from_utf8_lossy(&bytes)),
+            )
+        }
         Err(error) => {
             tracing::debug!(error = %error, http.status = status.as_u16(), "failed to read responses error body");
             let api_error = ApiError {
@@ -67,6 +87,7 @@ pub(super) async fn normalize_response(
         retry_after,
         request_id,
         provider_code,
+        private_details,
     })))
 }
 
@@ -108,19 +129,23 @@ fn identifier(value: &str) -> Option<&str> {
     .then_some(value)
 }
 
-pub(super) fn mapped_http_error(error: &OpenAIError) -> Option<AdkError> {
+pub(super) fn mapped_http_error(error: &mut OpenAIError) -> Option<AdkError> {
     let OpenAIError::Boxed(error) = error else {
         return None;
     };
-    let error = error.downcast_ref::<HttpError>()?;
+    let error = error.downcast_mut::<HttpError>()?;
     // A delay above `RetryConfig::max_delay` is capped by the retry loop.
     let mut mapped = with_retry_after(map_api_error(&error.error), error.retry_after);
     // The body's `status`, and a `code` that is not a string, do not survive `ApiError`.
     if error.provider_code.is_some() {
         mapped = crate::error_metadata::with_code(mapped, error.provider_code.as_deref());
     }
-    Some(match &error.request_id {
+    let mapped = match &error.request_id {
         Some(request_id) => mapped.with_request_id(request_id.as_str()),
+        None => mapped,
+    };
+    Some(match error.private_details.take() {
+        Some(details) => crate::provider_error::adapt(mapped, || details),
         None => mapped,
     })
 }
@@ -233,10 +258,10 @@ mod tests {
 
     async fn http_error_code(body: serde_json::Value) -> Option<serde_json::Value> {
         let response = http::Response::builder().status(400).body(body.to_string()).unwrap();
-        let error = normalize_response(reqwest_openai::Response::from(response), false)
+        let mut error = normalize_response(reqwest_openai::Response::from(response), false)
             .await
             .expect_err("a 400 is an error");
-        let mapped = mapped_http_error(&error).expect("an HTTP error");
+        let mapped = mapped_http_error(&mut error).expect("an HTTP error");
         mapped.details.metadata.get("provider_error_code").cloned()
     }
 

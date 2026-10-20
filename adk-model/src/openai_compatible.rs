@@ -812,7 +812,11 @@ async fn send_request(
             error_codes.for_status(status_code),
             format!(
                 "{provider_name} API error (HTTP {status}): {}",
-                adk_core::upstream_excerpt(&body)
+                if crate::provider_error::enabled() {
+                    "provider request failed"
+                } else {
+                    adk_core::upstream_excerpt(&body)
+                }
             ),
         )
         .with_upstream_status(status_code)

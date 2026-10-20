@@ -331,7 +331,7 @@ impl Llm for DeepSeekClient {
                             "model.deepseek.api_error",
                             format!(
                                 "DeepSeek API error (HTTP {status}): {}",
-                                adk_core::upstream_excerpt(&error_text)
+                                if crate::provider_error::enabled() { "provider request failed" } else { adk_core::upstream_excerpt(&error_text) }
                             ),
                         ).with_upstream_status(status_code).with_provider("deepseek");
                         return Err(crate::retry::with_retry_after(

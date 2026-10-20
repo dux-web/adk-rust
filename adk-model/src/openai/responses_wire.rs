@@ -113,7 +113,7 @@ pub(in crate::openai) fn event(value: Value) -> Result<Event, AdkError> {
                 &value,
                 parse::Layer::StreamEvent,
             )?;
-            Err(stream_error(failure.as_ref()))
+            Err(private_error(stream_error(failure.as_ref()), &value))
         }
         "response.cancelled" | "response.canceled" => {
             Err(invalid("cancelled", "OpenAI Responses generation was cancelled"))
@@ -124,7 +124,7 @@ pub(in crate::openai) fn event(value: Value) -> Result<Event, AdkError> {
                 &value,
                 parse::Layer::StreamEvent,
             )?;
-            Err(stream_error(Some(&failure)))
+            Err(private_error(stream_error(Some(&failure)), &value))
         }
         "response.output_item.added"
         | "response.output_item.done"
@@ -160,7 +160,7 @@ pub(in crate::openai) fn response(
 ) -> Result<Response, AdkError> {
     let header: Header = decode(value.clone(), body, layer)?;
     if header.status == Status::Failed {
-        return Err(stream_error(header.error.as_ref()));
+        return Err(private_error(stream_error(header.error.as_ref()), &value));
     }
     let output_missing = value.get("output").is_none();
     if output_missing && !matches!(layer, parse::Layer::StreamEvent) {
@@ -339,6 +339,10 @@ fn stream_error(failure: Option<&Failure>) -> AdkError {
     )
     .with_provider("openai-responses");
     crate::error_metadata::with_code(error, code)
+}
+
+fn private_error(error: AdkError, value: &Value) -> AdkError {
+    crate::provider_error::adapt(error, || crate::ProviderErrorDetails::from_value(value))
 }
 
 fn invalid(cause: &'static str, message: &'static str) -> AdkError {

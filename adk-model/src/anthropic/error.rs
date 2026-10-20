@@ -61,11 +61,15 @@ impl From<AnthropicApiError> for AdkError {
     /// which can echo the request.
     fn from(err: AnthropicApiError) -> Self {
         use adk_core::ErrorComponent;
-        let msg = AnthropicApiError {
-            message: adk_core::upstream_excerpt(&err.message).to_string(),
-            ..err.clone()
-        }
-        .to_string();
+        let msg = if crate::provider_error::enabled() {
+            "Anthropic API request failed".to_owned()
+        } else {
+            AnthropicApiError {
+                message: adk_core::upstream_excerpt(&err.message).to_string(),
+                ..err.clone()
+            }
+            .to_string()
+        };
         // Anthropic documents `api_error` (500) and `overloaded_error` (529) as transient.
         let category = crate::retry::category_for_status_code(err.status_code);
         let mut adk_err =
@@ -75,7 +79,15 @@ impl From<AnthropicApiError> for AdkError {
         if let Some(ref rid) = err.request_id {
             adk_err = adk_err.with_request_id(rid.clone());
         }
-        crate::error_metadata::with_code(adk_err, Some(&err.error_type))
+        let error = crate::error_metadata::with_code(adk_err, Some(&err.error_type));
+        crate::provider_error::adapt(error, || crate::ProviderErrorDetails {
+            code: crate::provider_error::bounded(&err.error_type),
+            kind: crate::provider_error::bounded(&err.error_type),
+            message: crate::provider_error::bounded(&err.message),
+            status: Some(err.status_code),
+            request_id: err.request_id.as_deref().and_then(crate::provider_error::bounded),
+            ..Default::default()
+        })
     }
 }
 
