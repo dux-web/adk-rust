@@ -126,6 +126,18 @@ fn certificate_errors_are_definitive() {
     }
 }
 
+#[test]
+fn initialization_failure_does_not_refuse_websocket() {
+    let error = AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::Unavailable,
+        "model.openai_responses.ws_tls_config",
+        "Responses WebSocket TLS configuration failed",
+    );
+    assert!(error.is_retryable());
+    assert_eq!(refusal(&error), WsRefusal::Transient);
+}
+
 #[tokio::test]
 async fn transports_reject_untrusted_certificates() {
     use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -147,16 +159,20 @@ async fn transports_reject_untrusted_certificates() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("https://localhost:{}/v1", listener.local_addr().unwrap().port());
     let server = tokio::spawn(async move {
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (socket, _) = listener.accept().await.unwrap();
             assert!(acceptor.accept(socket).await.is_err());
         }
     });
     let transport = WsTransport::lazy(&endpoint, "key", WsOptions::default())
         .with_retry_config(RetryConfig::default());
-    let error = transport.preconnect(HeaderMap::new()).await.unwrap_err();
-    assert_eq!(error.code, "model.openai_responses.ws_tls");
-    assert!(!error.is_retryable());
+    for _ in 0..2 {
+        // A caller can retry the same transport after an unsuccessful TLS handshake.
+        let error = transport.preconnect(HeaderMap::new()).await.unwrap_err();
+        assert_eq!(error.code, "model.openai_responses.ws_tls");
+        assert!(!error.is_retryable());
+        assert!(!transport.is_connected());
+    }
     assert_eq!(
         transport.connection.lock().await.preconnect_failure.as_ref().unwrap().1,
         WsRefusal::Definitive

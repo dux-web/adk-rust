@@ -323,12 +323,12 @@ impl WsTransport {
                     before(
                         AdkError::new(
                             ErrorComponent::Model,
-                            ErrorCategory::InvalidInput,
+                            ErrorCategory::Unavailable,
                             "model.openai_responses.ws_tls_config",
                             "Responses WebSocket TLS configuration failed",
                         )
                         .with_provider("openai-responses"),
-                        WsRefusal::Definitive,
+                        WsRefusal::Transient,
                     )
                 })?;
             Some(Connector::Rustls(config.clone()))
@@ -859,10 +859,8 @@ fn tls_config() -> Result<Arc<rustls::ClientConfig>, ()> {
     ))
 }
 fn refusal(error: &AdkError) -> WsRefusal {
-    if matches!(
-        error.code,
-        "model.openai_responses.ws_tls" | "model.openai_responses.ws_tls_config"
-    ) || error.details.upstream_status_code.is_some_and(refused)
+    if error.code == "model.openai_responses.ws_tls"
+        || error.details.upstream_status_code.is_some_and(refused)
     {
         WsRefusal::Definitive
     } else {
