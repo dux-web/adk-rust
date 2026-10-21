@@ -196,7 +196,15 @@ impl MutableSession {
                     }
                 }
                 OtherAgents::Exclude | OtherAgents::AsContext | OtherAgents::AsOwnTurns => {
-                    let mut mapped_content = content.clone();
+                    // Replay from earlier invocations needs proven ownership; the
+                    // agent may have changed models since then.
+                    let metadata = event.llm_response.provider_metadata.as_ref();
+                    let mut mapped_content =
+                        if adk_core::history::provider_origin(metadata).is_some() {
+                            adk_core::history::with_provider_parts(content, metadata)
+                        } else {
+                            content.clone()
+                        };
                     mapped_content.role = match (event.author.as_str(), content.role.as_str()) {
                         ("user", _) => "user",
                         (_, "function" | "tool") => content.role.as_str(),
@@ -287,6 +295,7 @@ fn close_interrupted_tool_calls(history: Vec<HistoryContent>) -> Vec<Content> {
     for (content_index, history_content) in history.iter().enumerate() {
         let content = &history_content.content;
         for (part_index, part) in content.parts.iter().enumerate() {
+            let part = part.provider_part();
             match part {
                 Part::FunctionCall { name, id, .. } => {
                     pending.push(PendingFunctionCall {

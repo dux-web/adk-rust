@@ -340,6 +340,34 @@ pub struct Content {
     pub parts: Vec<Part>,
 }
 
+/// The non-secret ownership of provider-specific replay data.
+///
+/// `scope` is an application-defined opaque identifier for the account,
+/// authorization and endpoint. It must not contain credentials. A refreshed
+/// token may retain a scope only when its account ownership is established.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderOrigin {
+    /// The provider protocol or implementation.
+    pub provider: String,
+    /// The requested model identifier.
+    pub model: String,
+    /// The opaque account, authorization and endpoint ownership identifier.
+    pub scope: String,
+}
+
+/// Provider-specific parts with their replay ownership.
+///
+/// This is internal conversation data, not a provider wire object. Model
+/// integrations resolve it with [`crate::history::for_provider`] before sending
+/// a request. Ordinary text and unsigned function calls remain outside it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderData {
+    /// Ownership captured when the provider produced the parts.
+    pub origin: Option<ProviderOrigin>,
+    /// Opaque replay parts, in their original order.
+    pub parts: Vec<Part>,
+}
+
 /// A single part of a [`Content`] message.
 ///
 /// Parts can be text, binary data, file references, function calls/responses,
@@ -347,6 +375,12 @@ pub struct Content {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Part {
+    /// Internal, provenance-bound provider replay data. Never send this envelope
+    /// directly to a provider or render its opaque contents as visible text.
+    ProviderData {
+        /// Provider-owned replay data and its non-secret ownership.
+        provider_data: ProviderData,
+    },
     /// Thinking/reasoning trace from a thinking-capable model.
     ///
     /// Must be placed before `Text` in the enum so that `#[serde(untagged)]`
@@ -478,6 +512,26 @@ pub enum Part {
 pub const GENERATED_CALL_ID_PREFIX: &str = "adk-call-";
 
 impl Content {
+    /// Returns a provider-facing view without unresolved provenance envelopes.
+    ///
+    /// Ordinary parts are unchanged. Opaque data requires an explicit matching
+    /// [`crate::history::for_provider`] projection; unresolved signed function
+    /// calls keep their ordinary call data with the signature removed.
+    pub fn for_model(&self) -> std::borrow::Cow<'_, Self> {
+        if !self.parts.iter().any(|part| matches!(part, Part::ProviderData { .. })) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        std::borrow::Cow::Owned(Self {
+            role: self.role.clone(),
+            parts: self
+                .parts
+                .iter()
+                .filter_map(Part::for_model)
+                .map(std::borrow::Cow::into_owned)
+                .collect(),
+        })
+    }
+
     /// Gives each function call without an ID a generated one, prefixed with
     /// [`GENERATED_CALL_ID_PREFIX`]. Calls that carry an ID keep it.
     ///
@@ -508,6 +562,7 @@ impl Content {
     /// ```
     pub fn assign_call_ids(&mut self) {
         for part in &mut self.parts {
+            let part = part.provider_part_mut();
             if let Part::FunctionCall { id: id @ None, .. } = part {
                 *id = Some(format!("{GENERATED_CALL_ID_PREFIX}{}", uuid::Uuid::new_v4().simple()));
             }
@@ -535,6 +590,7 @@ impl Content {
     /// ```
     pub fn strip_generated_call_ids(&mut self) {
         for part in &mut self.parts {
+            let part = part.provider_part_mut();
             if let Part::FunctionCall { id, .. } | Part::FunctionResponse { id, .. } = part
                 && id.as_deref().is_some_and(|id| id.starts_with(GENERATED_CALL_ID_PREFIX))
             {
@@ -566,7 +622,7 @@ impl Content {
     /// assert!(content.has_function_calls());
     /// ```
     pub fn has_function_calls(&self) -> bool {
-        self.parts.iter().any(|p| matches!(p, Part::FunctionCall { .. }))
+        self.parts.iter().any(|p| matches!(p.provider_part(), Part::FunctionCall { .. }))
     }
 
     /// Returns `true` if this content carries input from its author: a part other than
@@ -589,6 +645,7 @@ impl Content {
         self.parts.iter().any(|part| match part {
             Part::Text { text } => !text.trim().is_empty(),
             Part::FunctionResponse { .. } => false,
+            Part::ProviderData { .. } => false,
             Part::Thinking { .. }
             | Part::InlineData { .. }
             | Part::FileData { .. }
@@ -670,6 +727,55 @@ impl Content {
 }
 
 impl Part {
+    /// Returns ordinary provider input, omitting unresolved opaque data.
+    ///
+    /// An unresolved provenance envelope can still carry a real function call.
+    /// Keep that call with its thought signature removed, so changing providers
+    /// cannot lose tool history or leak the previous provider's signature.
+    pub fn for_model(&self) -> Option<std::borrow::Cow<'_, Self>> {
+        match self {
+            Self::ProviderData { .. } => {
+                if let call @ Self::FunctionCall { .. } = self.provider_part() {
+                    let mut call = call.clone();
+                    if let Self::FunctionCall { thought_signature, .. } = &mut call {
+                        *thought_signature = None;
+                    }
+                    Some(std::borrow::Cow::Owned(call))
+                } else {
+                    None
+                }
+            }
+            part => Some(std::borrow::Cow::Borrowed(part)),
+        }
+    }
+
+    /// Reads the single part in a provenance envelope without removing ownership.
+    ///
+    /// This lets tool-call bookkeeping and read-only history presentation inspect
+    /// a projected part. Sending still requires [`crate::history::for_provider`].
+    /// Nested envelopes are not expanded.
+    pub fn provider_part(&self) -> &Self {
+        match self {
+            Self::ProviderData { provider_data }
+                if provider_data.parts.len() == 1
+                    && !matches!(provider_data.parts[0], Self::ProviderData { .. }) =>
+            {
+                &provider_data.parts[0]
+            }
+            part => part,
+        }
+    }
+
+    fn provider_part_mut(&mut self) -> &mut Self {
+        let wrapped = matches!(self, Self::ProviderData { provider_data }
+            if provider_data.parts.len() == 1
+                && !matches!(provider_data.parts[0], Self::ProviderData { .. }));
+        if wrapped && let Self::ProviderData { provider_data } = self {
+            return &mut provider_data.parts[0];
+        }
+        self
+    }
+
     /// Returns the text content if this is a Text part, None otherwise
     pub fn text(&self) -> Option<&str> {
         match self {

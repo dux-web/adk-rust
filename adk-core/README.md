@@ -24,6 +24,26 @@ Core traits and types for ADK-Rust agents, tools, sessions, and events.
 
 The crate contains no model provider client.
 
+### Provider-owned history
+
+An integration can attach a non-secret `ProviderOrigin` as
+`LlmResponse.provider_metadata["provider_origin"]` from the authorization used for
+that request. Its scope must distinguish accounts and endpoints; a token refresh
+can keep it only when account ownership is established. Never put credentials in
+this metadata.
+
+With an origin, the history projection wraps opaque reasoning and signatures in
+`ProviderData`. Before a model call, apply `history::for_provider` to the request's
+copy of history with its current origin. Only exactly matching data is expanded.
+Old or unknown ownership is omitted, while visible text and tool calls and results
+remain available. Converters never serialize the internal envelope. This is explicit
+integration policy, not automatic account detection by the SDK.
+
+Without an origin, nothing changes for an ordinary agent: signed thinking, encrypted
+reasoning and thought signatures replay unchanged to the next request of the same
+invocation. Provider replay recorded in response metadata is reconstructed across
+invocations only with an origin.
+
 ## Installation
 
 ```toml
