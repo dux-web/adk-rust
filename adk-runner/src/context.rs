@@ -196,7 +196,10 @@ impl MutableSession {
                     }
                 }
                 OtherAgents::Exclude | OtherAgents::AsContext | OtherAgents::AsOwnTurns => {
-                    let mut mapped_content = content.clone();
+                    let mut mapped_content = adk_core::history::with_provider_parts(
+                        content,
+                        event.llm_response.provider_metadata.as_ref(),
+                    );
                     mapped_content.role = match (event.author.as_str(), content.role.as_str()) {
                         ("user", _) => "user",
                         (_, "function" | "tool") => content.role.as_str(),
@@ -287,6 +290,7 @@ fn close_interrupted_tool_calls(history: Vec<HistoryContent>) -> Vec<Content> {
     for (content_index, history_content) in history.iter().enumerate() {
         let content = &history_content.content;
         for (part_index, part) in content.parts.iter().enumerate() {
+            let part = part.provider_part();
             match part {
                 Part::FunctionCall { name, id, .. } => {
                     pending.push(PendingFunctionCall {

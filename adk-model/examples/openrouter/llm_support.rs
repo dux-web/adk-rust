@@ -22,6 +22,7 @@ pub fn print_llm_responses(responses: &[LlmResponse]) {
         if let Some(content) = response.content.as_ref() {
             for part in &content.parts {
                 match part {
+                    Part::ProviderData { .. } => {}
                     Part::Text { text } => println!("  text: {}", trim_for_display(text)),
                     Part::Thinking { thinking, .. } => {
                         println!("  thinking: {}", trim_for_display(thinking));

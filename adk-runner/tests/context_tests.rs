@@ -1284,6 +1284,42 @@ fn text_part(text: &str) -> Part {
 }
 
 #[test]
+fn retains_opaque_provider_parts_between_invocations() {
+    let mutable = MutableSession::new(Arc::new(MockSessionWithState::new()));
+    let replay = Part::ServerToolCall {
+        server_tool_call: serde_json::json!({"type":"reasoning","id":"rs_1","summary":[],
+            "encrypted_content":"opaque +/ bytes"}),
+    };
+    let call = call_part("call-1");
+    let mut event = event_with("ops", "inv-1", "model", vec![call.clone()]);
+    event.llm_response.provider_metadata = Some(serde_json::json!({"openai":{
+        "conversation_history_parts":[replay, call, replay]
+    }}));
+    let original = serde_json::to_vec(&event).unwrap();
+    mutable.append_event(event);
+    let response = response_part(serde_json::json!({"status":"paid"}), Some("call-1"));
+    mutable.append_event(event_with("ops", "inv-1", "function", vec![response.clone()]));
+    mutable.append_event(event_with("user", "inv-2", "user", vec![text_part("Continue")]));
+
+    let history = mutable.conversation_history_with_context("ops", "");
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].parts[0], call);
+    assert_eq!(history[0].parts[1].provider_part(), &replay);
+    assert!(
+        matches!(&history[0].parts[1], Part::ProviderData { provider_data } if provider_data.origin.is_none())
+    );
+    assert_eq!(history[1].parts, [response]);
+    assert_eq!(history[2].parts, [text_part("Continue")]);
+    let stored = mutable.events_snapshot();
+    assert_eq!(serde_json::to_vec(&stored[0]).unwrap(), original);
+
+    let other = mutable.conversation_history_with_context("report", "");
+    assert!(
+        other.iter().all(|content| !serde_json::to_string(content).unwrap().contains("opaque"))
+    );
+}
+
+#[test]
 fn a_response_whose_call_was_cut_from_the_window_is_left_out() {
     // A `history_max_events` window that starts on a result whose call it cut.
     let mutable = MutableSession::new(Arc::new(MockSessionWithState::new()));

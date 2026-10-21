@@ -264,6 +264,7 @@ pub fn content_to_messages(content: &Content) -> Vec<Message> {
 
 /// Convert ADK Content to DeepSeek Message.
 pub fn content_to_message(content: &Content) -> Message {
+    let content = content.for_model();
     let role = match content.role.as_str() {
         "model" | "assistant" => "assistant",
         "user" => "user",
@@ -282,6 +283,7 @@ pub fn content_to_message(content: &Content) -> Message {
     for part in &content.parts {
         let previous = text_parts.len();
         match part {
+            Part::ProviderData { .. } => {}
             Part::Text { text } => text_parts.push(text.clone()),
             Part::FunctionCall { name, args, id, .. } => {
                 tool_calls.push(ToolCall {

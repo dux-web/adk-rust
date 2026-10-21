@@ -51,6 +51,7 @@ pub(crate) fn adk_request_to_bedrock(
     let mut system = Vec::new();
 
     for content in contents {
+        let content = content.for_model();
         match content.role.as_str() {
             "system" => {
                 for part in &content.parts {
@@ -147,6 +148,7 @@ fn build_cache_point_block(cache_config: &BedrockCacheConfig) -> CachePointBlock
 pub fn report_for_contents(contents: &[Content]) -> ConversionReport {
     let mut report = ConversionReport::new("bedrock");
     for content in contents {
+        let content = content.for_model();
         let _ = adk_parts_to_bedrock_inner(&content.parts, &mut report);
     }
     report
@@ -198,6 +200,7 @@ fn adk_parts_to_bedrock_inner(parts: &[Part], report: &mut ConversionReport) -> 
 /// The `Part` variant name, for reporting.
 fn part_kind(part: &Part) -> &'static str {
     match part {
+        Part::ProviderData { .. } => "ProviderData",
         Part::Text { .. } => "Text",
         Part::InlineData { .. } => "InlineData",
         Part::FileData { .. } => "FileData",
@@ -228,6 +231,7 @@ fn convert_one_part(
     report: &mut ConversionReport,
 ) -> Option<ContentBlock> {
     match part {
+        Part::ProviderData { .. } => None,
         Part::Text { text } => {
             if text.is_empty() || contains_function_call {
                 None
