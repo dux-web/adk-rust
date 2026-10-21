@@ -17,14 +17,14 @@ use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::{
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_tungstenite::{
-    connect_async,
+    Connector, connect_async_tls_with_config,
     tungstenite::{self, Message, client::IntoClientRequest},
 };
 
@@ -153,6 +153,7 @@ pub struct WsTransport {
     options: WsOptions,
     retry_config: RetryConfig,
     connected: Arc<AtomicBool>,
+    tls: OnceLock<Result<Arc<rustls::ClientConfig>, ()>>,
 }
 impl WsTransport {
     /// Build a transport without opening a connection or enabling internal retries.
@@ -175,6 +176,7 @@ impl WsTransport {
             options,
             retry_config: RetryConfig::disabled(),
             connected: Arc::new(AtomicBool::new(false)),
+            tls: OnceLock::new(),
         }
     }
     /// Open a connection using the standalone transport's default retry policy.
@@ -304,32 +306,46 @@ impl WsTransport {
         lease.guard.continuation = None;
         let mut request = self.url.as_str().into_client_request().map_err(classify)?;
         request.headers_mut().extend(headers.clone());
+        let connector = if self.url.starts_with("wss:") {
+            let config = self.tls.get_or_init(tls_config).as_ref().map_err(|_| {
+                before(
+                    AdkError::new(
+                        ErrorComponent::Model,
+                        ErrorCategory::InvalidInput,
+                        "model.openai_responses.ws_tls_config",
+                        "Responses WebSocket TLS configuration failed",
+                    ),
+                    WsRefusal::Definitive,
+                )
+            })?;
+            Some(Connector::Rustls(config.clone()))
+        } else {
+            None
+        };
         let (socket, response) =
             execute_with_retry(&self.retry_config, is_retryable_model_error, || {
                 let request = request.clone();
+                let connector = connector.clone();
                 async move {
-                    tokio::time::timeout(self.options.connect_timeout, connect_async(request))
-                        .await
-                        .map_err(|_| timeout())?
-                        .map_err(|error| {
-                            if let Some(observer) = observer
-                                && let tungstenite::Error::Http(response) = &error
-                            {
-                                observer(response.headers());
-                            }
-                            classify(error).error
-                        })
+                    tokio::time::timeout(
+                        self.options.connect_timeout,
+                        connect_async_tls_with_config(request, None, false, connector),
+                    )
+                    .await
+                    .map_err(|_| timeout())?
+                    .map_err(|error| {
+                        if let Some(observer) = observer
+                            && let tungstenite::Error::Http(response) = &error
+                        {
+                            observer(response.headers());
+                        }
+                        classify(error).error
+                    })
                 }
             })
             .await
             .map_err(|error| {
-                let refusal = if error.details.upstream_status_code.is_some_and(|status| {
-                    matches!(status, 400 | 401 | 403 | 404 | 405 | 426 | 501 | 200..=399)
-                }) {
-                    WsRefusal::Definitive
-                } else {
-                    WsRefusal::Transient
-                };
+                let refusal = refusal(&error);
                 before(error, refusal)
             })?;
         lease.guard.socket = Some(socket);
@@ -695,7 +711,59 @@ fn derive_ws_url(base: &str) -> String {
             .replacen("http://", "ws://", 1)
     )
 }
+fn tls_config() -> Result<Arc<rustls::ClientConfig>, ()> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+
+    // Match reqwest's default verifier and its caller-installed crypto provider.
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    Ok(Arc::new(
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|_| ())?
+            .with_platform_verifier()
+            .map_err(|_| ())?
+            .with_no_client_auth(),
+    ))
+}
+fn refusal(error: &AdkError) -> WsRefusal {
+    if matches!(
+        error.code,
+        "model.openai_responses.ws_tls" | "model.openai_responses.ws_tls_config"
+    ) || error
+        .details
+        .upstream_status_code
+        .is_some_and(|status| matches!(status, 400 | 401 | 403 | 404 | 405 | 426 | 501 | 200..=399))
+    {
+        WsRefusal::Definitive
+    } else {
+        WsRefusal::Transient
+    }
+}
 fn classify(error: tungstenite::Error) -> BeforeEvent {
+    let certificate = match &error {
+        tungstenite::Error::Io(error) => error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<rustls::Error>())
+            .is_some_and(invalid_certificate),
+        tungstenite::Error::Tls(tungstenite::error::TlsError::Rustls(error)) => {
+            invalid_certificate(error)
+        }
+        tungstenite::Error::Tls(tungstenite::error::TlsError::InvalidDnsName) => true,
+        _ => false,
+    };
+    if certificate {
+        return before(
+            AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::Unsupported,
+                "model.openai_responses.ws_tls",
+                "Responses WebSocket TLS certificate verification failed",
+            ),
+            WsRefusal::Definitive,
+        );
+    }
     if let tungstenite::Error::Http(response) = error {
         let status = response.status().as_u16();
         let delay = response
@@ -730,6 +798,9 @@ fn classify(error: tungstenite::Error) -> BeforeEvent {
         ),
         WsRefusal::Transient,
     )
+}
+fn invalid_certificate(error: &rustls::Error) -> bool {
+    matches!(error, rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented)
 }
 fn proxy_in_effect(url: &str) -> bool {
     // reqwest handles configured proxies. Skip WebSocket rather than silently bypassing one.
