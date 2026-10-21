@@ -1,14 +1,18 @@
 //! Schema adapter for Anthropic's Claude models.
 //!
-//! Anthropic has the most permissive JSON Schema support among major LLM providers.
-//! The [`AnthropicSchemaAdapter`] applies only minimal transforms:
+//! The [`AnthropicSchemaAdapter`] retains tool parameters while adapting
+//! unsupported schema locations and metadata:
 //!
 //! 1. Strip `$schema` keyword (meta-keyword no provider supports)
 //! 2. Strip conditional keywords (`if`/`then`/`else`)
 //! 3. Add implicit `"type": "object"` when `properties` exists without a `type` field
+//! 4. Nest root composition under double negation while retaining visible fields
 //!
-//! Everything else passes through unchanged: `$ref`, `$defs`, `anyOf`, `oneOf`,
-//! `allOf`, `additionalProperties`, type arrays, `const`, and all `format` values.
+//! The Messages API rejects root `anyOf`, `oneOf`, and `allOf`. Double negation
+//! retains their boolean constraints without changing tool arguments. Schemas
+//! with unevaluated annotations or references whose targets could move are left
+//! unchanged rather than silently weakening them. Nested composition, `$defs`,
+//! `additionalProperties`, type arrays, `const`, and formats remain intact.
 //!
 //! # Example
 //!
@@ -35,28 +39,28 @@
 //! assert!(normalized.get("$schema").is_none());
 //! // const preserved (Anthropic supports it natively)
 //! assert_eq!(normalized["properties"]["name"]["const"], "fixed");
-//! // $ref, $defs, anyOf, additionalProperties all preserved
+//! // $ref, $defs, composition, additionalProperties all preserved
 //! assert!(normalized.get("$ref").is_some());
 //! assert!(normalized.get("$defs").is_some());
-//! assert!(normalized.get("anyOf").is_some());
+//! assert!(normalized["not"]["not"].get("anyOf").is_some());
 //! assert!(normalized.get("additionalProperties").is_some());
 //! ```
 
 use std::borrow::Cow;
 
 use adk_core::{SchemaAdapter, schema_utils};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Schema adapter for Anthropic's Claude models (near pass-through).
 ///
-/// Anthropic's function-calling API accepts most JSON Schema features natively.
-/// This adapter only strips the meta-keywords that no provider supports and adds
-/// implicit object types where needed.
+/// Anthropic's function-calling API accepts nested composition in object inputs.
+/// This adapter retains ordinary fields and branch constraints, removes unsupported
+/// metadata and conditionals, and adds implicit object types where needed.
 ///
 /// ## Preserved Features
 ///
 /// - `$ref` and `$defs` (reference resolution not needed)
-/// - `anyOf`, `oneOf`, `allOf` (combiners supported)
+/// - Nested `anyOf`, `oneOf`, `allOf`; root combiners are nested when safe
 /// - `additionalProperties` (supported as-is)
 /// - Type arrays (e.g., `["string", "null"]`)
 /// - `const` keyword (native support)
@@ -67,6 +71,7 @@ use serde_json::Value;
 /// 1. `strip_schema_keyword` — removes `$schema` meta-keyword
 /// 2. `strip_conditional_keywords` — removes `if`/`then`/`else`
 /// 3. `add_implicit_object_type` — adds `"type": "object"` when `properties` exists
+/// 4. Root composition is nested under `not`/`not`, retaining ordinary fields
 ///
 /// ## Tool Name Normalization
 ///
@@ -80,6 +85,7 @@ impl SchemaAdapter for AnthropicSchemaAdapter {
         schema_utils::strip_schema_keyword(&mut schema);
         schema_utils::strip_conditional_keywords(&mut schema);
         schema_utils::add_implicit_object_type(&mut schema);
+        nest_composition(&mut schema);
         schema
     }
 
@@ -97,10 +103,90 @@ impl SchemaAdapter for AnthropicSchemaAdapter {
     }
 }
 
+fn nest_composition(schema: &mut Value) {
+    if !can_nest(schema) {
+        return;
+    }
+    let Some(fields) = schema.as_object_mut() else {
+        return;
+    };
+    let mut composition = Map::new();
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        if let Some(value) = fields.remove(keyword) {
+            composition.insert(keyword.into(), value);
+        }
+    }
+    if !composition.is_empty() {
+        if let Some(value) = fields.remove("not") {
+            composition.insert("not".into(), value);
+        }
+        fields.insert("not".into(), serde_json::json!({"not": composition}));
+    }
+}
+
+fn can_nest(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            // Negation does not forward evaluation annotations. Definition
+            // pointers stay at the root; other reference targets may move.
+            !fields.contains_key("unevaluatedProperties")
+                && !fields.contains_key("unevaluatedItems")
+                && ["$ref", "$dynamicRef", "$recursiveRef"].into_iter().all(|keyword| {
+                    fields.get(keyword).and_then(Value::as_str).is_none_or(|reference| {
+                        reference.starts_with("#/$defs/") || reference.starts_with("#/definitions/")
+                    })
+                })
+                && fields.values().all(can_nest)
+        }
+        Value::Array(items) => items.iter().all(can_nest),
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn nests_root_composition() {
+        let adapter = AnthropicSchemaAdapter;
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            let mut schema = json!({
+                "type":"object",
+                "properties":{"action":{"enum":["read","write"]},"value":{"type":"string"}},
+                "required":["action"],
+                "additionalProperties":false,
+                "not":{"required":["blocked"]}
+            });
+            schema[keyword] = json!([
+                {"type":"object","properties":{"action":{"const":"read"}},"required":["action"]},
+                {"type":"object","properties":{"action":{"const":"write"}},"required":["action","value"]}
+            ]);
+            let normalized = adapter.normalize_schema(schema.clone());
+            assert!(normalized.get(keyword).is_none());
+            assert_eq!(normalized["properties"], schema["properties"]);
+            assert_eq!(normalized["required"], schema["required"]);
+            assert_eq!(normalized["additionalProperties"], false);
+            assert_eq!(normalized["not"]["not"][keyword], schema[keyword]);
+            assert_eq!(normalized["not"]["not"]["not"], schema["not"]);
+            assert_eq!(adapter.normalize_schema(normalized.clone()), normalized);
+        }
+    }
+
+    #[test]
+    fn retains_location_sensitive_composition() {
+        let adapter = AnthropicSchemaAdapter;
+        for constraint in [
+            json!({"unevaluatedProperties":false}),
+            json!({"unevaluatedItems":false}),
+            json!({"$ref":"#/oneOf/0"}),
+            json!({"$dynamicRef":"#node"}),
+        ] {
+            let schema = json!({"type":"object","oneOf":[constraint]});
+            assert_eq!(adapter.normalize_schema(schema.clone()), schema);
+        }
+    }
 
     #[test]
     fn test_strips_schema_keyword() {
@@ -182,8 +268,8 @@ mod tests {
             ]
         });
         let result = adapter.normalize_schema(schema);
-        assert!(result.get("anyOf").is_some());
-        assert_eq!(result["anyOf"].as_array().unwrap().len(), 2);
+        assert!(result["not"]["not"].get("anyOf").is_some());
+        assert_eq!(result["not"]["not"]["anyOf"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -196,8 +282,8 @@ mod tests {
             ]
         });
         let result = adapter.normalize_schema(schema);
-        assert!(result.get("oneOf").is_some());
-        assert_eq!(result["oneOf"].as_array().unwrap().len(), 2);
+        assert!(result["not"]["not"].get("oneOf").is_some());
+        assert_eq!(result["not"]["not"]["oneOf"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -210,8 +296,8 @@ mod tests {
             ]
         });
         let result = adapter.normalize_schema(schema);
-        assert!(result.get("allOf").is_some());
-        assert_eq!(result["allOf"].as_array().unwrap().len(), 2);
+        assert!(result["not"]["not"].get("allOf").is_some());
+        assert_eq!(result["not"]["not"]["allOf"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -415,16 +501,16 @@ mod tests {
         // $ref, $defs, combiners, additionalProperties all preserved
         assert_eq!(result["$ref"], "#/$defs/Base");
         assert!(result.get("$defs").is_some());
-        assert!(result.get("anyOf").is_some());
-        assert!(result.get("oneOf").is_some());
-        assert!(result.get("allOf").is_some());
+        assert!(result["not"]["not"].get("anyOf").is_some());
+        assert!(result["not"]["not"].get("oneOf").is_some());
+        assert!(result["not"]["not"].get("allOf").is_some());
         assert!(result.get("additionalProperties").is_some());
     }
 
     /// Comprehensive pass-through verification test.
     ///
     /// Verifies that `AnthropicSchemaAdapter` preserves all schema features
-    /// and only strips `$schema` and conditional keywords (`if`/`then`/`else`).
+    /// while nesting root combiners and stripping `$schema` and conditionals.
     ///
     /// **Validates: Requirements 6.4**
     #[test]
@@ -479,12 +565,12 @@ mod tests {
         );
 
         // 6. Preserves anyOf combiner
-        let any_of = result["anyOf"].as_array().expect("anyOf must be preserved");
+        let any_of = result["not"]["not"]["anyOf"].as_array().expect("anyOf must be preserved");
         assert_eq!(any_of.len(), 2);
         assert_eq!(any_of[0]["type"], "object");
         assert_eq!(any_of[1]["type"], "null");
 
-        // 7. Only strips $schema and conditional keywords
+        // 7. Strips $schema and conditional keywords
         assert!(result.get("$schema").is_none(), "$schema must be stripped");
         assert!(result.get("if").is_none(), "if must be stripped");
         assert!(result.get("then").is_none(), "then must be stripped");
@@ -545,10 +631,10 @@ mod tests {
 
         let result = adapter.normalize_schema(schema);
 
-        let one_of = result["oneOf"].as_array().expect("oneOf must be preserved");
+        let one_of = result["not"]["not"]["oneOf"].as_array().expect("oneOf must be preserved");
         assert_eq!(one_of.len(), 2);
 
-        let all_of = result["allOf"].as_array().expect("allOf must be preserved");
+        let all_of = result["not"]["not"]["allOf"].as_array().expect("allOf must be preserved");
         assert_eq!(all_of.len(), 2);
     }
 }
