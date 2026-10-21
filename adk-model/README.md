@@ -206,9 +206,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 accepts up to `XHigh`. `OpenAIResponsesConfig::with_reasoning_effort` takes the original
 three-value `ReasoningEffort` (`Low`, `Medium`, `High`).
 
-`OpenAIResponsesClient` always uses HTTP. For WebSocket mode, use `openai::WsTransport` from the
-`openai-ws` feature. `ResponsesTransport` and `OpenAIResponsesConfig::with_transport` were removed
-in 3.0: the option was never read.
+HTTP is the default. With `openai-ws`, call
+`OpenAIResponsesClient::with_websocket(WsOptions::default())` to prefer a persistent socket for
+streaming generations. Request adapters and header observers apply to both transports.
+`preconnect()` performs only the handshake; `http_only()` keeps helper generations on HTTP.
+`WsOptions` exposes connection deadlines, credential revisions and capability observations so
+the caller can own socket reuse and fallback policy. The standalone `WsTransport` API remains
+available for typed Responses requests. The default `first_event_timeout` is 15 seconds;
+control frames do not extend it. A timeout before the first provider event can fall back to
+HTTP even if the server already accepted the original request. This may generate and bill
+twice. After any provider event acknowledges acceptance, a lost socket or read timeout is
+reported without automatically resending the generation. An explicit provider failure keeps
+its normal error and retry classification.
+
+Secure WebSocket connections use the platform certificate verifier and the same crypto provider
+selection as the default Responses HTTP client. Certificate rejection is a definitive WebSocket
+refusal; callers can remember it after a successful HTTP fallback.
 
 #### Background mode
 
