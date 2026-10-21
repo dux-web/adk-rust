@@ -37,6 +37,21 @@ use crate::tools::{TODOS_STATE_KEY, TodoList};
 /// ```
 pub const CANCELLED_BY_MODE_CHANGE_STATUS: &str = "cancelled_by_mode_change";
 
+/// What closing the harness could not finish (spec 3.1 §7.15.2).
+///
+/// # Example
+///
+/// ```rust
+/// let report = adk_harness::CloseReport::default();
+/// assert!(report.distillation_failures.is_empty());
+/// ```
+#[derive(Debug, Default)]
+pub struct CloseReport {
+    /// Sessions whose turns were not distilled into long-term memory, by session id, with
+    /// the error.
+    pub distillation_failures: Vec<(String, AdkError)>,
+}
+
 /// A person's decision on a pending call, through [`Harness::decide`] (spec 3.1 §7.3).
 ///
 /// # Example
@@ -342,6 +357,7 @@ impl Harness {
         let ledger = runtime.ledgers.for_run(self.runner.run_config().action_ledger.as_ref());
         for (author, branch) in holders {
             let mut answers = Vec::new();
+            let mut answered = Vec::<String>::new();
             for call in held_tool_calls(&events, &author, &branch) {
                 let Some(call_id) = call.id.as_deref() else {
                     continue;
@@ -360,12 +376,15 @@ impl Harness {
                     &fingerprint,
                 );
                 match ledger.get(&key).await? {
+                    // A delegation holding several member calls is one call: one answer.
+                    Some(_) if answered.contains(&call_id.to_string()) => {}
                     Some(record) => {
                         tracing::warn!(
                             tool.name = %call.name,
                             function_call.id = %call_id,
                             "held call ran without its result being saved; answering it from the action ledger"
                         );
+                        answered.push(call_id.to_string());
                         answers.push(Part::FunctionResponse {
                             function_response: FunctionResponseData::new(
                                 call.name.clone(),
@@ -468,10 +487,21 @@ impl Harness {
                 let mut event = Event::new(format!("harness-mode-{}", uuid::Uuid::new_v4()));
                 event.author = author.clone();
                 event.branch = branch.clone();
+                // A delegation holding several member calls is one call with several
+                // requests, and a call gets exactly one response.
+                let mut answered = Vec::<String>::new();
                 event.llm_response.content = Some(Content {
                     role: "function".to_string(),
                     parts: held
                         .iter()
+                        .filter(|call| match &call.id {
+                            Some(id) if answered.contains(id) => false,
+                            Some(id) => {
+                                answered.push(id.clone());
+                                true
+                            }
+                            None => true,
+                        })
                         .map(|call| Part::FunctionResponse {
                             function_response: FunctionResponseData::new(
                                 call.name.clone(),
@@ -485,7 +515,7 @@ impl Harness {
                         })
                         .collect(),
                 });
-                cancelled.extend(held.iter().filter_map(|call| call.id.clone()));
+                cancelled.extend(answered);
                 cancelled_fingerprints.extend(held.iter().map(|call| call.request.fingerprint()));
                 self.sessions.append_event(session.as_ref(), event).await?;
             }
@@ -980,13 +1010,40 @@ impl Harness {
     }
 
     /// Closes the runner and the agent's toolsets.
+    ///
+    /// Sessions with turns not yet distilled are distilled first (spec 3.1 §7.15.2); a
+    /// distillation that fails is logged at `warn`. [`close_with_report`](Self::close_with_report)
+    /// returns those failures instead.
     pub async fn close(&self) {
-        // Sessions with turns not yet distilled are distilled first (spec 3.1 §7.15.2).
+        self.close_with_report().await;
+    }
+
+    /// Closes the harness as [`close`](Self::close) does and reports what it could not
+    /// finish: each session whose turns were not distilled into long-term memory, with
+    /// the error (spec 3.1 §7.15.2).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let report = harness.close_with_report().await;
+    /// for (session, error) in &report.distillation_failures {
+    ///     eprintln!("long-term memory was not updated for session {session}: {error}");
+    /// }
+    /// ```
+    pub async fn close_with_report(&self) -> CloseReport {
+        #[cfg_attr(not(feature = "memory"), allow(unused_mut))]
+        let mut report = CloseReport::default();
         #[cfg(feature = "memory")]
         if let Some(facts) = self.agent.runtime().toolset().facts() {
-            facts.close().await;
+            report.distillation_failures = facts
+                .close()
+                .await
+                .into_iter()
+                .map(|((_, _, session), error)| (session, error))
+                .collect();
         }
         self.runner.close().await;
+        report
     }
 
     #[cfg(feature = "memory")]
