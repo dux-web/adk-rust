@@ -47,8 +47,6 @@ pub use config::{
 pub use conversations::ConversationsClient;
 pub use request::{RequestAdapter, ResponseObserver};
 pub use responses_client::OpenAIResponsesClient;
-#[cfg(feature = "openai-ws")]
-pub use responses_client::http_only;
 pub use schema_adapter::{OpenAiSchemaAdapter, OpenAiStrictSchemaAdapter};
 #[cfg(feature = "openai-ws")]
 pub use ws_transport::{TransportEvent, WsOptions, WsRefusal, WsTransport};

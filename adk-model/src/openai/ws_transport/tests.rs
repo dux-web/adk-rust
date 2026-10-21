@@ -9,6 +9,67 @@ fn preserves_endpoint_paths() {
     );
     assert_eq!(derive_ws_url("http://localhost:8080/v1/"), "ws://localhost:8080/v1/responses");
 }
+
+#[test]
+fn merges_required_beta_without_losing_caller_values() {
+    for values in [
+        vec!["caller=v1"],
+        vec!["caller=v1", "other=v2"],
+        vec!["caller=v1, responses_websockets=2026-02-06"],
+    ] {
+        let mut headers = HeaderMap::new();
+        for value in &values {
+            headers.append("openai-beta", HeaderValue::from_str(value).unwrap());
+        }
+        let mut secret = HeaderValue::from_static("sensitive=v1");
+        secret.set_sensitive(true);
+        headers.append("openai-beta", secret);
+        let merged = upgrade_headers(headers).unwrap();
+        let tokens: Vec<_> = merged
+            .get_all("openai-beta")
+            .iter()
+            .flat_map(|value| value.to_str().unwrap().split(',').map(str::trim))
+            .collect();
+        assert_eq!(tokens.iter().filter(|token| **token == WS_BETA).count(), 1);
+        for value in values {
+            for token in value.split(',').map(str::trim) {
+                assert!(tokens.contains(&token));
+            }
+        }
+        assert!(tokens.contains(&"sensitive=v1"));
+        assert!(merged.get_all("openai-beta").iter().any(HeaderValue::is_sensitive));
+    }
+}
+
+#[tokio::test]
+async fn retains_send_and_read_failure_identity() {
+    use tokio::{io::AsyncWriteExt, net::TcpListener};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+        socket.next().await.unwrap().unwrap();
+        // Reserved data opcode: a real protocol read failure, rather than a provider error.
+        socket.get_mut().write_all(&[0x83, 0x00]).await.unwrap();
+        let _ = socket.next().await;
+    });
+    let transport = WsTransport::lazy(&endpoint, "key", WsOptions::default());
+    transport.preconnect(HeaderMap::new()).await.unwrap();
+    {
+        let mut lease = transport.lease(transport.connection.clone().lock_owned().await);
+        send(&mut lease, &json!({"type":"response.create"})).await.unwrap();
+        let failure = read(&mut lease, Duration::from_secs(5)).await.err().unwrap();
+        assert_eq!(failure.error.code, "model.openai_responses.ws_read");
+        assert_eq!(failure.error.details.provider.as_deref(), Some("openai-responses"));
+        let _ = lease.guard.socket.as_mut().unwrap().close(None).await;
+        let error = send(&mut lease, &json!({"type":"response.create"})).await.unwrap_err();
+        assert_eq!(error.code, "model.openai_responses.ws_send");
+        assert_eq!(error.category, ErrorCategory::Unavailable);
+        assert_eq!(error.details.provider.as_deref(), Some("openai-responses"));
+    }
+    server.await.unwrap();
+}
 #[test]
 fn extends_only_the_completed_baseline() {
     let request =
@@ -97,7 +158,7 @@ async fn transports_reject_untrusted_certificates() {
     assert_eq!(error.code, "model.openai_responses.ws_tls");
     assert!(!error.is_retryable());
     assert_eq!(
-        transport.connection.lock().await.preconnect_failure.as_ref().unwrap().2,
+        transport.connection.lock().await.preconnect_failure.as_ref().unwrap().1,
         WsRefusal::Definitive
     );
     let error = reqwest_openai::Client::new().get(&endpoint).send().await.unwrap_err();

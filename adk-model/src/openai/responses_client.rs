@@ -16,33 +16,13 @@ use futures::StreamExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-tokio::task_local! {
-    /// Set while a streamed generation request is sent; the transport raises it when the
-    /// response body hits the idle timeout. The SDK reports a failed SSE stream only as text,
-    /// so the flag is how the stream's error is classified as a timeout.
-    static STREAM_IDLE_TIMEOUT: Arc<AtomicBool>;
-}
-
-#[cfg(feature = "openai-ws")]
-tokio::task_local! {
-    static HTTP_ONLY: bool;
-    static PREPARED: (serde_json::Value, http::HeaderMap);
-}
-
-/// Keep helper generations off a session's one-response-at-a-time socket.
-///
-/// # Example
-///
-/// ```rust
-/// # async fn example() {
-/// use adk_model::openai::http_only;
-/// let result = http_only(async { "helper finished" }).await;
-/// assert_eq!(result, "helper finished");
-/// # }
-/// ```
-#[cfg(feature = "openai-ws")]
-pub async fn http_only<T>(future: impl std::future::Future<Output = T>) -> T {
-    HTTP_ONLY.scope(true, future).await
+#[derive(Clone, Default)]
+struct RequestState {
+    headers: http::HeaderMap,
+    body: Option<serde_json::Value>,
+    // The SSE SDK reports body read failures as text. This request's transport
+    // records an actual idle timeout for the stream's typed error projection.
+    idle_timeout: Option<Arc<AtomicBool>>,
 }
 
 /// Client for the OpenAI Responses API (`/responses` endpoint).
@@ -160,7 +140,7 @@ impl OpenAIResponsesClient {
         let client = with_transport(
             client,
             &transport,
-            http::HeaderMap::new(),
+            RequestState::default(),
             uses_max_reasoning,
             open_responses_mode,
             None,
@@ -219,13 +199,6 @@ impl OpenAIResponsesClient {
         self.websocket.clone()
     }
 
-    #[cfg(feature = "openai-ws")]
-    fn generation_headers(&self) -> http::HeaderMap {
-        let mut headers = self.default_headers.clone();
-        headers.extend(async_openai::config::Config::headers(self.client.config()));
-        headers
-    }
-
     /// Open only the session socket, without sending a response.create frame.
     ///
     /// # Errors
@@ -239,11 +212,15 @@ impl OpenAIResponsesClient {
         if !websocket.enabled() {
             return Ok(());
         }
-        let mut headers = self.generation_headers();
+        let mut headers = async_openai::config::Config::headers(self.client.config());
         let mut body = serde_json::json!({"model":self.model,"input":[],"stream":true});
-        if let Some(adapter) = &self.adapter {
-            adapter(&mut body, &mut headers)?;
-        }
+        prepare_request(
+            Some(&mut body),
+            &mut headers,
+            &self.default_headers,
+            matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
+            self.adapter.as_ref(),
+        )?;
         websocket.preconnect_observed(headers, self.observer.clone()).await
     }
 
@@ -313,7 +290,7 @@ impl OpenAIResponsesClient {
         self.client = with_transport(
             self.client,
             &self.transport,
-            self.default_headers.clone(),
+            RequestState { headers: self.default_headers.clone(), ..Default::default() },
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
@@ -355,7 +332,7 @@ impl OpenAIResponsesClient {
         self.client = with_transport(
             self.client,
             &self.transport,
-            self.default_headers.clone(),
+            RequestState { headers: self.default_headers.clone(), ..Default::default() },
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
@@ -399,7 +376,7 @@ impl OpenAIResponsesClient {
         self.client = with_transport(
             self.client,
             &self.transport,
-            self.default_headers.clone(),
+            RequestState { headers: self.default_headers.clone(), ..Default::default() },
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
@@ -480,10 +457,32 @@ fn http_client_init_error(err: impl std::error::Error + Send + Sync + 'static) -
     .with_source(err)
 }
 
+fn prepare_request(
+    body: Option<&mut serde_json::Value>,
+    headers: &mut http::HeaderMap,
+    defaults: &http::HeaderMap,
+    uses_max_reasoning: bool,
+    adapter: Option<&super::RequestAdapter>,
+) -> Result<(), AdkError> {
+    for (name, value) in defaults {
+        headers.entry(name).or_insert_with(|| value.clone());
+    }
+    if let Some(body) = body {
+        if uses_max_reasoning {
+            set_max_reasoning_effort(body)
+                .map_err(|error| map_error(error, parse::Layer::StreamSetup))?;
+        }
+        if let Some(adapter) = adapter {
+            adapter(body, headers)?;
+        }
+    }
+    Ok(())
+}
+
 fn with_transport(
     client: async_openai::Client<async_openai::config::OpenAIConfig>,
     http: &reqwest_openai::Client,
-    headers: http::HeaderMap,
+    state: RequestState,
     uses_max_reasoning: bool,
     open_responses_mode: bool,
     adapter: Option<super::RequestAdapter>,
@@ -496,79 +495,80 @@ fn with_transport(
     let transport = ReqwestService::new(http.clone());
     let service = tower::service_fn(move |factory: HttpRequestFactory| {
         let transport = transport.clone();
-        let headers = headers.clone();
+        let state = state.clone();
         let adapter = adapter.clone();
         let observer = observer.clone();
-        // Read while the caller's request future polls this one, before the body is handed
-        // to the SDK's stream task.
-        let idle_timeout = STREAM_IDLE_TIMEOUT.try_with(Arc::clone).ok();
         async move {
-            let streaming = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let streaming = Arc::new(AtomicBool::new(false));
             let requested_streaming = streaming.clone();
+            let idle_timeout = state.idle_timeout.clone();
             let original = factory.clone();
             let rewritten = HttpRequestFactory::new(move || {
                 let original = original.clone();
-                let headers = headers.clone();
+                let state = state.clone();
                 let adapter = adapter.clone();
                 let streaming = requested_streaming.clone();
                 async move {
                     let mut request = original.build().await?;
-                    // Defaults participate in the adapter's final header set, not a later merge.
-                    for (name, value) in &headers {
-                        request.headers_mut().entry(name).or_insert_with(|| value.clone());
-                    }
-                    #[cfg(feature = "openai-ws")]
-                    if let Ok((body, headers)) = PREPARED.try_with(Clone::clone) {
-                        *request.body_mut() = Some(
-                            serde_json::to_vec(&body)
-                                .map_err(|_| {
-                                    OpenAIError::InvalidArgument("Responses body is invalid".into())
-                                })?
-                                .into(),
-                        );
-                        *request.headers_mut() = headers;
-                        request
-                            .headers_mut()
-                            .entry(reqwest_openai::header::CONTENT_TYPE)
-                            .or_insert(http::HeaderValue::from_static("application/json"));
-                        request.headers_mut().remove(reqwest_openai::header::CONTENT_LENGTH);
-                        streaming.store(true, Ordering::Relaxed);
-                        return Ok(request);
-                    }
                     if request.url().path().ends_with("/responses") {
-                        let body =
-                            request.body().and_then(|body| body.as_bytes()).ok_or_else(|| {
-                                OpenAIError::InvalidArgument(
-                                    "Responses request body was not replayable".to_string(),
+                        let prepared = state.body.is_some();
+                        let body = match state.body {
+                            Some(body) => {
+                                *request.headers_mut() = state.headers;
+                                request
+                                    .headers_mut()
+                                    .entry(reqwest_openai::header::CONTENT_TYPE)
+                                    .or_insert(http::HeaderValue::from_static("application/json"));
+                                body
+                            }
+                            None => {
+                                let bytes = request
+                                    .body()
+                                    .and_then(|body| body.as_bytes())
+                                    .ok_or_else(|| {
+                                        OpenAIError::InvalidArgument(
+                                            "Responses request body was not replayable".into(),
+                                        )
+                                    })?;
+                                let body_text = String::from_utf8_lossy(bytes).into_owned();
+                                let mut body = serde_json::from_slice(bytes).map_err(|error| {
+                                    OpenAIError::JSONDeserialize(error, body_text)
+                                })?;
+                                prepare_request(
+                                    Some(&mut body),
+                                    request.headers_mut(),
+                                    &state.headers,
+                                    uses_max_reasoning,
+                                    adapter.as_ref(),
                                 )
-                            })?;
-                        let body_text = String::from_utf8_lossy(body).into_owned();
-                        let mut value: serde_json::Value = serde_json::from_slice(body)
-                            .map_err(|error| OpenAIError::JSONDeserialize(error, body_text))?;
-                        let customized = uses_max_reasoning || adapter.is_some();
-                        if uses_max_reasoning {
-                            set_max_reasoning_effort(&mut value)?;
-                        }
-                        if let Some(adapter) = adapter {
-                            adapter(&mut value, request.headers_mut()).map_err(|_| {
-                                OpenAIError::InvalidArgument(
-                                    "Responses request customization failed".into(),
-                                )
-                            })?;
-                        }
+                                .map_err(|_| {
+                                    OpenAIError::InvalidArgument(
+                                        "Responses request customization failed".into(),
+                                    )
+                                })?;
+                                body
+                            }
+                        };
                         streaming.store(
-                            value.get("stream").and_then(serde_json::Value::as_bool) == Some(true),
-                            std::sync::atomic::Ordering::Relaxed,
+                            body.get("stream").and_then(serde_json::Value::as_bool) == Some(true),
+                            Ordering::Relaxed,
                         );
-                        if customized {
-                            let encoded = serde_json::to_vec(&value).map_err(|error| {
+                        if prepared || uses_max_reasoning || adapter.is_some() {
+                            let encoded = serde_json::to_vec(&body).map_err(|error| {
                                 OpenAIError::InvalidArgument(format!(
-                                    "failed to serialize Responses request: {error}"
+                                    "failed to serialize Responses request: {error}",
                                 ))
                             })?;
                             *request.body_mut() = Some(encoded.into());
                             request.headers_mut().remove(reqwest_openai::header::CONTENT_LENGTH);
                         }
+                    } else {
+                        prepare_request(None, request.headers_mut(), &state.headers, false, None)
+                            .map_err(|_| {
+                            OpenAIError::InvalidArgument(
+                                "Responses request customization failed".into(),
+                            )
+                        })?;
                     }
                     Ok(request)
                 }
@@ -583,7 +583,7 @@ fn with_transport(
                 response,
                 uses_max_reasoning,
                 open_responses_mode,
-                streaming.load(std::sync::atomic::Ordering::Relaxed),
+                streaming.load(Ordering::Relaxed),
                 idle_timeout,
             )
             .await
@@ -1050,30 +1050,39 @@ impl OpenAIResponsesClient {
         stream: bool,
         native_tools: bool,
         usage_span: tracing::Span,
+        prepared: Option<(serde_json::Value, http::HeaderMap)>,
     ) -> Result<LlmResponseStream, AdkError> {
+        let idle_timeout = Arc::new(AtomicBool::new(false));
+        let (headers, body) = match prepared {
+            Some((body, headers)) => (headers, Some(body)),
+            None => (self.default_headers.clone(), None),
+        };
+        let client = with_transport(
+            self.client.clone(),
+            &self.transport,
+            RequestState { headers, body, idle_timeout: stream.then(|| idle_timeout.clone()) },
+            matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
+            self.open_responses_mode,
+            self.adapter.clone(),
+            self.observer.clone(),
+        );
         if stream {
-            // Explicitly set stream=true — async-openai's create_stream() does NOT
-            // set this field automatically, causing the server to return JSON instead
-            // of text/event-stream, which triggers an InvalidContentType error.
+            // BYOT preserves the caller's stream field, so set it explicitly.
             let mut create_request = create_request;
             create_request.stream = Some(true);
 
-            let idle_timeout = Arc::new(AtomicBool::new(false));
-            let event_stream = STREAM_IDLE_TIMEOUT
-                .scope(
-                    idle_timeout.clone(),
-                    execute_with_retry(&self.retry_config, is_retryable_model_error, || {
-                        let client = self.client.clone();
-                        let request = create_request.clone();
-                        async move {
-                            client
-                                .responses()
-                                .create_stream_byot::<_, serde_json::Value>(request)
-                                .await
-                                .map_err(|error| map_error(error, parse::Layer::StreamSetup))
-                        }
-                    }),
-                )
+            let event_stream =
+                execute_with_retry(&self.retry_config, is_retryable_model_error, || {
+                    let client = client.clone();
+                    let request = create_request.clone();
+                    async move {
+                        client
+                            .responses()
+                            .create_stream_byot::<_, serde_json::Value>(request)
+                            .await
+                            .map_err(|error| map_error(error, parse::Layer::StreamSetup))
+                    }
+                })
                 .await?;
 
             let mut state = StreamState::new(native_tools);
@@ -1123,7 +1132,6 @@ impl OpenAIResponsesClient {
             ))
         } else {
             // Non-streaming path
-            let client = self.client.clone();
             let retry_config = self.retry_config.clone();
             let background = create_request.background == Some(true);
 
@@ -1213,21 +1221,20 @@ impl Llm for OpenAIResponsesClient {
 
         #[cfg(feature = "openai-ws")]
         if stream
-            && !HTTP_ONLY.try_with(|value| *value).unwrap_or(false)
             && let Some(websocket) = &self.websocket
             && websocket.enabled()
         {
             let mut body = serde_json::to_value(&create_request)
                 .map_err(|_| super::ws_transport::invalid())?;
             body["stream"] = serde_json::Value::Bool(true);
-            if matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)) {
-                set_max_reasoning_effort(&mut body)
-                    .map_err(|error| map_error(error, parse::Layer::StreamSetup))?;
-            }
-            let mut headers = self.generation_headers();
-            if let Some(adapter) = &self.adapter {
-                adapter(&mut body, &mut headers)?;
-            }
+            let mut headers = async_openai::config::Config::headers(self.client.config());
+            prepare_request(
+                Some(&mut body),
+                &mut headers,
+                &self.default_headers,
+                matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
+                self.adapter.as_ref(),
+            )?;
             match websocket
                 .send_adapted(
                     body.clone(),
@@ -1252,10 +1259,13 @@ impl Llm for OpenAIResponsesClient {
                 Err(failure) => {
                     let refusal = failure.refusal;
                     websocket.observe(super::ws_transport::TransportEvent::Fallback { refusal });
-                    let stream = PREPARED
-                        .scope(
-                            (body, headers),
-                            self.generate_http(create_request, stream, native_tools, usage_span),
+                    let stream = self
+                        .generate_http(
+                            create_request,
+                            stream,
+                            native_tools,
+                            usage_span,
+                            Some((body, headers)),
                         )
                         .await?;
                     let websocket = websocket.clone();
@@ -1280,7 +1290,7 @@ impl Llm for OpenAIResponsesClient {
             websocket.observe(super::ws_transport::TransportEvent::Http);
         }
 
-        self.generate_http(create_request, stream, native_tools, usage_span).await
+        self.generate_http(create_request, stream, native_tools, usage_span, None).await
     }
 }
 

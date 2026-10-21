@@ -17,12 +17,12 @@ use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::{
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::sync::{Mutex, OnceCell, OwnedMutexGuard};
 use tokio_tungstenite::{
     Connector, connect_async_tls_with_config,
     tungstenite::{self, Message, client::IntoClientRequest},
@@ -30,6 +30,8 @@ use tokio_tungstenite::{
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+const PRECONNECT_TIMEOUT: Duration = Duration::from_secs(25);
+const WS_BETA: &str = "responses_websockets=2026-02-06";
 
 /// Whether a pre-event failure establishes that this endpoint refuses WebSocket ingress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,8 +96,6 @@ pub struct WsOptions {
     pub enabled: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Receives transport observations without request data.
     pub observe: Arc<dyn Fn(TransportEvent) + Send + Sync>,
-    /// Current request's immutable credential revision.
-    pub credential_revision: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 impl Default for WsOptions {
     fn default() -> Self {
@@ -107,7 +107,6 @@ impl Default for WsOptions {
             max_age: Duration::from_secs(55 * 60),
             enabled: Arc::new(|| true),
             observe: Arc::new(|_| {}),
-            credential_revision: Arc::new(|| 0),
         }
     }
 }
@@ -133,14 +132,26 @@ struct Connection {
     first_sent: bool,
     continuation: Option<Continuation>,
     response_headers: Option<HeaderMap>,
-    credential_revision: u64,
-    preconnect_failure: Option<(HeaderMap, u64, WsRefusal)>,
+    preconnect_failure: Option<(HeaderMap, WsRefusal)>,
+    unused: Option<tokio::task::JoinHandle<()>>,
 }
 impl Connection {
     fn expired(&self, options: &WsOptions, now: Instant) -> bool {
         now.duration_since(self.used) >= options.idle_timeout
             || now.duration_since(self.opened) >= options.max_age
-            || (!self.first_sent && now.duration_since(self.opened) >= Duration::from_secs(25))
+            || (!self.first_sent && now.duration_since(self.opened) >= PRECONNECT_TIMEOUT)
+    }
+    fn close(&mut self) {
+        self.socket = None;
+        self.continuation = None;
+        if let Some(unused) = self.unused.take() {
+            unused.abort();
+        }
+    }
+}
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 struct Lease {
@@ -151,8 +162,7 @@ struct Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if !self.finished {
-            self.guard.socket = None;
-            self.guard.continuation = None;
+            self.guard.close();
         }
         self.guard.used = Instant::now();
         self.connected.store(self.guard.socket.is_some(), Ordering::Relaxed);
@@ -167,7 +177,7 @@ pub struct WsTransport {
     options: WsOptions,
     retry_config: RetryConfig,
     connected: Arc<AtomicBool>,
-    tls: OnceLock<Result<Arc<rustls::ClientConfig>, ()>>,
+    tls: OnceCell<Arc<rustls::ClientConfig>>,
 }
 impl WsTransport {
     /// Build a transport without opening a connection or enabling internal retries.
@@ -182,15 +192,15 @@ impl WsTransport {
                 first_sent: false,
                 continuation: None,
                 response_headers: None,
-                credential_revision: 0,
                 preconnect_failure: None,
+                unused: None,
             })),
             url: derive_ws_url(base),
             key: key.into(),
             options,
             retry_config: RetryConfig::disabled(),
             connected: Arc::new(AtomicBool::new(false)),
-            tls: OnceLock::new(),
+            tls: OnceCell::new(),
         }
     }
     /// Open a connection using the standalone transport's default retry policy.
@@ -243,8 +253,7 @@ impl WsTransport {
         if let Ok(mut guard) = self.connection.try_lock()
             && predicate(&guard)
         {
-            guard.socket = None;
-            guard.continuation = None;
+            guard.close();
             self.connected.store(false, Ordering::Relaxed);
         }
     }
@@ -266,53 +275,62 @@ impl WsTransport {
         }
         let mut lease = self.lease(self.connection.clone().lock_owned().await);
         if let Err(failure) = self.ensure(&mut lease, headers.clone(), observer.as_ref()).await {
-            lease.guard.preconnect_failure =
-                Some((headers, (self.options.credential_revision)(), failure.refusal));
+            lease.guard.preconnect_failure = Some((headers, failure.refusal));
             return Err(failure.error);
         }
         observe_headers(&mut lease, observer.as_ref());
+        if !lease.guard.first_sent && lease.guard.unused.is_none() {
+            let connection = Arc::downgrade(&self.connection);
+            let connected = self.connected.clone();
+            let opened = lease.guard.opened;
+            let deadline = tokio::time::Instant::now() + PRECONNECT_TIMEOUT;
+            lease.guard.unused = Some(tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                if let Some(connection) = connection.upgrade()
+                    && let Ok(mut guard) = connection.try_lock()
+                    && guard.opened == opened
+                    && !guard.first_sent
+                {
+                    guard.close();
+                    connected.store(false, Ordering::Relaxed);
+                }
+            }));
+        }
         lease.finished = true;
         Ok(())
     }
     async fn ensure(
         &self,
         lease: &mut Lease,
-        mut headers: HeaderMap,
+        headers: HeaderMap,
         observer: Option<&super::ResponseObserver>,
     ) -> Result<bool, BeforeEvent> {
-        headers
-            .entry("openai-beta")
-            .or_insert(HeaderValue::from_static("responses_websockets=2026-02-06"));
-        // Content framing belongs to response.create, not the upgrade request.
-        for name in ["content-type", "content-length", "accept"] {
-            headers.remove(name);
-        }
+        let headers =
+            upgrade_headers(headers).map_err(|error| before(error, WsRefusal::Definitive))?;
         let now = Instant::now();
-        let revision = (self.options.credential_revision)();
-        let valid = lease.guard.credential_revision == revision
-            && lease.guard.headers == headers
+        let valid = lease.guard.headers == headers
             && !lease.guard.expired(&self.options, now)
             && lease.guard.socket.as_mut().is_some_and(idle_and_open);
         if valid {
             return Ok(true);
         }
-        lease.guard.socket = None;
-        lease.guard.continuation = None;
+        lease.guard.close();
         let mut request = self.url.as_str().into_client_request().map_err(classify)?;
         request.headers_mut().extend(headers.clone());
         let connector = if self.url.starts_with("wss:") {
-            let config = self.tls.get_or_init(tls_config).as_ref().map_err(|_| {
-                before(
-                    AdkError::new(
-                        ErrorComponent::Model,
-                        ErrorCategory::InvalidInput,
-                        "model.openai_responses.ws_tls_config",
-                        "Responses WebSocket TLS configuration failed",
+            let config =
+                self.tls.get_or_try_init(|| async { tls_config() }).await.map_err(|_| {
+                    before(
+                        AdkError::new(
+                            ErrorComponent::Model,
+                            ErrorCategory::InvalidInput,
+                            "model.openai_responses.ws_tls_config",
+                            "Responses WebSocket TLS configuration failed",
+                        )
+                        .with_provider("openai-responses"),
+                        WsRefusal::Definitive,
                     )
-                    .with_provider("openai-responses"),
-                    WsRefusal::Definitive,
-                )
-            })?;
+                })?;
             Some(Connector::Rustls(config.clone()))
         } else {
             None
@@ -351,7 +369,6 @@ impl WsTransport {
         self.connected.store(true, Ordering::Relaxed);
         // Handshake headers are surfaced through the client's observer at request setup.
         lease.guard.response_headers = Some(response.headers().clone());
-        lease.guard.credential_revision = revision;
         lease.guard.preconnect_failure = None;
         Ok(false)
     }
@@ -369,11 +386,7 @@ impl WsTransport {
         request: CreateResponse,
     ) -> Result<LlmResponseStream, AdkError> {
         let body = serde_json::to_value(request).map_err(|_| invalid())?;
-        let native_tools = body.get("tools").and_then(Value::as_array).is_some_and(|tools| {
-            tools.iter().any(|tool| {
-                !matches!(tool.get("type").and_then(Value::as_str), Some("function" | "custom"))
-            })
-        });
+        let native_tools = super::responses_convert::uses_native_tools(&body);
         self.send_adapted(
             body,
             self.authorization(HeaderMap::new())?,
@@ -412,9 +425,8 @@ impl WsTransport {
         normalization: (bool, bool),
     ) -> Result<LlmResponseStream, BeforeEvent> {
         let mut lease = self.lease(self.connection.clone().lock_owned().await);
-        if let Some((attempted, revision, refusal)) = lease.guard.preconnect_failure.take()
+        if let Some((attempted, refusal)) = lease.guard.preconnect_failure.take()
             && attempted == headers
-            && revision == (self.options.credential_revision)()
         {
             return Err(before(
                 AdkError::new(
@@ -459,7 +471,6 @@ impl WsTransport {
             .await
             .map_err(|error| before(error, WsRefusal::Transient))?;
         }
-        lease.guard.first_sent = true;
         let mut first = self.initial(&mut lease).await?;
         if incremental && missing(&first) {
             lease.guard.continuation = None;
@@ -497,7 +508,11 @@ impl WsTransport {
             let mut normalized = super::responses_client::OpenResponsesStreamState::default();
             loop {
                 let value = match next.take() { Some(value) => value, None => read(&mut lease, timeout).await.map_err(|failure| delivery(failure.error))? };
-                if value.get("type").and_then(Value::as_str) == Some("error") { Err(error_event(&value))?; }
+                if value.get("type").and_then(Value::as_str) == Some("error") {
+                    lease.finished = true;
+                    lease.guard.continuation = None;
+                    Err(error_event(&value))?;
+                }
                 let bytes = normalized.normalize_line(value.to_string().as_bytes(), normalization.0, normalization.1).map_err(|_| invalid())?;
                 let value:Value = serde_json::from_slice(&bytes).map_err(|error| parse::error(&error, &value.to_string(), parse::Layer::StreamEvent))?;
                 // A terminal provider outcome finishes the lease even when its
@@ -625,7 +640,21 @@ async fn send(lease: &mut Lease, frame: &Value) -> Result<(), AdkError> {
         .ok_or_else(closed)?
         .send(Message::Text(frame.to_string().into()))
         .await
-        .map_err(|_| closed())
+        .map_err(|error| {
+            AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::Unavailable,
+                "model.openai_responses.ws_send",
+                "Responses WebSocket send failed",
+            )
+            .with_provider("openai-responses")
+            .with_source(error)
+        })?;
+    lease.guard.first_sent = true;
+    if let Some(unused) = lease.guard.unused.take() {
+        unused.abort();
+    }
+    Ok(())
 }
 async fn read(lease: &mut Lease, timeout: Duration) -> Result<Value, BeforeEvent> {
     loop {
@@ -656,7 +685,20 @@ async fn read(lease: &mut Lease, timeout: Duration) -> Result<Value, BeforeEvent
                 ));
             }
             Some(Ok(_)) => {}
-            _ => return Err(before(closed(), WsRefusal::Transient)),
+            Some(Err(error)) => {
+                return Err(before(
+                    AdkError::new(
+                        ErrorComponent::Model,
+                        ErrorCategory::Unavailable,
+                        "model.openai_responses.ws_read",
+                        "Responses WebSocket read failed",
+                    )
+                    .with_provider("openai-responses")
+                    .with_source(error),
+                    WsRefusal::Transient,
+                ));
+            }
+            None => return Err(before(closed(), WsRefusal::Transient)),
         }
     }
 }
@@ -770,6 +812,36 @@ fn derive_ws_url(base: &str) -> String {
     url.set_path(&path);
     url.to_string()
 }
+fn upgrade_headers(mut headers: HeaderMap) -> Result<HeaderMap, AdkError> {
+    let values = headers.get_all("openai-beta");
+    if !values.iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|token| token.trim_ascii() == WS_BETA.as_bytes())
+    }) {
+        let mut bytes = Vec::new();
+        for value in values.iter() {
+            if !bytes.is_empty() {
+                bytes.push(b',');
+            }
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        if !bytes.is_empty() {
+            bytes.push(b',');
+        }
+        bytes.extend_from_slice(WS_BETA.as_bytes());
+        let mut beta = HeaderValue::from_bytes(&bytes).map_err(|_| invalid())?;
+        beta.set_sensitive(values.iter().any(HeaderValue::is_sensitive));
+        headers.insert("openai-beta", beta);
+    }
+    // Content framing belongs to response.create, not the upgrade request.
+    for name in ["content-type", "content-length", "accept"] {
+        headers.remove(name);
+    }
+    Ok(headers)
+}
+
 fn tls_config() -> Result<Arc<rustls::ClientConfig>, ()> {
     use rustls_platform_verifier::BuilderVerifierExt;
 

@@ -209,9 +209,10 @@ three-value `ReasoningEffort` (`Low`, `Medium`, `High`).
 HTTP is the default. With `openai-ws`, call
 `OpenAIResponsesClient::with_websocket(WsOptions::default())` to prefer a persistent socket for
 streaming generations. Request adapters and header observers apply to both transports.
-`preconnect()` performs only the handshake; `http_only()` keeps helper generations on HTTP.
-`WsOptions` exposes connection deadlines, credential revisions and capability observations so
-the caller can own socket reuse and fallback policy. The standalone `WsTransport` API remains
+`preconnect()` performs only the handshake and closes an unused socket after 25 seconds.
+Create helper clients without `with_websocket` to keep their generations on HTTP.
+`WsOptions` exposes connection deadlines and capability observations; socket reuse compares the
+complete adapted headers. The standalone `WsTransport` API remains
 available for typed Responses requests. The default `first_event_timeout` is 15 seconds;
 control frames do not extend it. A timeout before the first provider event can fall back to
 HTTP even if the server already accepted the original request. This may generate and bill

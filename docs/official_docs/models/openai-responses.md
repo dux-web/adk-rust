@@ -604,10 +604,11 @@ the connection-local cache of an unstored response is lost with the old connecti
 
 `OpenAIResponsesClient` defaults to HTTP. Its `with_websocket(WsOptions::default())` builder
 selects a persistent socket for streaming generations, using the same request adapter, header
-observer and response projection as HTTP. `preconnect()` opens only the handshake;
-`http_only()` keeps a helper generation on HTTP. `WsOptions` lets the caller observe transport
-outcomes and bind capability and credential revisions to its own lifecycle. Use `WsTransport`
-for standalone typed Responses requests.
+observer and response projection as HTTP. `preconnect()` opens only the handshake and closes an
+unused socket after 25 seconds. Create helper clients without `with_websocket` to keep them on
+HTTP. Socket reuse compares the complete adapted headers, including authorization. `WsOptions`
+lets the caller observe transport outcomes and own capability policy. Use `WsTransport` for
+standalone typed Responses requests.
 
 `WsOptions::first_event_timeout` defaults to 15 seconds. Ping and pong frames do not
 extend this deadline. Without a first provider event, the client can fall back to HTTP even

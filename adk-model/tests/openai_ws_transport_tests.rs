@@ -456,16 +456,27 @@ async fn failed_and_error_events_are_errors() {
     assert_eq!(text(&next), "after failure");
     assert_eq!(server.handshakes(), 1);
 
-    let (_, error) = single(Arc::new(|_| {
-        vec![Step::Send(json!({"type": "error", "status": 429,
-            "error": {"type": "requests", "code": "rate_limit_exceeded", "message": "slow down"}}))]
-    }))
+    let server = Server::start(Arc::new(|request| {
+        if input(request) == "q1" {
+            vec![Step::Send(json!({"type": "error", "status": 429,
+                "error": {"type": "requests", "code": "rate_limit_exceeded", "message": "slow down"}}))]
+        } else {
+            answer("after rate limit")
+        }
+    }), accept_all())
     .await;
+    let transport = WsTransport::connect(&server.config()).await.unwrap();
+    let (_, error) = collect(&transport, "q1").await;
     assert_eq!(
         error.as_ref().map(|e| (e.category, e.code)),
         Some((ErrorCategory::RateLimited, "model.openai_responses.ws_error"))
     );
     assert!(error.unwrap().is_retryable());
+    assert!(transport.is_connected());
+    let (next, error) = collect(&transport, "q2").await;
+    assert!(error.is_none(), "{error:?}");
+    assert_eq!(text(&next), "after rate limit");
+    assert_eq!(server.handshakes(), 1);
 }
 
 #[tokio::test]
@@ -575,7 +586,10 @@ async fn client_adapts_before_selecting_transport() {
     assert_eq!(server.headers.lock().unwrap()[0]["session-id"], "session");
     assert_eq!(server.headers.lock().unwrap()[0]["openai-organization"], "fixture-org");
     assert_eq!(observed.load(Ordering::SeqCst), 1);
-    assert_eq!(server.headers.lock().unwrap()[0]["openai-beta"], "caller_feature=v1");
+    assert_eq!(
+        server.headers.lock().unwrap()[0]["openai-beta"],
+        "caller_feature=v1,responses_websockets=2026-02-06"
+    );
     let request = server.requests.lock().unwrap()[0].clone();
     assert_eq!(request["store"], false);
     assert_eq!(request["service_tier"], "priority");
@@ -731,23 +745,63 @@ async fn handshake_timeout_is_classified() {
 }
 
 #[tokio::test]
-async fn credential_revision_replaces_the_socket() {
+async fn adapted_headers_replace_the_socket() {
+    use adk_core::{Content, Llm, LlmRequest};
+    use adk_model::openai::{OpenAIResponsesClient, WsOptions};
     let server = Server::start(Arc::new(|_| answer("answer")), accept_all()).await;
-    let revision = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let current = revision.clone();
-    let transport = WsTransport::lazy(
-        &server.base,
-        "key",
-        adk_model::openai::WsOptions {
-            credential_revision: Arc::new(move || current.load(Ordering::SeqCst)),
-            ..Default::default()
-        },
-    );
-    for value in [1, 1, 2] {
-        revision.store(value, Ordering::SeqCst);
-        transport.preconnect(http::HeaderMap::new()).await.unwrap();
-        assert!(collect(&transport, "request").await.1.is_none());
+    let token = Arc::new(Mutex::new("first"));
+    let current = token.clone();
+    let client = OpenAIResponsesClient::new(server.config())
+        .unwrap()
+        .with_request_adapter(Arc::new(move |_, headers| {
+            headers.insert(
+                "authorization",
+                http::HeaderValue::from_str(&current.lock().unwrap()).unwrap(),
+            );
+            Ok(())
+        }))
+        .with_websocket(WsOptions::default());
+    for value in ["first", "first", "second"] {
+        *token.lock().unwrap() = value;
+        client.preconnect().await.unwrap();
+        let mut stream = client
+            .generate_content(
+                LlmRequest::new("test-model", vec![Content::new("user").with_text("request")]),
+                true,
+            )
+            .await
+            .unwrap();
+        while let Some(result) = stream.next().await {
+            result.unwrap();
+        }
     }
+    assert_eq!(server.handshakes(), 2);
+    let headers = server.headers.lock().unwrap();
+    assert_eq!(headers[0]["authorization"], "first");
+    assert_eq!(headers[1]["authorization"], "second");
+}
+
+#[tokio::test]
+async fn unused_preconnection_closes_without_another_call() {
+    let server = Server::start(Arc::new(|_| answer("answer")), accept_all()).await;
+    let transport = WsTransport::lazy(&server.base, "key", Default::default());
+    transport.preconnect(http::HeaderMap::new()).await.unwrap();
+    assert!(transport.is_connected());
+    assert!(server.requests.lock().unwrap().is_empty());
+    // The socket owner, rather than a later request or external timer, closes it.
+    tokio::time::pause();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(25)).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while transport.is_connected() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!transport.is_connected());
+    tokio::time::resume();
+    assert!(collect(&transport, "request").await.1.is_none());
     assert_eq!(server.handshakes(), 2);
 }
 
