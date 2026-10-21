@@ -158,8 +158,10 @@ fn with_long_term_memory(model: Arc<dyn adk_core::Llm>) -> adk_core::Result<Harn
 On the first model call of each user turn, and again only when the todo list or the
 current plan step changes, the harness searches the facts of the user in this project and
 the user's preferences with the user's message, the open todos and the plan step. Tool
-rounds of the same turn reuse the same block, so the request prefix stays cacheable. The
-block follows the instruction, inside the untrusted section:
+rounds of the same turn reuse the same block. The block is appended after the
+conversation, before the mode reminder, never into the system instruction, so the request
+prefix — instruction and tool declarations — stays byte-stable and cacheable (spec 3.1
+§7.23, I56):
 
 ```text
 <memory-facts>
@@ -251,6 +253,32 @@ fn embedded(model: Arc<dyn adk_core::Llm>, key: &str) -> adk_core::Result<Harnes
         .build()
 }
 ```
+
+Feature `memory-embeddings-local` adds `RagEmbedder::local()` (and `RagEmbedder::onnx`
+with an `OnnxEmbeddingConfig`): `adk-rag`'s `OnnxEmbeddingProvider`, a sentence-transformer
+ONNX model — `BAAI/bge-small-en-v1.5`, 384 dimensions, mean-pooled and L2-normalised —
+run in process on the `ort` runtime. The model is fetched once into the Hugging Face hub
+cache (`HF_HOME`), so recall needs no network and no provider key afterwards; it is the
+default of the fully local harness (spec 3.1 §5 H10) and of `adk-rust` with a local
+provider. Building it downloads the onnxruntime binary.
+
+```rust
+use std::sync::Arc;
+
+use adk_harness::{HarnessAgent, LongTermMemoryConfig, RagEmbedder};
+
+fn local(model: Arc<dyn adk_core::Llm>) -> adk_core::Result<HarnessAgent> {
+    HarnessAgent::builder("harness")
+        .model(model)
+        .workspace(adk_devtools::Workspace::new("."))
+        .long_term_memory(LongTermMemoryConfig::default())
+        .memory_embedder(Arc::new(RagEmbedder::local()?))
+        .build()
+}
+```
+
+With a store key, the fact store seals every fact before it reaches `harness.db`
+(spec 3.1 §7.12); see [Durability](durability.md#the-encrypted-store).
 
 `fact_store_conformance_tests!` and `fact_index_conformance_tests!` check a backend
 against the contract the harness relies on.
