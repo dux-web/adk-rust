@@ -133,8 +133,15 @@ impl OpenAIResponsesClient {
         let (transport, http) = responses_http_clients(&http::HeaderMap::new(), timeouts)?;
         // ADK owns retry policy. async-openai's default executor has another
         // retry layer, including when this model's retries are disabled.
-        let client =
-            with_transport(client, &transport, uses_max_reasoning, open_responses_mode, None, None);
+        let client = with_transport(
+            client,
+            &transport,
+            http::HeaderMap::new(),
+            uses_max_reasoning,
+            open_responses_mode,
+            None,
+            None,
+        );
 
         let base_url =
             config.base_url.clone().unwrap_or_else(|| "https://api.openai.com/v1".to_string());
@@ -223,6 +230,7 @@ impl OpenAIResponsesClient {
         self.client = with_transport(
             self.client,
             &self.transport,
+            self.default_headers.clone(),
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
@@ -264,6 +272,7 @@ impl OpenAIResponsesClient {
         self.client = with_transport(
             self.client,
             &self.transport,
+            self.default_headers.clone(),
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
@@ -307,6 +316,7 @@ impl OpenAIResponsesClient {
         self.client = with_transport(
             self.client,
             &self.transport,
+            self.default_headers.clone(),
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
@@ -363,7 +373,6 @@ fn responses_http_clients(
     timeouts: crate::HttpTimeouts,
 ) -> Result<(reqwest_openai::Client, reqwest::Client), AdkError> {
     let transport = reqwest_openai::Client::builder()
-        .default_headers(headers.clone())
         .redirect(reqwest_openai::redirect::Policy::none())
         .connect_timeout(timeouts.connect)
         .read_timeout(timeouts.idle)
@@ -391,6 +400,7 @@ fn http_client_init_error(err: impl std::error::Error + Send + Sync + 'static) -
 fn with_transport(
     client: async_openai::Client<async_openai::config::OpenAIConfig>,
     http: &reqwest_openai::Client,
+    headers: http::HeaderMap,
     uses_max_reasoning: bool,
     open_responses_mode: bool,
     adapter: Option<super::RequestAdapter>,
@@ -403,6 +413,7 @@ fn with_transport(
     let transport = ReqwestService::new(http.clone());
     let service = tower::service_fn(move |factory: HttpRequestFactory| {
         let transport = transport.clone();
+        let headers = headers.clone();
         let adapter = adapter.clone();
         let observer = observer.clone();
         // Read while the caller's request future polls this one, before the body is handed
@@ -414,10 +425,15 @@ fn with_transport(
             let original = factory.clone();
             let rewritten = HttpRequestFactory::new(move || {
                 let original = original.clone();
+                let headers = headers.clone();
                 let adapter = adapter.clone();
                 let streaming = requested_streaming.clone();
                 async move {
                     let mut request = original.build().await?;
+                    // Defaults participate in the adapter's final header set, not a later merge.
+                    for (name, value) in &headers {
+                        request.headers_mut().entry(name).or_insert_with(|| value.clone());
+                    }
                     if request.url().path().ends_with("/responses") {
                         let body =
                             request.body().and_then(|body| body.as_bytes()).ok_or_else(|| {
