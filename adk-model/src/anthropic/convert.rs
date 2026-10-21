@@ -277,7 +277,10 @@ pub fn convert_tools(
 
             let input_schema =
                 decl.get("parameters").cloned().unwrap_or_else(|| adapter.empty_schema());
-            let normalized_schema = cache.normalize(&input_schema);
+            let mut normalized_schema = cache.normalize(&input_schema);
+            if decl.get("strict").and_then(Value::as_bool) != Some(true) {
+                super::schema_adapter::nest_composition(&mut normalized_schema);
+            }
 
             let normalized_name = adapter.normalize_tool_name(name);
 
