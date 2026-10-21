@@ -488,7 +488,7 @@ impl WsTransport {
             let mut state = StreamState::new(native_tools);
             let mut normalized = super::responses_client::OpenResponsesStreamState::default();
             loop {
-                let value = match next.take() { Some(value) => value, None => read(&mut lease, timeout).await.map_err(|failure| failure.error)? };
+                let value = match next.take() { Some(value) => value, None => read(&mut lease, timeout).await.map_err(|failure| delivery(failure.error))? };
                 if value.get("type").and_then(Value::as_str) == Some("error") { Err(error_event(&value))?; }
                 let bytes = normalized.normalize_line(value.to_string().as_bytes(), normalization.0, normalization.1).map_err(|_| invalid())?;
                 let value:Value = serde_json::from_slice(&bytes).map_err(|error| parse::error(&error, &value.to_string(), parse::Layer::StreamEvent))?;
@@ -522,6 +522,12 @@ fn observe_headers(lease: &mut Lease, observer: Option<&super::ResponseObserver>
     {
         observer(&headers);
     }
+}
+// A provider event confirms that this generation may have started. Losing its
+// socket is an uncertain delivery outcome, even before any text is emitted.
+fn delivery(mut error: AdkError) -> AdkError {
+    error.retry.should_retry = false;
+    error
 }
 fn before(error: AdkError, refusal: WsRefusal) -> BeforeEvent {
     BeforeEvent { error, refusal }

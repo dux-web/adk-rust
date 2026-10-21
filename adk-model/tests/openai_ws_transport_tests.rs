@@ -421,6 +421,7 @@ async fn close_before_a_terminal_event_is_an_error() {
         (error.category, error.code),
         (ErrorCategory::Unavailable, "model.openai_responses.unfinished_stream")
     );
+    assert!(!error.is_retryable());
     assert!(!transport.is_connected());
 }
 
@@ -433,9 +434,10 @@ async fn failed_and_error_events_are_errors() {
     };
     let (_, error) = single(Arc::new(move |_| vec![Step::Send(failed.clone())])).await;
     assert_eq!(
-        error.map(|e| (e.category, e.code)),
+        error.as_ref().map(|e| (e.category, e.code)),
         Some((ErrorCategory::Unavailable, "model.openai_responses.response_failed"))
     );
+    assert!(error.unwrap().is_retryable());
 
     let (_, error) = single(Arc::new(|_| {
         vec![Step::Send(json!({"type": "error", "status": 429,
@@ -443,9 +445,10 @@ async fn failed_and_error_events_are_errors() {
     }))
     .await;
     assert_eq!(
-        error.map(|e| (e.category, e.code)),
+        error.as_ref().map(|e| (e.category, e.code)),
         Some((ErrorCategory::RateLimited, "model.openai_responses.ws_error"))
     );
+    assert!(error.unwrap().is_retryable());
 }
 
 #[tokio::test]
@@ -683,6 +686,7 @@ async fn read_timeout_is_classified() {
     );
     let error = transport.send_request(request("first")).await.err().unwrap();
     assert_eq!(error.category, ErrorCategory::Timeout);
+    assert!(error.is_retryable());
 }
 
 #[tokio::test]
@@ -955,7 +959,12 @@ async fn provider_acknowledgment_prevents_http_replay() {
             if completes {
                 assert!(error.is_none());
             } else {
-                assert_eq!(error.unwrap().category, ErrorCategory::Timeout);
+                let error = error.unwrap();
+                assert_eq!(
+                    (error.category, error.code),
+                    (ErrorCategory::Timeout, "model.openai_responses.timeout")
+                );
+                assert!(!error.is_retryable());
             }
             assert_eq!(server.requests.lock().unwrap().len(), 1);
             assert!(
