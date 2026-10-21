@@ -214,6 +214,10 @@ streaming generations. Request adapters and header observers apply to both trans
 the caller can own socket reuse and fallback policy. The standalone `WsTransport` API remains
 available for typed Responses requests.
 
+Secure WebSocket connections use the platform certificate verifier and the same crypto provider
+selection as the default Responses HTTP client. Certificate rejection is a definitive WebSocket
+refusal; callers can remember it after a successful HTTP fallback.
+
 #### Background mode
 
 `extensions["openai"]["background"] = true` submits the response in the background.

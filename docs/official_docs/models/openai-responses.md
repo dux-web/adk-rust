@@ -609,6 +609,10 @@ observer and response projection as HTTP. `preconnect()` opens only the handshak
 outcomes and bind capability and credential revisions to its own lifecycle. Use `WsTransport`
 for standalone typed Responses requests.
 
+Secure WebSocket connections use the platform certificate verifier and the default HTTP client's
+crypto provider selection. A certificate rejection is a definitive refusal; capability policy can
+remember it after a successful HTTP fallback.
+
 `examples/gemini_ws_outcomes` runs each WebSocket case against a scripted local server and,
 when `OPENAI_API_KEY` is set, against the live endpoint:
 
