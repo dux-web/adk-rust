@@ -20,6 +20,7 @@ use tokio_tungstenite::tungstenite::handshake::server as handshake;
 
 enum Step {
     Send(Value),
+    Ping,
     Pause(u64),
     Close,
     Refuse(u16),
@@ -132,6 +133,7 @@ async fn serve(
         for step in script(&request) {
             let sent = match step {
                 Step::Send(event) => ws.send(Message::Text(event.to_string().into())).await,
+                Step::Ping => ws.send(Message::Ping(Vec::new().into())).await,
                 Step::Pause(millis) => {
                     tokio::time::sleep(Duration::from_millis(millis)).await;
                     Ok(())
@@ -211,6 +213,11 @@ async fn serve_http(
                 }
             }
             Step::Pause(millis) => tokio::time::sleep(Duration::from_millis(millis)).await,
+            Step::Ping => {
+                if socket.write_all(b": ping\n\n").await.is_err() {
+                    return;
+                }
+            }
             Step::Close | Step::Refuse(_) => return,
         }
     }
@@ -833,5 +840,131 @@ async fn fallback_preserves_the_adapted_request() {
         assert!(events.lock().unwrap().iter().any(
             |event| matches!(event,TransportEvent::HttpCompleted {refusal} if *refusal == expected)
         ));
+    }
+}
+
+#[tokio::test]
+async fn first_event_deadline_allows_safe_fallback() {
+    use adk_core::{Content, Llm, LlmRequest};
+    use adk_model::openai::{OpenAIResponsesClient, TransportEvent, WsOptions, WsRefusal};
+    for control_frames in [false, true] {
+        let server = Server::combined(
+            Arc::new(move |request| {
+                if request["type"] != "response.create" {
+                    return answer("HTTP fallback");
+                }
+                if control_frames {
+                    vec![Step::Ping,Step::Pause(60),Step::Ping,Step::Pause(60),
+                        Step::Ping,Step::Pause(60),Step::Send(json!({"type":"response.completed","sequence_number":1,"response":response("resp_1","completed","late")}))]
+                } else {
+                    vec![Step::Pause(300),Step::Send(json!({"type":"response.completed","sequence_number":1,"response":response("resp_1","completed","late")}))]
+                }
+            }),
+            accept_all(),
+            true,
+        ).await;
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = observations.clone();
+        let client = OpenAIResponsesClient::new(server.config())
+            .unwrap()
+            .with_retry_config(RetryConfig::disabled())
+            .with_websocket(WsOptions {
+                first_event_timeout: Duration::from_millis(100),
+                read_timeout: Duration::from_secs(5),
+                observe: Arc::new(move |event| observed.lock().unwrap().push(event)),
+                ..Default::default()
+            });
+        let mut stream = client
+            .generate_content(
+                LlmRequest::new("test-model", vec![Content::new("user").with_text("first")]),
+                true,
+            )
+            .await
+            .unwrap();
+        let mut complete = false;
+        while let Some(response) = stream.next().await {
+            complete |= response.unwrap().turn_complete;
+        }
+        assert!(complete);
+        assert_eq!(server.handshakes(), 1);
+        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        let observations = observations.lock().unwrap();
+        assert!(observations.iter().any(|event| matches!(
+            event,
+            TransportEvent::HttpCompleted { refusal: WsRefusal::Transient }
+        )));
+        assert!(
+            !observations.iter().any(|event| matches!(event, TransportEvent::WebSocket { .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn provider_acknowledgment_prevents_http_replay() {
+    use adk_core::{Content, Llm, LlmRequest};
+    use adk_model::openai::{OpenAIResponsesClient, TransportEvent, WsOptions};
+    for event in ["response.created", "response.in_progress"] {
+        for completes in [false, true] {
+            let server = Server::combined(
+                Arc::new(move |request| {
+                    if request["type"] != "response.create" {
+                        return answer("unexpected HTTP");
+                    }
+                    let mut steps = vec![
+                        Step::Send(json!({"type":event,"sequence_number":0,
+                        "response":response("resp_1","in_progress","")})),
+                        Step::Pause(150),
+                    ];
+                    steps.extend(answer("acknowledged"));
+                    steps
+                }),
+                accept_all(),
+                true,
+            )
+            .await;
+            let observations = Arc::new(Mutex::new(Vec::new()));
+            let observed = observations.clone();
+            let client = OpenAIResponsesClient::new(server.config())
+                .unwrap()
+                .with_retry_config(RetryConfig::disabled())
+                .with_websocket(WsOptions {
+                    first_event_timeout: Duration::from_millis(100),
+                    read_timeout: Duration::from_millis(if completes { 500 } else { 50 }),
+                    observe: Arc::new(move |event| observed.lock().unwrap().push(event)),
+                    ..Default::default()
+                });
+            let mut stream = client
+                .generate_content(
+                    LlmRequest::new("test-model", vec![Content::new("user").with_text("first")]),
+                    true,
+                )
+                .await
+                .unwrap();
+            let mut complete = false;
+            let mut error = None;
+            while let Some(response) = stream.next().await {
+                match response {
+                    Ok(response) => complete |= response.turn_complete,
+                    Err(failure) => {
+                        error = Some(failure);
+                        break;
+                    }
+                }
+            }
+            assert_eq!(complete, completes);
+            if completes {
+                assert!(error.is_none());
+            } else {
+                assert_eq!(error.unwrap().category, ErrorCategory::Timeout);
+            }
+            assert_eq!(server.requests.lock().unwrap().len(), 1);
+            assert!(
+                observations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|event| matches!(event, TransportEvent::WebSocket { .. }))
+            );
+        }
     }
 }
