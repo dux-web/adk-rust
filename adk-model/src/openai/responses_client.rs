@@ -23,6 +23,28 @@ tokio::task_local! {
     static STREAM_IDLE_TIMEOUT: Arc<AtomicBool>;
 }
 
+#[cfg(feature = "openai-ws")]
+tokio::task_local! {
+    static HTTP_ONLY: bool;
+    static PREPARED: (serde_json::Value, http::HeaderMap);
+}
+
+/// Keep helper generations off a session's one-response-at-a-time socket.
+///
+/// # Example
+///
+/// ```rust
+/// # async fn example() {
+/// use adk_model::openai::http_only;
+/// let result = http_only(async { "helper finished" }).await;
+/// assert_eq!(result, "helper finished");
+/// # }
+/// ```
+#[cfg(feature = "openai-ws")]
+pub async fn http_only<T>(future: impl std::future::Future<Output = T>) -> T {
+    HTTP_ONLY.scope(true, future).await
+}
+
 /// Client for the OpenAI Responses API (`/responses` endpoint).
 ///
 /// Wraps `async-openai`'s typed `Responses` client and implements `adk_core::Llm`.
@@ -64,6 +86,8 @@ pub struct OpenAIResponsesClient {
     open_responses_mode: bool,
     /// Connect and idle bounds of both HTTP clients.
     timeouts: crate::HttpTimeouts,
+    #[cfg(feature = "openai-ws")]
+    websocket: Option<Arc<super::ws_transport::WsTransport>>,
 }
 
 impl OpenAIResponsesClient {
@@ -161,7 +185,66 @@ impl OpenAIResponsesClient {
             base_url,
             open_responses_mode,
             timeouts,
+            #[cfg(feature = "openai-ws")]
+            websocket: None,
         })
+    }
+
+    /// Select WebSocket for eligible streamed generations; HTTP remains available.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use adk_model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig, WsOptions};
+    /// # fn main() -> Result<(), adk_core::AdkError> {
+    /// let client = OpenAIResponsesClient::new(OpenAIResponsesConfig::new("key", "model"))?
+    ///     .with_websocket(WsOptions::default());
+    /// assert!(!client.websocket().unwrap().is_connected());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "openai-ws")]
+    pub fn with_websocket(mut self, options: super::ws_transport::WsOptions) -> Self {
+        self.websocket = Some(Arc::new(super::ws_transport::WsTransport::lazy(
+            &self.base_url,
+            &self.api_key,
+            options,
+        )));
+        self
+    }
+
+    #[cfg(feature = "openai-ws")]
+    /// Access the socket mechanics for the caller's lifecycle owner.
+    pub fn websocket(&self) -> Option<Arc<super::ws_transport::WsTransport>> {
+        self.websocket.clone()
+    }
+
+    #[cfg(feature = "openai-ws")]
+    fn generation_headers(&self) -> http::HeaderMap {
+        let mut headers = self.default_headers.clone();
+        headers.extend(async_openai::config::Config::headers(self.client.config()));
+        headers
+    }
+
+    /// Open only the session socket, without sending a response.create frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns the request adapter or handshake error. No generation is sent.
+    #[cfg(feature = "openai-ws")]
+    pub async fn preconnect(&self) -> Result<(), AdkError> {
+        let Some(websocket) = &self.websocket else {
+            return Ok(());
+        };
+        if !websocket.enabled() {
+            return Ok(());
+        }
+        let mut headers = self.generation_headers();
+        let mut body = serde_json::json!({"model":self.model,"input":[],"stream":true});
+        if let Some(adapter) = &self.adapter {
+            adapter(&mut body, &mut headers)?;
+        }
+        websocket.preconnect_observed(headers, self.observer.clone()).await
     }
 
     /// Adds default HTTP headers to generation and auxiliary requests.
@@ -434,6 +517,24 @@ fn with_transport(
                     for (name, value) in &headers {
                         request.headers_mut().entry(name).or_insert_with(|| value.clone());
                     }
+                    #[cfg(feature = "openai-ws")]
+                    if let Ok((body, headers)) = PREPARED.try_with(Clone::clone) {
+                        *request.body_mut() = Some(
+                            serde_json::to_vec(&body)
+                                .map_err(|_| {
+                                    OpenAIError::InvalidArgument("Responses body is invalid".into())
+                                })?
+                                .into(),
+                        );
+                        *request.headers_mut() = headers;
+                        request
+                            .headers_mut()
+                            .entry(reqwest_openai::header::CONTENT_TYPE)
+                            .or_insert(http::HeaderValue::from_static("application/json"));
+                        request.headers_mut().remove(reqwest_openai::header::CONTENT_LENGTH);
+                        streaming.store(true, Ordering::Relaxed);
+                        return Ok(request);
+                    }
                     if request.url().path().ends_with("/responses") {
                         let body =
                             request.body().and_then(|body| body.as_bytes()).ok_or_else(|| {
@@ -667,7 +768,7 @@ fn normalize_responses_bytes(
 }
 
 #[derive(Default)]
-struct OpenResponsesStreamState {
+pub(super) struct OpenResponsesStreamState {
     function_calls: std::collections::BTreeMap<u64, StreamedFunctionCall>,
     identity_conflict: bool,
 }
@@ -680,7 +781,7 @@ struct StreamedFunctionCall {
 }
 
 impl OpenResponsesStreamState {
-    fn normalize_line(
+    pub(super) fn normalize_line(
         &mut self,
         bytes: &[u8],
         uses_max_reasoning: bool,
@@ -942,48 +1043,14 @@ fn map_error(e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkErr
     .with_provider("openai-responses")
 }
 
-#[async_trait]
-impl Llm for OpenAIResponsesClient {
-    // The request's `max_output_tokens`, reasoning included, or the model's output limit.
-    fn max_cost_micro_usd(&self, request: &adk_core::LlmRequest) -> Option<u64> {
-        crate::pricing::PricingCatalog::standard().max_cost_micro_usd(
-            Some("openai-responses"),
-            self.name(),
-            request,
-            crate::pricing::request_output_cap(request),
-        )
-    }
-
-    fn name(&self) -> &str {
-        &self.model
-    }
-
-    #[tracing::instrument(
-        name = "model.generate_content",
-        skip_all,
-        fields(
-            model.name = %self.name(),
-            stream = %stream,
-            request.contents_count = %request.contents.len(),
-            request.tools_count = %request.tools.len()
-        )
-    )]
-    async fn generate_content(
+impl OpenAIResponsesClient {
+    async fn generate_http(
         &self,
-        request: LlmRequest,
+        create_request: async_openai::types::responses::CreateResponse,
         stream: bool,
+        native_tools: bool,
+        usage_span: tracing::Span,
     ) -> Result<LlmResponseStream, AdkError> {
-        let usage_span = adk_telemetry::llm_generate_span("openai-responses", &self.model, stream);
-
-        let create_request = responses_convert::build_create_response(
-            &self.model,
-            &request,
-            self.reasoning_effort,
-            self.reasoning_summary,
-        )?;
-
-        let native_tools = responses_convert::request_uses_native_tools(&request);
-
         if stream {
             // Explicitly set stream=true — async-openai's create_stream() does NOT
             // set this field automatically, causing the server to return JSON instead
@@ -1099,6 +1166,121 @@ impl Llm for OpenAIResponsesClient {
                 &self.model,
             ))
         }
+    }
+}
+
+#[async_trait]
+impl Llm for OpenAIResponsesClient {
+    // The request's `max_output_tokens`, reasoning included, or the model's output limit.
+    fn max_cost_micro_usd(&self, request: &adk_core::LlmRequest) -> Option<u64> {
+        crate::pricing::PricingCatalog::standard().max_cost_micro_usd(
+            Some("openai-responses"),
+            self.name(),
+            request,
+            crate::pricing::request_output_cap(request),
+        )
+    }
+
+    fn name(&self) -> &str {
+        &self.model
+    }
+
+    #[tracing::instrument(
+        name = "model.generate_content",
+        skip_all,
+        fields(
+            model.name = %self.name(),
+            stream = %stream,
+            request.contents_count = %request.contents.len(),
+            request.tools_count = %request.tools.len()
+        )
+    )]
+    async fn generate_content(
+        &self,
+        request: LlmRequest,
+        stream: bool,
+    ) -> Result<LlmResponseStream, AdkError> {
+        let usage_span = adk_telemetry::llm_generate_span("openai-responses", &self.model, stream);
+
+        let create_request = responses_convert::build_create_response(
+            &self.model,
+            &request,
+            self.reasoning_effort,
+            self.reasoning_summary,
+        )?;
+
+        let native_tools = responses_convert::request_uses_native_tools(&request);
+
+        #[cfg(feature = "openai-ws")]
+        if stream
+            && !HTTP_ONLY.try_with(|value| *value).unwrap_or(false)
+            && let Some(websocket) = &self.websocket
+            && websocket.enabled()
+        {
+            let mut body = serde_json::to_value(&create_request)
+                .map_err(|_| super::ws_transport::invalid())?;
+            body["stream"] = serde_json::Value::Bool(true);
+            if matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)) {
+                set_max_reasoning_effort(&mut body)
+                    .map_err(|error| map_error(error, parse::Layer::StreamSetup))?;
+            }
+            let mut headers = self.generation_headers();
+            if let Some(adapter) = &self.adapter {
+                adapter(&mut body, &mut headers)?;
+            }
+            match websocket
+                .send_adapted(
+                    body.clone(),
+                    headers.clone(),
+                    self.observer.clone(),
+                    native_tools,
+                    (
+                        matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
+                        self.open_responses_mode,
+                    ),
+                )
+                .await
+            {
+                Ok(stream) => {
+                    return Ok(crate::usage_tracking::with_priced_usage_tracking(
+                        stream,
+                        usage_span,
+                        "openai",
+                        &self.model,
+                    ));
+                }
+                Err(failure) => {
+                    let refusal = failure.refusal;
+                    websocket.observe(super::ws_transport::TransportEvent::Fallback { refusal });
+                    let stream = PREPARED
+                        .scope(
+                            (body, headers),
+                            self.generate_http(create_request, stream, native_tools, usage_span),
+                        )
+                        .await?;
+                    let websocket = websocket.clone();
+                    return Ok(Box::pin(stream.map(move |result| {
+                        if result.as_ref().is_ok_and(|response| {
+                            response.turn_complete
+                                && response.error_code.is_none()
+                                && response.error_message.is_none()
+                        }) {
+                            websocket.observe(super::ws_transport::TransportEvent::HttpCompleted {
+                                refusal,
+                            });
+                        }
+                        result
+                    })));
+                }
+            }
+        }
+
+        #[cfg(feature = "openai-ws")]
+        if let Some(websocket) = &self.websocket {
+            websocket.observe(super::ws_transport::TransportEvent::Http);
+        }
+
+        self.generate_http(create_request, stream, native_tools, usage_span).await
     }
 }
 
