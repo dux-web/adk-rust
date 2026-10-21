@@ -140,12 +140,17 @@ async fn adapters_can_replace_default_authorization() {
                 defaults.insert("authorization", "default-key".parse().unwrap());
                 defaults.insert("x-api-key", "default-key".parse().unwrap());
                 defaults.insert("x-session", "preserved".parse().unwrap());
+                let mut earlier = http::HeaderMap::new();
+                earlier.insert("x-session", "replaced".parse().unwrap());
+                earlier.insert("x-retained", "earlier".parse().unwrap());
                 let client: Box<dyn Llm> = if responses {
                     Box::new(
                         OpenAIResponsesClient::new(
                             OpenAIResponsesConfig::new("constructor-key", "fixture")
                                 .with_base_url(server.uri()),
                         )
+                        .unwrap()
+                        .with_default_headers(earlier)
                         .unwrap()
                         .with_default_headers(defaults)
                         .unwrap()
@@ -158,6 +163,8 @@ async fn adapters_can_replace_default_authorization() {
                             OpenAICompatibleConfig::new("constructor-key", "fixture")
                                 .with_base_url(server.uri()),
                         )
+                        .unwrap()
+                        .with_default_headers(earlier)
                         .unwrap()
                         .with_default_headers(defaults)
                         .unwrap()
@@ -175,6 +182,7 @@ async fn adapters_can_replace_default_authorization() {
                 assert_eq!(requests.len(), 1);
                 assert_eq!(requests[0].headers[header], "custom grant");
                 assert_eq!(requests[0].headers["x-session"], "preserved");
+                assert_eq!(requests[0].headers["x-retained"], "earlier");
                 for other in ["authorization", "x-api-key"] {
                     if other != header {
                         assert!(

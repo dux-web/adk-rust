@@ -346,7 +346,6 @@ pub struct OpenAICompatible {
     parallel_tool_calls: bool,
     reasoning_replay_field: Option<ReasoningReplayField>,
     error_codes: ErrorCodes,
-    timeouts: crate::HttpTimeouts,
 }
 
 /// Builds the redirect-free HTTP client; adapters receive defaults on each request.
@@ -411,15 +410,14 @@ impl OpenAICompatible {
             parallel_tool_calls: config.parallel_tool_calls,
             reasoning_replay_field: None,
             error_codes: ErrorCodes::COMPATIBLE,
-            timeouts,
         })
     }
 
     /// Adds default HTTP headers to every request, replacing earlier defaults with the same name.
     ///
-    /// The bearer token and organization headers set per request take precedence, and
-    /// redirects stay disabled. Unlike builder methods that only store a value, this
-    /// method rebuilds the underlying `reqwest` client, so it returns `Result`.
+    /// The bearer token and organization headers set per request take precedence.
+    /// Headers are applied per request without replacing the HTTP transport or its
+    /// timeout settings; redirects stay disabled.
     ///
     /// # Example
     ///
@@ -433,14 +431,8 @@ impl OpenAICompatible {
     ///     .with_default_headers(headers)?;
     /// # Ok::<(), adk_core::AdkError>(())
     /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns an `Internal` error with code `model.openai.http_client_init` when the
-    /// HTTP client cannot be built.
     pub fn with_default_headers(mut self, headers: http::HeaderMap) -> Result<Self, AdkError> {
         self.default_headers.extend(headers);
-        self.http = compatible_http_client(self.timeouts, &self.provider_name)?;
         Ok(self)
     }
 
@@ -448,8 +440,7 @@ impl OpenAICompatible {
     ///
     /// The idle timeout bounds each wait for data, so a stream that stalls fails with a
     /// `Timeout` error instead of holding the run; see [`HttpTimeouts`](crate::HttpTimeouts)
-    /// for the defaults. Like [`with_default_headers`](Self::with_default_headers), this
-    /// rebuilds the `reqwest` client, so it returns `Result`.
+    /// for the defaults. This rebuilds the `reqwest` client, so it returns `Result`.
     ///
     /// # Example
     ///
@@ -469,8 +460,7 @@ impl OpenAICompatible {
     /// Returns an `Internal` error with code `model.openai.http_client_init` when the
     /// HTTP client cannot be built.
     pub fn with_timeouts(mut self, timeouts: crate::HttpTimeouts) -> Result<Self, AdkError> {
-        self.timeouts = timeouts;
-        self.http = compatible_http_client(self.timeouts, &self.provider_name)?;
+        self.http = compatible_http_client(timeouts, &self.provider_name)?;
         Ok(self)
     }
 
