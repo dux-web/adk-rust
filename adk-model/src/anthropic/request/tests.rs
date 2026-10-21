@@ -112,12 +112,16 @@ async fn preserves_composed_tool_parameters() {
         request.config = None;
         request.tools.insert(
             "composed".into(),
-            json!({"description":"Read or write a value","parameters":schema}),
+            json!({"description":"Read or write a value","parameters":schema,"strict":false}),
         );
         // Anthropic documents no `not` keyword for strict tools.
         request.tools.insert(
             "strict_composed".into(),
             json!({"description":"Read or write a value","parameters":schema,"strict":true}),
+        );
+        request.tools.insert(
+            "unspecified".into(),
+            json!({"description":"Read or write a value","parameters":schema}),
         );
         client(&server)
             .generate_content(request.clone(), streaming)
@@ -137,7 +141,11 @@ async fn preserves_composed_tool_parameters() {
         assert_eq!(input["properties"], schema["properties"]);
         assert_eq!(input["required"], schema["required"]);
         assert_eq!(input["not"]["not"]["oneOf"], schema["oneOf"]);
+        assert_eq!(body["tools"][0]["strict"], false);
         assert_eq!(body["tools"][1]["input_schema"], schema);
+        assert_eq!(body["tools"][1]["strict"], true);
+        assert_eq!(body["tools"][2]["input_schema"], *input);
+        assert!(body["tools"][2].get("strict").is_none());
         assert_eq!(request.tools["composed"]["parameters"], schema);
     }
 }
