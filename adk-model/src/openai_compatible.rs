@@ -349,15 +349,13 @@ pub struct OpenAICompatible {
     timeouts: crate::HttpTimeouts,
 }
 
-/// Builds the redirect-free HTTP client with `headers` and `timeouts`.
+/// Builds the redirect-free HTTP client; adapters receive defaults on each request.
 fn compatible_http_client(
-    headers: &http::HeaderMap,
     timeouts: crate::HttpTimeouts,
     provider_name: &str,
 ) -> Result<reqwest::Client, AdkError> {
     timeouts
         .apply(reqwest::Client::builder())
-        .default_headers(headers.clone())
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|err| {
@@ -400,7 +398,7 @@ impl OpenAICompatible {
         let timeouts = crate::HttpTimeouts::default();
         Ok(Self {
             completion_url: None,
-            http: compatible_http_client(&http::HeaderMap::new(), timeouts, &config.provider_name)?,
+            http: compatible_http_client(timeouts, &config.provider_name)?,
             default_headers: http::HeaderMap::new(),
             request_adapter: None,
             api_key: config.api_key,
@@ -442,8 +440,7 @@ impl OpenAICompatible {
     /// HTTP client cannot be built.
     pub fn with_default_headers(mut self, headers: http::HeaderMap) -> Result<Self, AdkError> {
         self.default_headers.extend(headers);
-        self.http =
-            compatible_http_client(&self.default_headers, self.timeouts, &self.provider_name)?;
+        self.http = compatible_http_client(self.timeouts, &self.provider_name)?;
         Ok(self)
     }
 
@@ -473,8 +470,7 @@ impl OpenAICompatible {
     /// HTTP client cannot be built.
     pub fn with_timeouts(mut self, timeouts: crate::HttpTimeouts) -> Result<Self, AdkError> {
         self.timeouts = timeouts;
-        self.http =
-            compatible_http_client(&self.default_headers, self.timeouts, &self.provider_name)?;
+        self.http = compatible_http_client(self.timeouts, &self.provider_name)?;
         Ok(self)
     }
 
@@ -762,6 +758,7 @@ fn to_oai_reasoning_effort(effort: OpenAIReasoningEffort) -> Option<OaiReasoning
 #[derive(Clone)]
 struct RequestTarget {
     url: String,
+    headers: http::HeaderMap,
     api_key: String,
     organization_id: Option<String>,
     provider_name: String,
@@ -779,34 +776,42 @@ async fn send_request(
     target: &RequestTarget,
     body: &serde_json::Value,
 ) -> Result<reqwest::Response, AdkError> {
-    let RequestTarget { url, api_key, organization_id, provider_name, adapter, error_codes } =
-        target;
-    let mut http_req = http.post(url);
+    let RequestTarget {
+        url,
+        headers,
+        api_key,
+        organization_id,
+        provider_name,
+        adapter,
+        error_codes,
+    } = target;
+    let request_error = |error: reqwest::Error| {
+        AdkError::new(
+            ErrorComponent::Model,
+            crate::http_timeouts::transport_category(&error),
+            error_codes.request,
+            format!("{provider_name} request error: {error}"),
+        )
+        .with_provider(provider_name)
+    };
+    let mut builder = http.post(url).json(body);
     if !api_key.is_empty() {
-        http_req = http_req.bearer_auth(api_key);
+        builder = builder.bearer_auth(api_key);
+    }
+    if let Some(org_id) = organization_id {
+        builder = builder.header("OpenAI-Organization", org_id);
+    }
+    let mut request = builder.build().map_err(&request_error)?;
+    for (name, value) in headers {
+        request.headers_mut().entry(name).or_insert_with(|| value.clone());
     }
     if let Some(adapter) = adapter {
         let mut body = body.clone();
-        let mut headers = reqwest::header::HeaderMap::new();
-        adapter(&mut body, &mut headers)?;
-        http_req = http_req.headers(headers).json(&body);
-    } else {
-        http_req = http_req.json(body);
+        adapter(&mut body, request.headers_mut())?;
+        *request.body_mut() = Some(body.to_string().into());
+        request.headers_mut().remove(reqwest::header::CONTENT_LENGTH);
     }
-
-    if let Some(org_id) = organization_id {
-        http_req = http_req.header("OpenAI-Organization", org_id);
-    }
-
-    let http_resp = http_req.send().await.map_err(|e| {
-        AdkError::new(
-            ErrorComponent::Model,
-            crate::http_timeouts::transport_category(&e),
-            error_codes.request,
-            format!("{provider_name} request error: {e}"),
-        )
-        .with_provider(provider_name)
-    })?;
+    let http_resp = http.execute(request).await.map_err(request_error)?;
 
     if !http_resp.status().is_success() {
         let status = http_resp.status();
@@ -910,6 +915,7 @@ impl Llm for OpenAICompatible {
         let reasoning_replay_field = self.reasoning_replay_field;
         let error_codes = self.error_codes;
         let target = RequestTarget {
+            headers: self.default_headers.clone(),
             url: self
                 .completion_url
                 .clone()

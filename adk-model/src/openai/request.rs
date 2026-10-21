@@ -4,6 +4,8 @@
 ///
 /// The adapter must preserve the requested response mode and must not perform I/O.
 /// It runs for each HTTP attempt under the model's configured retry policy.
+/// Headers include configured defaults and constructor credentials. Generation
+/// transports preserve removals instead of restoring those defaults afterward.
 ///
 /// # Example
 ///
