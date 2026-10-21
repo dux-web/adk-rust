@@ -53,7 +53,7 @@ pub fn with_provider_parts(content: &Content, metadata: Option<&serde_json::Valu
         if let Ok(part) = serde_json::from_value::<Part>(part.clone())
             && !content.parts.iter().any(|existing| {
                 existing == &part
-                    || matches!(existing, Part::ProviderData { provider_data } if provider_data.parts.contains(&part))
+                    || matches!(existing, Part::ProviderData { provider_data } if provider_data.parts[0] == part)
             })
         {
             content.parts.push(part);
@@ -70,7 +70,10 @@ pub fn with_provider_parts(content: &Content, metadata: Option<&serde_json::Valu
                 || matches!(&part, Part::FunctionCall { thought_signature: Some(_), .. })
             {
                 Part::ProviderData {
-                    provider_data: ProviderData { origin: Some(origin.clone()), parts: vec![part] },
+                    provider_data: ProviderData {
+                        origin: Some(origin.clone()),
+                        parts: Box::new([part]),
+                    },
                 }
             } else {
                 part
@@ -128,19 +131,16 @@ pub fn for_provider(contents: &mut Vec<Content>, origin: &ProviderOrigin) {
                 Part::ProviderData { provider_data } => {
                     let owned =
                         valid_origin(origin) && provider_data.origin.as_ref() == Some(origin);
-                    for mut part in provider_data.parts {
-                        if opaque(&part) {
-                            if owned {
-                                parts.push(part);
-                            }
-                        } else if !matches!(part, Part::ProviderData { .. }) {
-                            if !owned
-                                && let Part::FunctionCall { thought_signature, .. } = &mut part
-                            {
-                                *thought_signature = None;
-                            }
+                    let [mut part] = *provider_data.parts;
+                    if opaque(&part) {
+                        if owned {
                             parts.push(part);
                         }
+                    } else if !matches!(part, Part::ProviderData { .. }) {
+                        if !owned && let Part::FunctionCall { thought_signature, .. } = &mut part {
+                            *thought_signature = None;
+                        }
+                        parts.push(part);
                     }
                 }
                 mut part => {

@@ -102,15 +102,28 @@ fn keeps_tool_results_and_rejects_nested_data() {
     let nested = Part::ProviderData {
         provider_data: ProviderData {
             origin: Some(origin()),
-            parts: vec![
-                Part::ProviderData {
-                    provider_data: ProviderData { origin: Some(origin()), parts: content().parts },
+            parts: Box::new([Part::ProviderData {
+                provider_data: ProviderData {
+                    origin: Some(origin()),
+                    parts: Box::new([call(Some("nested-signature"))]),
                 },
-                response.clone(),
-            ],
+            }]),
         },
     };
-    let mut sent = vec![Content { role: "tool".into(), parts: vec![nested] }];
+    assert!(matches!(nested.provider_part(), Part::ProviderData { .. }));
+    assert!(nested.for_model().is_none());
+    let mut sent = vec![Content {
+        role: "tool".into(),
+        parts: vec![
+            nested,
+            Part::ProviderData {
+                provider_data: ProviderData {
+                    origin: Some(origin()),
+                    parts: Box::new([response.clone()]),
+                },
+            },
+        ],
+    }];
     for_provider(&mut sent, &origin());
     assert_eq!(sent[0].parts, vec![response]);
 }
@@ -154,5 +167,38 @@ fn originless_parts_replay_unchanged() {
         }
         assert_eq!(projected.parts, expected);
         assert_eq!(projected.for_model().parts, expected);
+    }
+}
+
+#[test]
+fn roundtrips_single_parts() {
+    let projected = with_provider_parts(&content(), Some(&metadata()));
+    let encoded = serde_json::to_value(&projected).unwrap();
+    assert_eq!(
+        encoded["parts"][2]["provider_data"],
+        json!({"origin":origin(), "parts":[call(Some("call-signature"))]})
+    );
+    let restored: Content = serde_json::from_value(encoded).unwrap();
+    assert_eq!(restored.role, projected.role);
+    assert_eq!(restored.parts, projected.parts);
+    assert!(restored.has_function_calls());
+    assert_eq!(restored.for_model().parts, projected.for_model().parts);
+    let mut sent = vec![restored];
+    for_provider(&mut sent, &origin());
+    assert_eq!(&sent[0].parts[..3], &content().parts);
+}
+
+#[test]
+fn rejects_collection_envelopes() {
+    let part = call(Some("call-signature"));
+    for data in [
+        json!({"origin":origin(), "parts":[]}),
+        json!({"origin":origin(), "parts":[part, part]}),
+        json!({"origin":origin(), "parts":part}),
+        json!({"origin":origin(), "part":part}),
+        json!({"origin":origin(), "name":"lookup", "args":{}}),
+    ] {
+        assert!(serde_json::from_value::<ProviderData>(data.clone()).is_err(), "{data}");
+        assert!(serde_json::from_value::<Part>(json!({"provider_data":data})).is_err());
     }
 }

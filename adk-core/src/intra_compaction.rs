@@ -111,9 +111,7 @@ fn estimate_event_chars(event: &Event) -> usize {
 /// Estimate the character count of a single content part.
 fn estimate_part_chars(part: &Part) -> usize {
     match part {
-        Part::ProviderData { provider_data } => {
-            provider_data.parts.iter().map(estimate_part_chars).sum()
-        }
+        Part::ProviderData { provider_data } => estimate_part_chars(&provider_data.parts[0]),
         Part::Text { text } => text.len(),
         Part::Thinking { thinking, .. } => thinking.len(),
         Part::FunctionCall { name, args, .. } => {
@@ -264,6 +262,21 @@ mod tests {
         let tokens = estimate_tokens(&[event], 4);
         // "get_weather" = 11 chars + {"city":"NYC"} serialized
         assert!(tokens > 0);
+    }
+
+    #[test]
+    fn counts_wrapped_parts() {
+        let original = Content::new("model").with_thinking("Private reasoning").with_text("Answer");
+        let mut event = Event::new("inv-1");
+        event.set_content(original.clone());
+        let expected = estimate_tokens(std::slice::from_ref(&event), 4);
+        event.set_content(crate::history::with_provider_parts(
+            &original,
+            Some(&serde_json::json!({"provider_origin":{
+                "provider":"provider", "model":"model", "scope":"owner"
+            }})),
+        ));
+        assert_eq!(estimate_tokens(&[event], 4), expected);
     }
 
     #[test]

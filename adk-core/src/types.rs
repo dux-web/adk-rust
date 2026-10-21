@@ -355,17 +355,17 @@ pub struct ProviderOrigin {
     pub scope: String,
 }
 
-/// Provider-specific parts with their replay ownership.
+/// A provider-specific part with its replay ownership.
 ///
 /// This is internal conversation data, not a provider wire object. Model
 /// integrations resolve it with [`crate::history::for_provider`] before sending
 /// a request. Ordinary text and unsigned function calls remain outside it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderData {
-    /// Ownership captured when the provider produced the parts.
+    /// Ownership captured when the provider produced the part.
     pub origin: Option<ProviderOrigin>,
-    /// Opaque replay parts, in their original order.
-    pub parts: Vec<Part>,
+    /// The single opaque replay part, serialized as a one-element array.
+    pub parts: Box<[Part; 1]>,
 }
 
 /// A single part of a [`Content`] message.
@@ -757,8 +757,7 @@ impl Part {
     pub fn provider_part(&self) -> &Self {
         match self {
             Self::ProviderData { provider_data }
-                if provider_data.parts.len() == 1
-                    && !matches!(provider_data.parts[0], Self::ProviderData { .. }) =>
+                if !matches!(provider_data.parts[0], Self::ProviderData { .. }) =>
             {
                 &provider_data.parts[0]
             }
@@ -768,8 +767,7 @@ impl Part {
 
     fn provider_part_mut(&mut self) -> &mut Self {
         let wrapped = matches!(self, Self::ProviderData { provider_data }
-            if provider_data.parts.len() == 1
-                && !matches!(provider_data.parts[0], Self::ProviderData { .. }));
+            if !matches!(provider_data.parts[0], Self::ProviderData { .. }));
         if wrapped && let Self::ProviderData { provider_data } = self {
             return &mut provider_data.parts[0];
         }
