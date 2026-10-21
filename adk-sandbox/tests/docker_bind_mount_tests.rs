@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use adk_sandbox::workspace::{DockerClient, Manifest, SandboxClient};
+use adk_sandbox::workspace::{DockerClient, Manifest, ManifestEntry, SandboxClient};
 
 const IMAGE: &str = "alpine:3.20";
 
@@ -27,16 +27,22 @@ fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
 #[tokio::test]
 #[ignore = "needs a Docker daemon and the alpine:3.20 image"]
 async fn the_container_and_the_host_share_the_mounted_workspace() {
+    use std::os::unix::fs::MetadataExt;
+
     let (_workspace_guard, workspace) = canonical_tempdir();
     let (_reference_guard, reference) = canonical_tempdir();
     std::fs::write(workspace.join("from-host.txt"), "written on the host\n").unwrap();
     std::fs::write(reference.join("pinned.txt"), "read-only reference\n").unwrap();
+    // Root without capabilities cannot write a directory only its host owner may write, so
+    // the container runs as that owner.
+    let owner = std::fs::metadata(&workspace).unwrap();
 
     let client = DockerClient::with_image(IMAGE)
         .await
         .expect("a Docker daemon is running")
         .with_bind_mount(&workspace, "/workspace", false)
-        .with_bind_mount(&reference, "/reference", true);
+        .with_bind_mount(&reference, "/reference", true)
+        .with_user(format!("{}:{}", owner.uid(), owner.gid()));
     let handle = client.provision(&Manifest { entries: vec![] }).await.expect("provision");
     let session = client.start(&handle).await.expect("start");
 
@@ -67,6 +73,38 @@ async fn the_container_and_the_host_share_the_mounted_workspace() {
     );
 }
 
+/// The container runs as the user the client names, so what it writes into the mounted
+/// workspace belongs to that user on the host.
+#[tokio::test]
+#[ignore = "needs a Docker daemon and the alpine:3.20 image"]
+async fn the_container_runs_as_the_configured_user() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_guard, workspace) = canonical_tempdir();
+    let uid = std::fs::metadata(&workspace).unwrap().uid();
+    let gid = std::fs::metadata(&workspace).unwrap().gid();
+
+    let client = DockerClient::with_image(IMAGE)
+        .await
+        .expect("a Docker daemon is running")
+        .with_bind_mount(&workspace, "/workspace", false)
+        .with_user(format!("{uid}:{gid}"));
+    let handle = client.provision(&Manifest { entries: vec![] }).await.expect("provision");
+    let session = client.start(&handle).await.expect("start");
+
+    let id = session.exec_command("id -u; id -g", None).await;
+    let write = session.exec_command("echo owned > owned.txt", None).await;
+    client.stop(&handle).await.expect("stop");
+
+    let id = id.expect("exec");
+    assert_eq!(id.exit_code, 0, "{id:?}");
+    assert_eq!(id.stdout, format!("{uid}\n{gid}\n"));
+    let write = write.expect("exec");
+    assert_eq!(write.exit_code, 0, "{write:?}");
+    let owned = std::fs::metadata(workspace.join("owned.txt")).unwrap();
+    assert_eq!((owned.uid(), owned.gid()), (uid, gid), "the host user owns the file");
+}
+
 #[tokio::test]
 #[ignore = "needs a Docker daemon and the alpine:3.20 image"]
 async fn a_missing_host_path_fails_provisioning() {
@@ -79,4 +117,44 @@ async fn a_missing_host_path_fails_provisioning() {
     let result = client.provision(&Manifest { entries: vec![] }).await;
 
     assert!(matches!(result, Err(adk_sandbox::SandboxError::ProvisionFailed { .. })), "{result:?}");
+}
+
+/// A provisioning that fails after its container was created removes that container, so
+/// nothing is left running on the daemon with no handle to stop it.
+#[tokio::test]
+#[ignore = "needs a Docker daemon and the alpine:3.20 image"]
+async fn a_failed_provisioning_leaves_no_container() {
+    use bollard::container::ListContainersOptions;
+
+    let (_guard, workspace) = canonical_tempdir();
+    let client = DockerClient::with_image(IMAGE)
+        .await
+        .expect("a Docker daemon is running")
+        .with_bind_mount(&workspace, "/workspace", false);
+    // Manifest paths are checked once the container is up, so this entry fails a
+    // provisioning whose container already exists.
+    let manifest = Manifest {
+        entries: vec![ManifestEntry::File { path: "../escape.txt".into(), content: b"x".to_vec() }],
+    };
+
+    let result = client.provision(&manifest).await;
+
+    assert!(result.is_err(), "{result:?}");
+    // Only this provisioning's container mounts this workspace; the containers of tests
+    // running beside this one mount their own.
+    let docker =
+        bollard::Docker::connect_with_local_defaults().expect("a Docker daemon is running");
+    let containers = docker
+        .list_containers(Some(ListContainersOptions::<String> { all: true, ..Default::default() }))
+        .await
+        .expect("list containers");
+    let source = workspace.to_str().unwrap();
+    let left: Vec<String> = containers
+        .iter()
+        .filter(|container| {
+            container.mounts.iter().flatten().any(|mount| mount.source.as_deref() == Some(source))
+        })
+        .filter_map(|container| container.id.clone())
+        .collect();
+    assert!(left.is_empty(), "containers left by a failed provisioning: {left:?}");
 }

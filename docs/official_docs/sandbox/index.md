@@ -287,6 +287,7 @@ The `workspace` feature adds a `provision → session → exec → snapshot → 
 | Environment | Cleared except `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`, `TERM` | Image environment |
 | Timeout | Kills the command's process group | Kills the command's process tree inside the container |
 | Host directories | The host filesystem | None by default; `with_bind_mount(host, container, read_only)` mounts one into every container |
+| User | Host user | The image's default (usually `root`, which without capabilities cannot write a host directory only its owner may write); `with_user("1000:1000")` runs commands as that user, so a bind-mounted workspace is writable and what the container writes belongs to the host user |
 
 `DockerClient::with_bind_mount` gives commands in the container and file tools on the host
 one view of a workspace:
@@ -315,7 +316,9 @@ remounted. Content under a mount stays on the host, so `snapshot` does not captu
 `resume` mounts the same host paths again.
 
 `LocalUnixClient` is not an isolation boundary; use `DockerClient` for untrusted commands.
-`GitRepo` manifest entries need a `DockerClient` network mode other than `none`.
+`GitRepo` manifest entries need a `DockerClient` network mode other than `none`. A
+provisioning that fails after its container was created removes that container before the
+error is returned.
 
 A `LocalUnixSession` file operation fails with `SandboxError::PathTraversal` when its
 path leaves the workspace: an absolute path, a `..` that escapes, a symlink that resolves
