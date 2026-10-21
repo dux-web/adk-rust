@@ -179,7 +179,7 @@ async fn serve_http(
     let mut captured = http::HeaderMap::new();
     for line in std::str::from_utf8(&data[..end]).unwrap().lines().skip(1) {
         if let Some((name, value)) = line.split_once(':') {
-            captured.insert(
+            captured.append(
                 http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
                 http::HeaderValue::from_str(value.trim()).unwrap(),
             );
@@ -196,6 +196,13 @@ async fn serve_http(
     }
     let request: Value = serde_json::from_slice(&data[end..end + length]).unwrap();
     log.lock().unwrap().push(request.clone());
+    let steps = script(&request);
+    if let Some(Step::Refuse(status)) = steps.first() {
+        let body = json!({"error":{"message":"temporary failure","type":"server_error"}});
+        let body = body.to_string();
+        socket.write_all(format!("HTTP/1.1 {status} Refused\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        return;
+    }
     if socket
         .write_all(
             b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
@@ -205,7 +212,7 @@ async fn serve_http(
     {
         return;
     }
-    for step in script(&request) {
+    for step in steps {
         match step {
             Step::Send(value) => {
                 if socket.write_all(format!("data: {value}\n\n").as_bytes()).await.is_err() {
@@ -910,6 +917,135 @@ async fn expiry_preserves_an_active_lease() {
         assert!(!transport.is_connected());
         assert!(collect(&transport, "second").await.1.is_none());
         assert_eq!(server.handshakes(), 2);
+    }
+}
+
+#[tokio::test]
+async fn routes_final_background_requests() {
+    use adk_core::{Content, GenerateContentConfig, Llm, LlmRequest};
+    use adk_model::openai::{OpenAIResponsesClient, WsOptions};
+    use futures::TryStreamExt;
+
+    for (model, explicit, adapted, background) in [
+        ("test-model", Some(true), None, true),
+        ("o3-deep-research", None, None, true),
+        ("test-model", None, Some(true), true),
+        ("test-model", Some(true), Some(false), false),
+        ("o3-deep-research", None, Some(false), false),
+        ("test-model", None, None, false),
+    ] {
+        let server = Server::combined(Arc::new(|_| answer("done")), accept_all(), true).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let client = OpenAIResponsesClient::new(
+            OpenAIResponsesConfig::new("sk-test", model).with_base_url(&server.base),
+        )
+        .unwrap()
+        .with_retry_config(RetryConfig::disabled())
+        .with_request_adapter(Arc::new(move |body, _| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            if let Some(background) = adapted {
+                body["background"] = json!(background);
+            }
+            Ok(())
+        }))
+        .with_websocket(WsOptions::default());
+        let mut request = LlmRequest::new(model, vec![Content::new("user").with_text("first")]);
+        if let Some(background) = explicit {
+            let mut config = GenerateContentConfig::default();
+            config.extensions.insert("openai".into(), json!({"background":background}));
+            request.config = Some(config);
+        }
+        let responses: Vec<_> =
+            client.generate_content(request, true).await.unwrap().try_collect().await.unwrap();
+        assert_eq!(text(&responses), "done");
+        assert!(responses.last().unwrap().turn_complete);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            server.handshakes(),
+            usize::from(!background),
+            "{model}/{explicit:?}/{adapted:?}"
+        );
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        if background {
+            assert_eq!(requests[0]["background"], true);
+            assert_eq!(requests[0]["stream"], true);
+            assert!(requests[0].get("type").is_none());
+        } else {
+            assert_eq!(requests[0]["type"], "response.create");
+            assert!(requests[0].get("background").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn fallback_retries_adapt_original_requests() {
+    use adk_core::{Content, Llm, LlmRequest};
+    use adk_model::openai::{OpenAIResponsesClient, WsOptions};
+    use futures::TryStreamExt;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let observed = attempts.clone();
+    let server = Server::combined(
+        Arc::new(move |_| {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![Step::Refuse(503)]
+            } else {
+                answer("done")
+            }
+        }),
+        Arc::new(|_| Some(426)),
+        true,
+    )
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapted = calls.clone();
+    let client = OpenAIResponsesClient::new(server.config())
+        .unwrap()
+        .with_retry_config(no_retry_delay().with_max_retries(1))
+        .with_default_headers(http::HeaderMap::from_iter([(
+            http::HeaderName::from_static("x-original"),
+            http::HeaderValue::from_static("frozen"),
+        )]))
+        .unwrap()
+        .with_request_adapter(Arc::new(move |body, headers| {
+            let attempt = adapted.fetch_add(1, Ordering::SeqCst) + 1;
+            body["input"].as_array_mut().unwrap().push(json!({
+                "role":"user", "content":format!("nonce {attempt}")
+            }));
+            headers.append("x-nonce", http::HeaderValue::from_str(&attempt.to_string()).unwrap());
+            Ok(())
+        }))
+        .with_websocket(WsOptions::default());
+    let responses: Vec<_> = client
+        .generate_content(
+            LlmRequest::new("test-model", vec![Content::new("user").with_text("first")]),
+            true,
+        )
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(text(&responses), "done");
+    assert!(responses.last().unwrap().turn_complete);
+    assert_eq!(server.handshakes(), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "only a new HTTP attempt reruns adaptation");
+    let requests = server.requests.lock().unwrap();
+    let headers = server.headers.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(headers.len(), 2);
+    assert_eq!(requests[0]["input"][0], requests[1]["input"][0]);
+    for (index, (body, headers)) in requests.iter().zip(headers.iter()).enumerate() {
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+        assert_eq!(body["input"][1]["content"], format!("nonce {}", index + 1));
+        assert_eq!(headers["x-original"], "frozen");
+        let values: Vec<_> =
+            headers.get_all("x-nonce").iter().map(|value| value.to_str().unwrap()).collect();
+        assert_eq!(values, vec![(index + 1).to_string()]);
     }
 }
 

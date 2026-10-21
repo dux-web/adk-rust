@@ -209,6 +209,9 @@ three-value `ReasoningEffort` (`Low`, `Medium`, `High`).
 HTTP is the default. With `openai-ws`, call
 `OpenAIResponsesClient::with_websocket(WsOptions::default())` to prefer a persistent socket for
 streaming generations. Request adapters and header observers apply to both transports.
+The final adapted `background: true` selects HTTP, including streaming background requests.
+The first HTTP fallback reuses the WebSocket attempt's adapted body and headers; each later
+HTTP retry adapts the original request again.
 `preconnect()` performs only the handshake; the transport closes an unused socket after
 `WsOptions::preconnect_timeout` (25 seconds by default). The socket URL appends `/responses` to
 the base path, so `https://gw.example/openai` uses `wss://gw.example/openai/responses`.

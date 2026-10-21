@@ -1068,19 +1068,31 @@ impl OpenAIResponsesClient {
         prepared: Option<(serde_json::Value, http::HeaderMap)>,
     ) -> Result<LlmResponseStream, AdkError> {
         let idle_timeout = Arc::new(AtomicBool::new(false));
-        let (headers, body) = match prepared {
-            Some((body, headers)) => (headers, Some(body)),
-            None => (self.default_headers.clone(), None),
+        let mut prepared = prepared;
+        let base_client = self.client.clone();
+        let transport = self.transport.clone();
+        let default_headers = self.default_headers.clone();
+        let request_idle_timeout = stream.then(|| idle_timeout.clone());
+        let uses_max_reasoning = matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max));
+        let open_responses_mode = self.open_responses_mode;
+        let adapter = self.adapter.clone();
+        let observer = self.observer.clone();
+        let mut next_client = move || {
+            // Only the first fallback shares the WebSocket attempt's adaptation.
+            let (headers, body) = match prepared.take() {
+                Some((body, headers)) => (headers, Some(body)),
+                None => (default_headers.clone(), None),
+            };
+            with_transport(
+                base_client.clone(),
+                &transport,
+                RequestState { headers, body, idle_timeout: request_idle_timeout.clone() },
+                uses_max_reasoning,
+                open_responses_mode,
+                adapter.clone(),
+                observer.clone(),
+            )
         };
-        let client = with_transport(
-            self.client.clone(),
-            &self.transport,
-            RequestState { headers, body, idle_timeout: stream.then(|| idle_timeout.clone()) },
-            matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
-            self.open_responses_mode,
-            self.adapter.clone(),
-            self.observer.clone(),
-        );
         if stream {
             // BYOT preserves the caller's stream field, so set it explicitly.
             let mut create_request = create_request;
@@ -1088,7 +1100,7 @@ impl OpenAIResponsesClient {
 
             let event_stream =
                 execute_with_retry(&self.retry_config, is_retryable_model_error, || {
-                    let client = client.clone();
+                    let client = next_client();
                     let request = create_request.clone();
                     async move {
                         client
@@ -1155,7 +1167,7 @@ impl OpenAIResponsesClient {
                     &retry_config,
                     is_retryable_model_error,
                     || {
-                        let client = client.clone();
+                        let client = next_client();
                         let mut req = create_request.clone();
                         req.stream = Some(false);
                         async move {
@@ -1246,6 +1258,18 @@ impl Llm for OpenAIResponsesClient {
                 &mut body,
                 matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             )?;
+            if body.get("background").and_then(serde_json::Value::as_bool) == Some(true) {
+                websocket.observe(super::ws_transport::TransportEvent::Http);
+                return self
+                    .generate_http(
+                        create_request,
+                        stream,
+                        native_tools,
+                        usage_span,
+                        Some((body, headers)),
+                    )
+                    .await;
+            }
             match websocket
                 .send_adapted(
                     body.clone(),

@@ -20,6 +20,13 @@ fn rejects_frames_that_are_not_objects() {
 }
 
 #[test]
+fn rejects_background_requests() {
+    let error = create_event(&json!({"input":[],"background":true})).unwrap_err();
+    assert_eq!(error.code, "model.openai_responses.ws_serialize");
+    assert_eq!(error.category, ErrorCategory::InvalidInput);
+}
+
+#[test]
 fn merges_required_beta_without_losing_caller_values() {
     for values in [
         vec!["caller=v1"],
