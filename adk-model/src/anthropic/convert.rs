@@ -275,13 +275,20 @@ pub fn convert_tools(
 
             let input_schema =
                 decl.get("parameters").cloned().unwrap_or_else(|| adapter.empty_schema());
-            let normalized_schema = cache.normalize(&input_schema);
+            let mut normalized_schema = cache.normalize(&input_schema);
+            let strict = decl.get("strict").and_then(Value::as_bool);
+            if strict != Some(true) {
+                super::schema_adapter::nest_composition(&mut normalized_schema);
+            }
 
             let normalized_name = adapter.normalize_tool_name(name);
 
             let mut tool_param = ToolParam::new(normalized_name.into_owned(), normalized_schema);
             if let Some(desc) = description {
                 tool_param = tool_param.with_description(desc);
+            }
+            if let Some(strict) = strict {
+                tool_param = tool_param.with_strict(strict);
             }
 
             Ok(ToolUnionParam::CustomTool(tool_param))
