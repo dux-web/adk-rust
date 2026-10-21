@@ -578,7 +578,17 @@ fn create_event(body: &Value) -> Result<Value, AdkError> {
         )
         .with_provider("openai-responses")
     })?;
+    if fields.get("background").and_then(Value::as_bool) == Some(true) {
+        return Err(AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::InvalidInput,
+            "model.openai_responses.ws_serialize",
+            "Responses WebSocket does not support background requests",
+        )
+        .with_provider("openai-responses"));
+    }
     fields.remove("stream");
+    // False is foreground; WebSocket has no background field.
     fields.remove("background");
     fields.insert("type".into(), Value::from("response.create"));
     Ok(event)

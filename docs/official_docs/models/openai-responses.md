@@ -604,7 +604,7 @@ A response continued with `previous_response_id` after a reconnect needs `store 
 the connection-local cache of an unstored response is lost with the old connection.
 
 `OpenAIResponsesClient` defaults to HTTP. Its `with_websocket(WsOptions::default())` builder
-selects a persistent socket for streaming generations, using the same request adapter, header
+selects a persistent socket for foreground streaming generations, using the same request adapter, header
 observer and response projection as HTTP. `preconnect()` opens only the handshake. It applies
 the request adapter to a minimal body for the handshake headers; body rewrites such as `max`
 reasoning apply to the generation. The transport closes an unused socket after
@@ -612,6 +612,10 @@ reasoning apply to the generation. The transport closes an unused socket after
 own. Create helper clients without `with_websocket` to keep them on HTTP. Socket reuse compares the complete adapted headers, including authorization. `WsOptions`
 lets the caller observe transport outcomes and own capability policy. Use `WsTransport` for
 standalone typed Responses requests.
+
+The final adapted `background: true` selects HTTP and preserves both background and streaming
+fields. The first HTTP fallback shares the WebSocket attempt's adapted body and headers.
+Later HTTP retries start from the original request and run the adapter again.
 
 The socket URL is the HTTP base URL with a `ws`/`wss` scheme and `/responses` appended:
 `https://api.openai.com/v1` becomes `wss://api.openai.com/v1/responses`, and a gateway path
