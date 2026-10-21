@@ -196,7 +196,10 @@ impl MutableSession {
                     }
                 }
                 OtherAgents::Exclude | OtherAgents::AsContext | OtherAgents::AsOwnTurns => {
-                    let mut mapped_content = content.clone();
+                    let mut mapped_content = adk_core::history::with_provider_parts(
+                        content,
+                        event.llm_response.provider_metadata.as_ref(),
+                    );
                     mapped_content.role = match (event.author.as_str(), content.role.as_str()) {
                         ("user", _) => "user",
                         (_, "function" | "tool") => content.role.as_str(),
