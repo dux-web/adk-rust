@@ -252,7 +252,7 @@ impl WsTransport {
 
     /// Handshake only. It never sends a model generation or a generate=false warmup.
     pub async fn preconnect(&self, headers: HeaderMap) -> Result<(), AdkError> {
-        self.preconnect_observed(headers, None).await
+        self.preconnect_observed(self.authorization(headers)?, None).await
     }
     pub(super) async fn preconnect_observed(
         &self,
@@ -278,13 +278,6 @@ impl WsTransport {
         mut headers: HeaderMap,
         observer: Option<&super::ResponseObserver>,
     ) -> Result<bool, BeforeEvent> {
-        if !headers.contains_key(http::header::AUTHORIZATION) && !self.key.is_empty() {
-            headers.insert(
-                http::header::AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", self.key))
-                    .map_err(|_| before(invalid(), WsRefusal::Definitive))?,
-            );
-        }
         headers.insert("openai-beta", HeaderValue::from_static("responses_websockets=2026-02-06"));
         // Content framing belongs to response.create, not the upgrade request.
         for name in ["content-type", "content-length", "accept"] {
@@ -371,10 +364,27 @@ impl WsTransport {
                 !matches!(tool.get("type").and_then(Value::as_str), Some("function" | "custom"))
             })
         });
-        self.send_adapted(body, HeaderMap::new(), None, native_tools, (false, false))
-            .await
-            .map_err(|failure| failure.error)
+        self.send_adapted(
+            body,
+            self.authorization(HeaderMap::new())?,
+            None,
+            native_tools,
+            (false, false),
+        )
+        .await
+        .map_err(|failure| failure.error)
     }
+    fn authorization(&self, mut headers: HeaderMap) -> Result<HeaderMap, AdkError> {
+        if !headers.contains_key(http::header::AUTHORIZATION) && !self.key.is_empty() {
+            headers.insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", self.key)).map_err(|_| invalid())?,
+            );
+        }
+        Ok(headers)
+    }
+
+    // Request-adapted headers are final; an adapter may intentionally remove authorization.
     pub(super) async fn send_adapted(
         &self,
         body: Value,

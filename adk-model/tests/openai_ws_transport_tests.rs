@@ -556,6 +556,56 @@ async fn client_adapts_before_selecting_transport() {
 }
 
 #[tokio::test]
+async fn adapter_can_remove_default_authorization() {
+    use adk_core::{Content, Llm, LlmRequest};
+    use adk_model::openai::{OpenAIResponsesClient, WsOptions};
+    for fallback in [false, true] {
+        let server = Server::combined(
+            Arc::new(move |request| {
+                if fallback && request["type"] == "response.create" {
+                    vec![Step::Refuse(1008)]
+                } else {
+                    answer("custom authorization")
+                }
+            }),
+            accept_all(),
+            true,
+        )
+        .await;
+        let client = OpenAIResponsesClient::new(server.config())
+            .unwrap()
+            .with_retry_config(RetryConfig::disabled())
+            .with_request_adapter(Arc::new(|_, headers| {
+                headers.remove("authorization");
+                headers.remove("x-api-key");
+                headers.insert("x-provider-token", http::HeaderValue::from_static("custom grant"));
+                Ok(())
+            }))
+            .with_websocket(WsOptions::default());
+        client.preconnect().await.unwrap();
+        let mut stream = client
+            .generate_content(
+                LlmRequest::new("test-model", vec![Content::new("user").with_text("first")]),
+                true,
+            )
+            .await
+            .unwrap();
+        let mut complete = false;
+        while let Some(response) = stream.next().await {
+            complete |= response.unwrap().turn_complete;
+        }
+        assert!(complete);
+        let headers = server.headers.lock().unwrap();
+        assert_eq!(headers.len(), if fallback { 2 } else { 1 });
+        for headers in headers.iter() {
+            assert_eq!(headers["x-provider-token"], "custom grant");
+            assert!(!headers.contains_key("authorization"));
+            assert!(!headers.contains_key("x-api-key"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn continuation_uses_only_the_new_input() {
     let server = Server::start(Arc::new(|_| answer("answer")), accept_all()).await;
     let transport = WsTransport::lazy(&server.base, "key", Default::default());
@@ -573,6 +623,7 @@ async fn continuation_uses_only_the_new_input() {
         response.unwrap();
     }
     let requests = server.requests.lock().unwrap();
+    assert_eq!(server.headers.lock().unwrap()[0]["authorization"], "Bearer key");
     assert_eq!(requests[1]["previous_response_id"], "resp_1");
     assert_eq!(requests[1]["input"], json!([{"type":"message","role":"user","content":"next"}]));
     assert_eq!(server.handshakes(), 1);
