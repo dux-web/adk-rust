@@ -12,6 +12,52 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{Content, Event, Part};
 
+/// Adds provider-owned replay parts to a copy of an assistant's content.
+///
+/// Providers can keep opaque continuation items in `conversation_history_parts`,
+/// either at the metadata root or under `openai`. These parts belong in model
+/// history alongside the visible answer, even when no reasoning summary exists.
+/// Already present parts are retained once, in their original order. The source
+/// content and metadata remain unchanged.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_core::{Content, Part};
+/// use adk_core::history::with_provider_parts;
+/// use serde_json::json;
+///
+/// let content = Content::new("model").with_text("Done");
+/// let metadata = json!({"openai":{"conversation_history_parts":[{
+///     "server_tool_call":{
+///         "type":"reasoning", "id":"rs_1", "summary":[],
+///         "encrypted_content":"opaque"
+///     }
+/// }]}});
+/// let history = with_provider_parts(&content, Some(&metadata));
+/// assert_eq!(content.parts.len(), 1);
+/// assert_eq!(history.parts.len(), 2);
+/// assert!(matches!(history.parts[1], Part::ServerToolCall { .. }));
+/// ```
+pub fn with_provider_parts(content: &Content, metadata: Option<&serde_json::Value>) -> Content {
+    let mut content = content.clone();
+    let parts = metadata
+        .and_then(|metadata| {
+            metadata.get("conversation_history_parts").or_else(|| {
+                metadata.get("openai").and_then(|openai| openai.get("conversation_history_parts"))
+            })
+        })
+        .and_then(serde_json::Value::as_array);
+    for part in parts.into_iter().flatten() {
+        if let Ok(part) = serde_json::from_value::<Part>(part.clone())
+            && !content.parts.contains(&part)
+        {
+            content.parts.push(part);
+        }
+    }
+    content
+}
+
 /// Marks where a quoted payload from another agent starts.
 pub const QUOTED_CONTENT_BEGIN: &str = "<<<BEGIN_QUOTED_AGENT_CONTENT>>>";
 /// Marks where a quoted payload from another agent ends.
@@ -323,6 +369,31 @@ mod tests {
     use super::*;
     use crate::FunctionResponseData;
     use serde_json::json;
+
+    #[test]
+    fn provider_parts_preserve_order_without_duplicates() {
+        let replay = Part::ServerToolCall {
+            server_tool_call: json!({"type":"reasoning","id":"rs_1","summary":[],
+                "encrypted_content":"opaque +/ bytes"}),
+        };
+        let call = Part::FunctionCall {
+            name: "lookup".into(),
+            args: json!({"query":"example"}),
+            id: Some("call_1".into()),
+            thought_signature: None,
+        };
+        let original = Content { role: "model".into(), parts: vec![call.clone()] };
+        for metadata in [
+            json!({"conversation_history_parts":[replay, call, replay, {"invalid":true}]}),
+            json!({"openai":{"conversation_history_parts":[replay, call, replay]}}),
+        ] {
+            let projected = with_provider_parts(&original, Some(&metadata));
+            assert_eq!(projected.parts, [call.clone(), replay.clone()]);
+            assert_eq!(with_provider_parts(&projected, Some(&metadata)).parts, projected.parts);
+            assert_eq!(original.parts.as_slice(), std::slice::from_ref(&call));
+        }
+        assert_eq!(with_provider_parts(&original, None).parts, original.parts);
+    }
 
     fn call(id: Option<&str>, name: &str) -> Event {
         let mut event = Event::new("inv");
