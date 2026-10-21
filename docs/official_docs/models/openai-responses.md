@@ -602,9 +602,27 @@ async fn main() -> anyhow::Result<()> {
 A response continued with `previous_response_id` after a reconnect needs `store = true`:
 the connection-local cache of an unstored response is lost with the old connection.
 
-`OpenAIResponsesClient` always uses HTTP. The former `OpenAIResponsesConfig::with_transport`
-option and the `ResponsesTransport` enum were never read and are removed; use `WsTransport`
-for WebSocket mode.
+`OpenAIResponsesClient` defaults to HTTP. Its `with_websocket(WsOptions::default())` builder
+selects a persistent socket for streaming generations, using the same request adapter, header
+observer and response projection as HTTP. `preconnect()` opens only the handshake and closes an
+unused socket after 25 seconds. Create helper clients without `with_websocket` to keep them on
+HTTP. Socket reuse compares the complete adapted headers, including authorization. `WsOptions`
+lets the caller observe transport outcomes and own capability policy. Use `WsTransport` for
+standalone typed Responses requests.
+
+`WsOptions::first_event_timeout` defaults to 15 seconds. Ping and pong frames do not
+extend this deadline. Without a first provider event, the client can fall back to HTTP even
+if the server already accepted the WebSocket request, which may generate and bill twice.
+After any provider event confirms acceptance, a socket delivery failure or read timeout is
+reported without automatically resending the generation. Explicit provider failures retain
+their error and retry classification.
+
+System and environment proxy rules, including `NO_PROXY`, match the HTTP client's policy.
+A destination that requires a proxy uses HTTP; a bypassed destination can use WebSocket.
+
+Secure WebSocket connections use the platform certificate verifier and the default HTTP client's
+crypto provider selection. A certificate rejection is a definitive refusal; capability policy can
+remember it after a successful HTTP fallback.
 
 `examples/gemini_ws_outcomes` runs each WebSocket case against a scripted local server and,
 when `OPENAI_API_KEY` is set, against the live endpoint:
