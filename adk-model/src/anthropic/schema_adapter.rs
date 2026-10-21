@@ -45,7 +45,7 @@
 use std::borrow::Cow;
 
 use adk_core::{SchemaAdapter, schema_utils};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Schema adapter for Anthropic's Claude models (near pass-through).
 ///
@@ -97,10 +97,104 @@ impl SchemaAdapter for AnthropicSchemaAdapter {
     }
 }
 
+/// Nests root `anyOf`, `oneOf` and `allOf` of a non-strict tool under `not`/`not`.
+///
+/// The Messages API rejects these combiners at the root of `input_schema`; double
+/// negation keeps their constraints and the visible root fields. Anthropic documents
+/// neither root `not` nor `not` for strict tools, so [`convert_tools`] leaves strict
+/// declarations unchanged. Schemas with unevaluated annotations or references whose
+/// targets could move are also left unchanged rather than silently weakened.
+///
+/// [`convert_tools`]: super::convert::convert_tools
+pub(super) fn nest_composition(schema: &mut Value) {
+    if !can_nest(schema) {
+        return;
+    }
+    let Some(fields) = schema.as_object_mut() else {
+        return;
+    };
+    let mut composition = Map::new();
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        if let Some(value) = fields.remove(keyword) {
+            composition.insert(keyword.into(), value);
+        }
+    }
+    if !composition.is_empty() {
+        if let Some(value) = fields.remove("not") {
+            composition.insert("not".into(), value);
+        }
+        fields.insert("not".into(), serde_json::json!({"not": composition}));
+    }
+}
+
+fn can_nest(value: &Value) -> bool {
+    match value {
+        Value::Object(fields) => {
+            // Negation does not forward evaluation annotations. Definition
+            // pointers stay at the root; other reference targets may move.
+            !fields.contains_key("unevaluatedProperties")
+                && !fields.contains_key("unevaluatedItems")
+                && ["$ref", "$dynamicRef", "$recursiveRef"].into_iter().all(|keyword| {
+                    fields.get(keyword).and_then(Value::as_str).is_none_or(|reference| {
+                        reference.starts_with("#/$defs/") || reference.starts_with("#/definitions/")
+                    })
+                })
+                && fields.values().all(can_nest)
+        }
+        Value::Array(items) => items.iter().all(can_nest),
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn nests_root_composition() {
+        let adapter = AnthropicSchemaAdapter;
+        for keyword in ["oneOf", "anyOf", "allOf"] {
+            let mut schema = json!({
+                "type":"object",
+                "properties":{"action":{"enum":["read","write"]},"value":{"type":"string"}},
+                "required":["action"],
+                "additionalProperties":false,
+                "not":{"required":["blocked"]}
+            });
+            schema[keyword] = json!([
+                {"type":"object","properties":{"action":{"const":"read"}},"required":["action"]},
+                {"type":"object","properties":{"action":{"const":"write"}},"required":["action","value"]}
+            ]);
+            let mut normalized = adapter.normalize_schema(schema.clone());
+            nest_composition(&mut normalized);
+            assert!(normalized.get(keyword).is_none());
+            assert_eq!(normalized["properties"], schema["properties"]);
+            assert_eq!(normalized["required"], schema["required"]);
+            assert_eq!(normalized["additionalProperties"], false);
+            assert_eq!(normalized["not"]["not"][keyword], schema[keyword]);
+            assert_eq!(normalized["not"]["not"]["not"], schema["not"]);
+            let mut again = normalized.clone();
+            nest_composition(&mut again);
+            assert_eq!(again, normalized);
+        }
+    }
+
+    #[test]
+    fn retains_location_sensitive_composition() {
+        let adapter = AnthropicSchemaAdapter;
+        for constraint in [
+            json!({"unevaluatedProperties":false}),
+            json!({"unevaluatedItems":false}),
+            json!({"$ref":"#/oneOf/0"}),
+            json!({"$dynamicRef":"#node"}),
+        ] {
+            let schema = json!({"type":"object","oneOf":[constraint]});
+            let mut nested = adapter.normalize_schema(schema.clone());
+            nest_composition(&mut nested);
+            assert_eq!(nested, schema);
+        }
+    }
 
     #[test]
     fn test_strips_schema_keyword() {

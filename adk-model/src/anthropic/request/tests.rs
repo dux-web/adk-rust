@@ -91,6 +91,66 @@ async fn mount(server: &MockServer, streaming: bool, count: u64) {
 }
 
 #[tokio::test]
+async fn preserves_composed_tool_parameters() {
+    for streaming in [false, true] {
+        let server = MockServer::start().await;
+        mount(&server, streaming, 1).await;
+        let schema = json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["read","write"]},
+                "value":{"type":"string","description":"Required when writing"}
+            },
+            "required":["action"],
+            "additionalProperties":false,
+            "oneOf":[
+                {"type":"object","properties":{"action":{"const":"read"}},"required":["action"],"additionalProperties":false},
+                {"type":"object","properties":{"action":{"const":"write"},"value":{"type":"string"}},"required":["action","value"],"additionalProperties":false}
+            ]
+        });
+        let mut request = request();
+        request.config = None;
+        request.tools.insert(
+            "composed".into(),
+            json!({"description":"Read or write a value","parameters":schema,"strict":false}),
+        );
+        // Anthropic documents no `not` keyword for strict tools.
+        request.tools.insert(
+            "strict_composed".into(),
+            json!({"description":"Read or write a value","parameters":schema,"strict":true}),
+        );
+        request.tools.insert(
+            "unspecified".into(),
+            json!({"description":"Read or write a value","parameters":schema}),
+        );
+        client(&server)
+            .generate_content(request.clone(), streaming)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        let body: Value = serde_json::from_slice(&received[0].body).unwrap();
+        let input = &body["tools"][0]["input_schema"];
+        for keyword in ["oneOf", "allOf", "anyOf"] {
+            assert!(input.get(keyword).is_none());
+        }
+        assert_eq!(input["type"], "object");
+        assert_eq!(input["properties"], schema["properties"]);
+        assert_eq!(input["required"], schema["required"]);
+        assert_eq!(input["not"]["not"]["oneOf"], schema["oneOf"]);
+        assert_eq!(body["tools"][0]["strict"], false);
+        assert_eq!(body["tools"][1]["input_schema"], schema);
+        assert_eq!(body["tools"][1]["strict"], true);
+        assert_eq!(body["tools"][2]["input_schema"], *input);
+        assert!(body["tools"][2].get("strict").is_none());
+        assert_eq!(request.tools["composed"]["parameters"], schema);
+    }
+}
+
+#[tokio::test]
 async fn replaces_body_and_headers() {
     for streaming in [false, true] {
         let server = MockServer::start().await;
