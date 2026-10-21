@@ -602,9 +602,12 @@ async fn main() -> anyhow::Result<()> {
 A response continued with `previous_response_id` after a reconnect needs `store = true`:
 the connection-local cache of an unstored response is lost with the old connection.
 
-`OpenAIResponsesClient` always uses HTTP. The former `OpenAIResponsesConfig::with_transport`
-option and the `ResponsesTransport` enum were never read and are removed; use `WsTransport`
-for WebSocket mode.
+`OpenAIResponsesClient` defaults to HTTP. Its `with_websocket(WsOptions::default())` builder
+selects a persistent socket for streaming generations, using the same request adapter, header
+observer and response projection as HTTP. `preconnect()` opens only the handshake;
+`http_only()` keeps a helper generation on HTTP. `WsOptions` lets the caller observe transport
+outcomes and bind capability and credential revisions to its own lifecycle. Use `WsTransport`
+for standalone typed Responses requests.
 
 `examples/gemini_ws_outcomes` runs each WebSocket case against a scripted local server and,
 when `OPENAI_API_KEY` is set, against the live endpoint:
