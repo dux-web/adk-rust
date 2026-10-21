@@ -79,7 +79,9 @@ pub enum TransportEvent {
 pub struct WsOptions {
     /// TCP, TLS and upgrade deadline.
     pub connect_timeout: Duration,
-    /// Maximum interval without any WebSocket frame.
+    /// Maximum wait for the first provider event; control frames do not restart it.
+    pub first_event_timeout: Duration,
+    /// Maximum interval without any WebSocket frame after the provider acknowledges the request.
     pub read_timeout: Duration,
     /// Idle lifetime checked at a request boundary.
     pub idle_timeout: Duration,
@@ -96,6 +98,7 @@ impl Default for WsOptions {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(15),
+            first_event_timeout: Duration::from_secs(15),
             read_timeout: Duration::from_secs(300),
             idle_timeout: Duration::from_secs(240),
             max_age: Duration::from_secs(55 * 60),
@@ -353,6 +356,14 @@ impl WsTransport {
         lease.guard.preconnect_failure = None;
         Ok(false)
     }
+    async fn initial(&self, lease: &mut Lease) -> Result<Value, BeforeEvent> {
+        tokio::time::timeout(
+            self.options.first_event_timeout,
+            read(lease, self.options.read_timeout),
+        )
+        .await
+        .map_err(|_| before(timeout(), WsRefusal::Transient))?
+    }
     /// Send a typed request using the standalone transport API.
     pub async fn send_request(
         &self,
@@ -441,7 +452,7 @@ impl WsTransport {
             .map_err(|error| before(error, WsRefusal::Transient))?;
         }
         lease.guard.first_sent = true;
-        let mut first = read(&mut lease, self.options.read_timeout).await?;
+        let mut first = self.initial(&mut lease).await?;
         if incremental && missing(&first) {
             lease.guard.continuation = None;
             incremental = false;
@@ -461,7 +472,7 @@ impl WsTransport {
                     .await
                     .map_err(|error| before(error, WsRefusal::Transient))?;
             }
-            first = read(&mut lease, self.options.read_timeout).await?;
+            first = self.initial(&mut lease).await?;
         }
         if first.get("type").and_then(Value::as_str) == Some("error")
             && first.pointer("/error/code").or_else(|| first.get("code")).and_then(Value::as_str)
