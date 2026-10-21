@@ -111,6 +111,9 @@ fn estimate_event_chars(event: &Event) -> usize {
 /// Estimate the character count of a single content part.
 fn estimate_part_chars(part: &Part) -> usize {
     match part {
+        Part::ProviderData { provider_data } => {
+            provider_data.parts.iter().map(estimate_part_chars).sum()
+        }
         Part::Text { text } => text.len(),
         Part::Thinking { thinking, .. } => thinking.len(),
         Part::FunctionCall { name, args, .. } => {
@@ -165,7 +168,7 @@ pub fn render_part_for_summary(part: &Part) -> Option<String> {
     let json = |value: &serde_json::Value| value.to_string();
     Some(match part {
         Part::Text { text } => text.clone(),
-        Part::Thinking { .. } => return None,
+        Part::Thinking { .. } | Part::ProviderData { .. } => return None,
         Part::FunctionCall { name, args, .. } => format!("[function call] {name}({})", json(args)),
         Part::FunctionResponse { function_response, .. } => {
             let mut rendered = format!(
