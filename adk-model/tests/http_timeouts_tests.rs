@@ -133,15 +133,23 @@ async fn stalled_call(model: &dyn Llm, model_id: &str, stream: bool) -> adk_core
 async fn openai_compatible_stalled_stream_times_out() {
     use adk_model::{OpenAICompatible, OpenAICompatibleConfig};
     let first = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n";
-    let base = stalling("text/event-stream", first).await;
-    let model = OpenAICompatible::new(OpenAICompatibleConfig::new("key", "m").with_base_url(base))
-        .unwrap()
-        .with_timeouts(timeouts())
-        .unwrap()
-        .with_retry_config(adk_model::RetryConfig::disabled());
-    let error = stalled_error(&model, "m").await;
-    assert_eq!(error.category, ErrorCategory::Timeout, "{error}");
-    assert_eq!(error.code, "model.openai_compat.incomplete_stream");
+    for headers_first in [true, false] {
+        let base = stalling("text/event-stream", first).await;
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-session", "fixture".parse().unwrap());
+        let model =
+            OpenAICompatible::new(OpenAICompatibleConfig::new("key", "m").with_base_url(base))
+                .unwrap()
+                .with_retry_config(adk_model::RetryConfig::disabled());
+        let model = if headers_first {
+            model.with_default_headers(headers).unwrap().with_timeouts(timeouts()).unwrap()
+        } else {
+            model.with_timeouts(timeouts()).unwrap().with_default_headers(headers).unwrap()
+        };
+        let error = stalled_error(&model, "m").await;
+        assert_eq!(error.category, ErrorCategory::Timeout, "{error}");
+        assert_eq!(error.code, "model.openai_compat.incomplete_stream");
+    }
 }
 
 #[cfg(feature = "groq")]
