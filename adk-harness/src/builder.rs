@@ -1871,6 +1871,7 @@ impl HarnessAgentBuilder {
                 #[cfg(feature = "hooks")]
                 hooks: hook_runner,
                 effort: self.effort,
+                #[cfg(feature = "runner")]
                 cache_capable: self.context_caching.then_some(self.cache_capable).flatten(),
                 #[cfg(feature = "payments")]
                 payments: payments.map(|payments| payments.reminder),
