@@ -169,6 +169,7 @@ pub mod pricing;
 
 /// Canonical provider identifiers and metadata.
 pub mod provider;
+pub mod request_retry;
 /// Retry logic with exponential backoff for transient provider errors.
 pub mod retry;
 /// Scripted LLM test double with per-call replies and request capture.

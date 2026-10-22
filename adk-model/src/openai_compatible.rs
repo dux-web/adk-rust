@@ -1,6 +1,7 @@
 //! Shared OpenAI-compatible provider implementation.
 
 use crate::openai::{OpenAIReasoningEffort, convert};
+use crate::request_retry::{RequestRetryConfig, http as request_http};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
 use crate::sse::take_line;
 use adk_core::{
@@ -341,6 +342,7 @@ pub struct OpenAICompatible {
     model: String,
     provider_name: String,
     retry_config: RetryConfig,
+    request_retry: RequestRetryConfig,
     reasoning_effort: Option<OpenAIReasoningEffort>,
     organization_id: Option<String>,
     parallel_tool_calls: bool,
@@ -356,6 +358,7 @@ fn compatible_http_client(
     timeouts
         .apply(reqwest::Client::builder())
         .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .build()
         .map_err(|err| {
             AdkError::new(
@@ -405,6 +408,7 @@ impl OpenAICompatible {
             model: config.model,
             provider_name: config.provider_name,
             retry_config: RetryConfig::default(),
+            request_retry: RequestRetryConfig::default(),
             reasoning_effort,
             organization_id: config.organization_id,
             parallel_tool_calls: config.parallel_tool_calls,
@@ -462,6 +466,13 @@ impl OpenAICompatible {
     pub fn with_timeouts(mut self, timeouts: crate::HttpTimeouts) -> Result<Self, AdkError> {
         self.http = compatible_http_client(timeouts, &self.provider_name)?;
         Ok(self)
+    }
+
+    /// Configures retries of raw HTTP sends before a response body starts.
+    #[must_use]
+    pub fn with_request_retry(mut self, policy: RequestRetryConfig) -> Self {
+        self.request_retry = policy;
+        self
     }
 
     /// Set the retry configuration (builder pattern).
@@ -754,6 +765,7 @@ struct RequestTarget {
     provider_name: String,
     adapter: Option<crate::openai::RequestAdapter>,
     error_codes: ErrorCodes,
+    request_retry: RequestRetryConfig,
 }
 
 /// Send an HTTP POST and handle error status codes.
@@ -774,15 +786,20 @@ async fn send_request(
         provider_name,
         adapter,
         error_codes,
+        request_retry,
     } = target;
     let request_error = |error: reqwest::Error| {
-        AdkError::new(
-            ErrorComponent::Model,
-            crate::http_timeouts::transport_category(&error),
-            error_codes.request,
-            format!("{provider_name} request error: {error}"),
+        request_http::network(
+            AdkError::new(
+                ErrorComponent::Model,
+                crate::http_timeouts::transport_category(&error),
+                error_codes.request,
+                format!("{provider_name} request error: {error}"),
+            )
+            .with_provider(provider_name),
+            &error,
+            "request",
         )
-        .with_provider(provider_name)
     };
     let mut builder = http.post(url).json(body);
     if !api_key.is_empty() {
@@ -801,7 +818,8 @@ async fn send_request(
         *request.body_mut() = Some(body.to_string().into());
         request.headers_mut().remove(reqwest::header::CONTENT_LENGTH);
     }
-    let http_resp = http.execute(request).await.map_err(request_error)?;
+    let http_resp =
+        request_http::send(http, request, *request_retry).await.map_err(request_error)?;
 
     if !http_resp.status().is_success() {
         let status = http_resp.status();
@@ -811,6 +829,7 @@ async fn send_request(
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .and_then(crate::retry::parse_retry_after);
+        let deadline = request_http::deadline(&http_resp);
         let body = http_resp.text().await.unwrap_or_default();
         let error = AdkError::new(
             ErrorComponent::Model,
@@ -823,10 +842,14 @@ async fn send_request(
         )
         .with_upstream_status(status_code)
         .with_provider(provider_name);
-        return Err(crate::retry::with_retry_after(
+        let mut error = crate::retry::with_retry_after(
             crate::error_metadata::from_body(error, &body),
             retry_after,
-        ));
+        );
+        if let Some(deadline) = deadline {
+            error = error.with_retry_deadline(deadline);
+        }
+        return Err(request_http::annotate(error, "request"));
     }
 
     Ok(http_resp)
@@ -915,6 +938,7 @@ impl Llm for OpenAICompatible {
             provider_name: provider_name.clone(),
             adapter: self.request_adapter.clone(),
             error_codes,
+            request_retry: self.request_retry,
         };
         // Text-encoded tool calls are honoured only for tools this request declared.
         let declared_tools: std::collections::HashSet<String> =
@@ -1338,16 +1362,16 @@ impl Llm for OpenAICompatible {
                         let http_resp = send_request(&http, &target, &body).await?;
 
                         let bytes = http_resp.bytes().await.map_err(|e| {
-                            AdkError::new(
+                            request_http::network(AdkError::new(
                                 ErrorComponent::Model,
                                 crate::http_timeouts::transport_category(&e),
                                 error_codes.request,
                                 format!("{provider_name} response could not be read: {e}"),
                             )
-                            .with_provider(&provider_name)
+                            .with_provider(&provider_name), &e, "stream")
                         })?;
                         let raw_json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-                            AdkError::new(
+                            request_http::annotate(AdkError::new(
                                 ErrorComponent::Model,
                                 ErrorCategory::Internal,
                                 error_codes.parse,
@@ -1356,7 +1380,7 @@ impl Llm for OpenAICompatible {
                                     adk_core::json_error_summary(&e)
                                 ),
                             )
-                            .with_provider(&provider_name)
+                            .with_provider(&provider_name), "stream")
                         })?;
 
                         tracing::debug!(

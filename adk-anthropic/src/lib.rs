@@ -61,7 +61,7 @@ pub use cache_control::{
     MAX_CACHE_BREAKPOINTS, apply_cache_control_to_messages, count_system_cache_controls,
     prune_cache_controls_in_messages,
 };
-pub use client::{Anthropic, LoggingStream};
+pub use client::{Anthropic, GenerationExecutor, LoggingStream};
 pub use client_logger::ClientLogger;
 pub use error::{Error, Result};
 pub use json_schema::JsonSchema;

@@ -241,6 +241,7 @@ pub struct AdkError {
     /// Additional structured metadata.
     pub details: Box<ErrorDetails>,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    retry_deadline: Option<std::time::Instant>,
 }
 
 impl fmt::Debug for AdkError {
@@ -296,6 +297,7 @@ impl AdkError {
             retry: RetryHint::for_category(category),
             details: Box::new(ErrorDetails::default()),
             source: None,
+            retry_deadline: None,
         }
     }
 
@@ -309,6 +311,19 @@ impl AdkError {
     pub fn with_retry(mut self, retry: RetryHint) -> Self {
         self.retry = retry;
         self
+    }
+
+    /// Retains the original monotonic server retry deadline across error mappings.
+    #[must_use]
+    pub fn with_retry_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.retry_deadline = Some(deadline);
+        self
+    }
+
+    /// Returns the in-process deadline; it is never serialized as a wall-clock time.
+    #[must_use]
+    pub fn retry_deadline(&self) -> Option<std::time::Instant> {
+        self.retry_deadline
     }
 
     /// Replaces the error details.

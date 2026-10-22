@@ -69,6 +69,7 @@ struct Lifecycle {
 }
 
 struct Failure {
+    value: Value,
     code: Option<String>,
     kind: Option<String>,
 }
@@ -76,6 +77,7 @@ struct Failure {
 impl Failure {
     fn from_value(value: &Value) -> Self {
         Self {
+            value: value.clone(),
             code: value.get("code").and_then(Value::as_str).map(str::to_owned),
             kind: value.get("type").and_then(Value::as_str).map(str::to_owned),
         }
@@ -88,6 +90,30 @@ struct Header {
 }
 
 pub(in crate::openai) fn event(value: Value) -> Result<Event, AdkError> {
+    let kind = value.get("type").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let completed = matches!(kind.as_str(), "response.completed" | "response.done");
+    let reason = value
+        .pointer("/response/incomplete_details/reason")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    event_inner(value).map_err(|mut error| {
+        error.details.metadata.insert("response_completed".into(), completed.into());
+        if kind.len() <= 128
+            && kind.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        {
+            error.details.metadata.insert("provider_event_type".into(), kind.into());
+        }
+        if let Some(reason) = reason
+            && reason.len() <= 128
+            && reason.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+        {
+            error.details.metadata.insert("incomplete_reason".into(), reason.into());
+        }
+        error
+    })
+}
+
+fn event_inner(value: Value) -> Result<Event, AdkError> {
     let kind: Kind = decode(value.clone(), &value, parse::Layer::StreamEvent)?;
     match kind.r#type.as_str() {
         "response.created" | "response.in_progress" | "response.queued" => {
@@ -157,6 +183,14 @@ pub(in crate::openai) fn response(
     body: &Value,
     layer: parse::Layer,
 ) -> Result<Response, AdkError> {
+    let completed = value.get("status").and_then(Value::as_str) == Some("completed");
+    response_inner(value, body, layer).map_err(|mut error| {
+        error.details.metadata.insert("response_completed".into(), completed.into());
+        error
+    })
+}
+
+fn response_inner(value: Value, body: &Value, layer: parse::Layer) -> Result<Response, AdkError> {
     let header: Header = decode(value.clone(), body, layer)?;
     if header.status == Status::Failed {
         let failure = Failure::from_value(value.get("error").unwrap_or(&Value::Null));
@@ -338,10 +372,14 @@ fn stream_error(failure: Option<&Failure>) -> AdkError {
         message,
     )
     .with_provider("openai-responses");
-    crate::error_metadata::with_first_code(
+    let mapped = crate::error_metadata::with_first_code(
         error,
         [failure.and_then(|failure| failure.code.as_deref()), code],
-    )
+    );
+    match failure {
+        Some(failure) => super::responses_transport::provider(mapped, &failure.value),
+        None => mapped,
+    }
 }
 
 fn invalid(cause: &'static str, message: &'static str) -> AdkError {

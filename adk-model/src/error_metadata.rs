@@ -20,6 +20,13 @@ pub(crate) const PROVIDER_ERROR_CODE: &str = "provider_error_code";
 #[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "gemini", feature = "openai"))]
 const MAX_BODY_LEN: usize = 64 * 1024;
 
+/// Records the actual HTTP boundary without inferring it from provider text.
+pub(crate) fn transport(mut error: AdkError, phase: &str) -> AdkError {
+    error.details.metadata.insert("transport".into(), "http".into());
+    error.details.metadata.insert("transport_phase".into(), phase.into());
+    error
+}
+
 fn valid_code(code: &str) -> bool {
     !code.is_empty()
         && code.len() <= 128
@@ -48,7 +55,19 @@ pub(crate) fn with_first_code<'a>(
 #[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "openai"))]
 pub(crate) fn from_body(error: AdkError, body: &str) -> AdkError {
     let code = code_from_body(body);
-    with_code(error, code.as_deref())
+    let mut error = with_code(error, code.as_deref());
+    if body.len() <= MAX_BODY_LEN
+        && let Ok(value) = serde_json::from_str::<Value>(body)
+        && let Some(kind) = value
+            .get("error")
+            .or_else(|| value.get(0).and_then(|value| value.get("error")))
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            .filter(|value| valid_code(value))
+    {
+        error.details.metadata.insert("provider_error_type".into(), kind.into());
+    }
+    error
 }
 
 /// Extracts the provider code from a JSON body shaped `{"error": {...}}` or, as Gemini's
@@ -93,6 +112,17 @@ mod tests {
     #[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "gemini", feature = "openai"))]
     fn body_code(body: Value) -> Option<String> {
         code_from_body(&body.to_string())
+    }
+
+    #[cfg(any(feature = "azure-ai", feature = "deepseek", feature = "openai"))]
+    #[test]
+    fn preserves_code_and_type_independently() {
+        let mapped = from_body(
+            error(),
+            r#"{"error":{"code":"quota_exhausted","type":"insufficient_quota"}}"#,
+        );
+        assert_eq!(mapped.details.metadata["provider_error_code"], "quota_exhausted");
+        assert_eq!(mapped.details.metadata["provider_error_type"], "insufficient_quota");
     }
 
     #[test]

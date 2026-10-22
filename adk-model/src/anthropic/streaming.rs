@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Span;
 
-pub(super) fn responses<S>(events: S) -> LlmResponseStream
+pub(super) fn responses<S>(events: S, recovery: bool) -> LlmResponseStream
 where
     S: Stream<Item = Result<MessageStreamEvent, adk_anthropic::Error>> + Send + 'static,
 {
@@ -21,7 +21,12 @@ where
         // same shape as a transport failure; this flag tells the two apart.
         let saw_error_event = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&saw_error_event);
+        let reported = Arc::new(std::sync::Mutex::new(None));
+        let captured = reported.clone();
         let events = events.inspect(move |event| {
+            if let Ok(MessageStreamEvent::StreamError { error }) = event {
+                *captured.lock().unwrap() = Some((error.error_type.clone(), error.message.clone()));
+            }
             if matches!(event, Ok(MessageStreamEvent::StreamError { .. })) {
                 flag.store(true, Ordering::Relaxed);
             }
@@ -32,6 +37,19 @@ where
         while let Some(event) = events.next().await {
             let event = match event {
                 Ok(event) => event,
+                Err(error) if recovery => {
+                    let mut failure = convert_anthropic_error(error);
+                    if let Some((kind, message)) = reported.lock().unwrap().take() {
+                        failure.details.upstream_status_code = None;
+                        failure.message = adk_core::upstream_excerpt(&message);
+                        failure.details.metadata.insert("provider_event_type".into(), "error".into());
+                        if kind.len() <= 128 && kind.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte)) {
+                            failure.details.metadata.insert("provider_error_type".into(), kind.clone().into());
+                            failure.details.metadata.insert("provider_error_code".into(), kind.into());
+                        }
+                    }
+                    Err(crate::request_retry::http::annotate(failure, "stream"))?
+                }
                 // A mid-stream `error` event (for example `overloaded_error`) aborts
                 // the message; it fails the stream with the category the same error
                 // gets as an HTTP response, so retry policy can act on it.
@@ -81,9 +99,14 @@ where
                     _ => {}
                 },
                 MessageStreamEvent::MessageStop(_) => {
-                    let mut message = events.finalize_partial().map_err(convert_anthropic_error)?;
+                    let mut message = events.finalize_partial().map_err(convert_anthropic_error).map_err(|mut error| {
+                        if recovery { error.details.metadata.insert("response_completed".into(), true.into()); }
+                        error
+                    })?;
                     if message.stop_reason.is_none() {
-                        Err(AdkError::model("Anthropic stream ended without a stop reason"))?;
+                        let mut error = AdkError::model("Anthropic stream ended without a stop reason");
+                        if recovery { error.details.metadata.insert("response_completed".into(), true.into()); }
+                        Err(error)?;
                     }
                     // The accumulator keeps malformed streamed arguments as a JSON
                     // string; a truncated call must never run with substituted input, so
@@ -134,6 +157,6 @@ where
             adk_core::ErrorCategory::Unavailable,
             "model.anthropic.unfinished_stream",
             "Anthropic stream ended before message_stop",
-        ).with_provider("anthropic"))?;
+        ).with_provider("anthropic")).map_err(|error| if recovery { crate::request_retry::http::annotate(error, "stream") } else { error })?;
     })
 }

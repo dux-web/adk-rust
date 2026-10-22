@@ -192,3 +192,89 @@ async fn zero_argument_tool_call_has_empty_object_arguments() {
         }]
     );
 }
+
+#[tokio::test]
+async fn raw_policy_preserves_status_type_and_deadline() {
+    use adk_model::request_retry::RequestRetryConfig;
+    use futures::TryStreamExt;
+    for (status, sends) in [(503, 5), (429, 1), (401, 1)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "0")
+                .set_body_json(serde_json::json!({"error":{"type":"actual_provider_type","message":"fixture failure"}})))
+            .expect(sends).mount(&server).await;
+        let client = AnthropicClient::new(
+            AnthropicConfig::new("test-key", "claude-sonnet-4-6").with_base_url(server.uri()),
+        )
+        .unwrap()
+        .with_retry_config(RetryConfig::disabled())
+        .with_request_retry(RequestRetryConfig {
+            max_retries: 4,
+            initial_delay: std::time::Duration::ZERO,
+        });
+        let error = client
+            .generate_content(
+                LlmRequest::new("claude-sonnet-4-6", vec![Content::new("user").with_text("Hello")]),
+                true,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert_eq!(error.details.upstream_status_code, Some(status));
+        assert_eq!(error.details.metadata["provider_error_type"], "actual_provider_type");
+        assert_eq!(error.details.metadata["transport_phase"], "request");
+        assert_eq!(error.message, "fixture failure");
+        assert!(error.retry_deadline().is_some());
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn recovery_keeps_stream_failures_typed() {
+    use adk_model::request_retry::RequestRetryConfig;
+    for failure in [
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+        "event: content_block_delta\ndata: invalid\n\n",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("{MESSAGE_START}{failure}")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AnthropicClient::new(
+            AnthropicConfig::new("test-key", "claude-sonnet-4-6").with_base_url(server.uri()),
+        )
+        .unwrap()
+        .with_retry_config(RetryConfig::disabled())
+        .with_request_retry(RequestRetryConfig::default());
+        let items: Vec<_> = client
+            .generate_content(
+                LlmRequest::new("claude-sonnet-4-6", vec![Content::new("user").with_text("Hello")]),
+                true,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let error = items.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(error.details.metadata["transport_phase"], "stream");
+        assert!(
+            items
+                .iter()
+                .filter_map(|item| item.as_ref().ok())
+                .all(|response| response.error_code.is_none())
+        );
+        if failure.starts_with("event: error") {
+            assert_eq!(error.details.metadata["provider_error_type"], "overloaded_error");
+            assert_eq!(error.details.upstream_status_code, None);
+        }
+    }
+}

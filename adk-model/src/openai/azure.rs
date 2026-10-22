@@ -103,6 +103,13 @@ impl AzureOpenAIClient {
         self
     }
 
+    /// Configures retries of raw HTTP sends before a response body starts.
+    #[must_use]
+    pub fn with_request_retry(mut self, policy: crate::request_retry::RequestRetryConfig) -> Self {
+        self.inner = self.inner.with_request_retry(policy);
+        self
+    }
+
     /// Set the retry policy while constructing the client.
     #[must_use]
     pub fn with_retry_config(mut self, config: RetryConfig) -> Self {

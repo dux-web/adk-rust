@@ -7,7 +7,7 @@ pub(super) mod wire;
 use super::config::{OpenAIReasoningEffort, OpenAIResponsesConfig, ReasoningSummary};
 use super::responses_convert;
 use super::responses_stream::StreamState;
-use super::{responses_errors, responses_lines};
+use super::{responses_errors, responses_lines, responses_transport};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
 use adk_core::{AdkError, ErrorCategory, ErrorComponent, Llm, LlmRequest, LlmResponseStream};
 use async_stream::try_stream;
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Default)]
 struct RequestState {
+    retry: super::RequestRetryConfig,
     headers: http::HeaderMap,
     body: Option<serde_json::Value>,
     // The SSE SDK reports body read failures as text. This request's transport
@@ -45,6 +46,8 @@ pub struct OpenAIResponsesClient {
     reasoning_effort: Option<OpenAIReasoningEffort>,
     reasoning_summary: Option<ReasoningSummary>,
     retry_config: RetryConfig,
+    request_retry: super::RequestRetryConfig,
+    response_recovery: bool,
     /// HTTP client for direct API calls (compaction, polling, etc.).
     http: reqwest::Client,
     /// Redirect-free HTTP client under the async-openai generation transport.
@@ -156,6 +159,8 @@ impl OpenAIResponsesClient {
             reasoning_effort,
             reasoning_summary: config.reasoning_summary,
             retry_config: RetryConfig::default(),
+            request_retry: super::RequestRetryConfig::default(),
+            response_recovery: false,
             http,
             transport,
             default_headers: http::HeaderMap::new(),
@@ -303,13 +308,63 @@ impl OpenAIResponsesClient {
         self.client = with_transport(
             self.client,
             &self.transport,
-            RequestState { headers: self.default_headers.clone(), ..Default::default() },
+            RequestState {
+                headers: self.default_headers.clone(),
+                retry: self.request_retry,
+                ..Default::default()
+            },
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
             self.observer.clone(),
         );
         Ok(self)
+    }
+
+    /// Configures retries at the raw HTTP send boundary, before consuming SSE.
+    ///
+    /// Use [`RetryConfig::disabled`] for model-level retries when the caller owns
+    /// stream recovery. This independent policy does not retry WebSocket frames.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// use adk_model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig, RequestRetryConfig};
+    /// use adk_model::retry::RetryConfig;
+    /// # fn main() -> Result<(), adk_core::AdkError> {
+    /// let client = OpenAIResponsesClient::new(OpenAIResponsesConfig::new("key", "model"))?
+    ///     .with_retry_config(RetryConfig::disabled())
+    ///     .with_request_retry(RequestRetryConfig { max_retries: 4, ..Default::default() });
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn with_request_retry(mut self, policy: super::RequestRetryConfig) -> Self {
+        self.request_retry = policy;
+        self.client = with_transport(
+            self.client,
+            &self.transport,
+            RequestState {
+                headers: self.default_headers.clone(),
+                retry: policy,
+                ..Default::default()
+            },
+            matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
+            self.open_responses_mode,
+            self.adapter.clone(),
+            self.observer.clone(),
+        );
+        self
+    }
+
+    /// Enable explicit Responses stream recovery semantics.
+    ///
+    /// Disabled by default. When enabled, ordinary standalone errors are ignored,
+    /// `flex_unavailable` remains terminal, incomplete responses retain their
+    /// reason, and an interrupted response continues through the agent's existing
+    /// turn loop. HTTP request retries remain configured separately.
+    pub fn with_response_recovery(mut self, enabled: bool) -> Self {
+        self.response_recovery = enabled;
+        self
     }
 
     /// Set the retry configuration, consuming self.
@@ -345,7 +400,11 @@ impl OpenAIResponsesClient {
         self.client = with_transport(
             self.client,
             &self.transport,
-            RequestState { headers: self.default_headers.clone(), ..Default::default() },
+            RequestState {
+                headers: self.default_headers.clone(),
+                retry: self.request_retry,
+                ..Default::default()
+            },
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
@@ -389,7 +448,11 @@ impl OpenAIResponsesClient {
         self.client = with_transport(
             self.client,
             &self.transport,
-            RequestState { headers: self.default_headers.clone(), ..Default::default() },
+            RequestState {
+                headers: self.default_headers.clone(),
+                retry: self.request_retry,
+                ..Default::default()
+            },
             matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
             self.open_responses_mode,
             self.adapter.clone(),
@@ -449,6 +512,7 @@ fn responses_http_clients(
 ) -> Result<(reqwest_openai::Client, reqwest::Client), AdkError> {
     let transport = reqwest_openai::Client::builder()
         .redirect(reqwest_openai::redirect::Policy::none())
+        .retry(reqwest_openai::retry::never())
         .connect_timeout(timeouts.connect)
         .read_timeout(timeouts.idle)
         .build()
@@ -505,7 +569,6 @@ fn with_transport(
 ) -> async_openai::Client<async_openai::config::OpenAIConfig> {
     use async_openai::error::OpenAIError;
     use async_openai::middleware::{HttpRequestFactory, ReqwestService};
-    use tower::ServiceExt;
 
     let transport = ReqwestService::new(http.clone());
     let service = tower::service_fn(move |factory: HttpRequestFactory| {
@@ -517,6 +580,7 @@ fn with_transport(
             let streaming = Arc::new(AtomicBool::new(false));
             let requested_streaming = streaming.clone();
             let idle_timeout = state.idle_timeout.clone();
+            let retry = state.retry;
             let original = factory.clone();
             let rewritten = HttpRequestFactory::new(move || {
                 let original = original.clone();
@@ -588,12 +652,7 @@ fn with_transport(
                     Ok(request)
                 }
             });
-            let response = transport.oneshot(rewritten).await?;
-            if response.url().path().ends_with("/responses")
-                && let Some(observer) = observer
-            {
-                observer(response.headers());
-            }
+            let response = responses_transport::send(transport, rewritten, retry, observer).await?;
             normalize_responses_response(
                 response,
                 uses_max_reasoning,
@@ -1010,6 +1069,11 @@ pub(super) fn map_openai_error(e: async_openai::error::OpenAIError) -> AdkError 
 }
 
 fn map_error(e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkError {
+    let phase = if matches!(layer, parse::Layer::StreamEvent) { "stream" } else { "request" };
+    responses_transport::annotate(map_error_inner(e, layer), "http", phase)
+}
+
+fn map_error_inner(e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkError {
     if let async_openai::error::OpenAIError::JSONDeserialize(error, body) = e {
         return parse::error(&error, &body, layer);
     }
@@ -1028,13 +1092,16 @@ fn map_error(e: async_openai::error::OpenAIError, layer: parse::Layer) -> AdkErr
     if let async_openai::error::OpenAIError::Reqwest(ref error) = e {
         let category =
             if error.is_timeout() { ErrorCategory::Timeout } else { ErrorCategory::Unavailable };
-        return AdkError::new(
-            ErrorComponent::Model,
-            category,
-            "model.openai_responses.request",
-            format!("OpenAI Responses API network error: {error_string}"),
-        )
-        .with_provider("openai-responses");
+        return responses_transport::network(
+            AdkError::new(
+                ErrorComponent::Model,
+                category,
+                "model.openai_responses.request",
+                format!("OpenAI Responses API network error: {error_string}"),
+            )
+            .with_provider("openai-responses"),
+            error,
+        );
     }
 
     // Stream errors → Unavailable
@@ -1075,8 +1142,10 @@ impl OpenAIResponsesClient {
         let request_idle_timeout = stream.then(|| idle_timeout.clone());
         let uses_max_reasoning = matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max));
         let open_responses_mode = self.open_responses_mode;
+        let response_recovery = self.response_recovery;
         let adapter = self.adapter.clone();
         let observer = self.observer.clone();
+        let request_retry = self.request_retry;
         let mut next_client = move || {
             // Only the first fallback shares the WebSocket attempt's adaptation.
             let (headers, body) = match prepared.take() {
@@ -1086,7 +1155,12 @@ impl OpenAIResponsesClient {
             with_transport(
                 base_client.clone(),
                 &transport,
-                RequestState { headers, body, idle_timeout: request_idle_timeout.clone() },
+                RequestState {
+                    headers,
+                    body,
+                    idle_timeout: request_idle_timeout.clone(),
+                    retry: request_retry,
+                },
                 uses_max_reasoning,
                 open_responses_mode,
                 adapter.clone(),
@@ -1113,6 +1187,8 @@ impl OpenAIResponsesClient {
                 .await?;
 
             let mut state = StreamState::new(native_tools);
+            let completed_tools = Arc::new(AtomicBool::new(false));
+            let observed_tools = completed_tools.clone();
             let response_stream = try_stream! {
                 futures::pin_mut!(event_stream);
                 while let Some(event_result) = event_stream.next().await {
@@ -1129,9 +1205,10 @@ impl OpenAIResponsesClient {
                             map_error(error, parse::Layer::StreamEvent)
                         }
                     })?;
-                    match wire::event(value)? {
+                    if responses_transport::tool_completed(&value) { observed_tools.store(true, Ordering::Relaxed); }
+                    match responses_transport::event(value, response_recovery).map_err(|error| responses_transport::annotate(error, "http", "stream"))? {
                         wire::Event::Terminal(response) => {
-                            yield state.finish(&response)?;
+                            yield responses_transport::finish(&mut state, &response, response_recovery)?;
                             return;
                         }
                         wire::Event::Content(event) => {
@@ -1148,9 +1225,17 @@ impl OpenAIResponsesClient {
                     ErrorCategory::Unavailable,
                     "model.openai_responses.unfinished_stream",
                     "OpenAI Responses stream ended before completion",
-                ).with_provider("openai-responses"))?;
+                ).with_provider("openai-responses")).map_err(|error| responses_transport::annotate(error, "http", "stream"))?;
             };
 
+            let response_stream = response_stream.map(move |result| {
+                result.map_err(|error| {
+                    responses_transport::committed(
+                        responses_transport::annotate(error, "http", "stream"),
+                        completed_tools.load(Ordering::Relaxed),
+                    )
+                })
+            });
             Ok(crate::usage_tracking::with_priced_usage_tracking(
                 Box::pin(response_stream),
                 usage_span,
@@ -1280,6 +1365,7 @@ impl Llm for OpenAIResponsesClient {
                         matches!(self.reasoning_effort, Some(OpenAIReasoningEffort::Max)),
                         self.open_responses_mode,
                     ),
+                    self.response_recovery,
                 )
                 .await
             {
@@ -1292,6 +1378,9 @@ impl Llm for OpenAIResponsesClient {
                     ));
                 }
                 Err(failure) => {
+                    if !websocket.options.fallback_to_http {
+                        return Err(failure.error);
+                    }
                     let refusal = failure.refusal;
                     websocket.observe(super::ws_transport::TransportEvent::Fallback { refusal });
                     let stream = self

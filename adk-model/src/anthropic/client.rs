@@ -31,6 +31,7 @@ pub struct AnthropicClient {
     pub(super) model: String,
     pub(super) max_tokens: u32,
     retry_config: RetryConfig,
+    transport_recovery: bool,
     request_adapter: Option<RequestAdapter>,
     /// Latest rate-limit information from the most recent API response.
     latest_rate_limit: Arc<RwLock<RateLimitInfo>>,
@@ -88,6 +89,7 @@ impl AnthropicClient {
                 .unwrap_or_else(|| crate::catalog::anthropic_default_max_tokens(&config.model)),
             config,
             retry_config: RetryConfig::default(),
+            transport_recovery: false,
             request_adapter: None,
             latest_rate_limit: Arc::new(RwLock::new(RateLimitInfo::default())),
         })
@@ -204,6 +206,16 @@ impl AnthropicClient {
     /// Access the current Anthropic configuration.
     pub fn anthropic_config(&self) -> &AnthropicConfig {
         &self.config
+    }
+
+    /// Configure retries at the raw generation HTTP boundary.
+    ///
+    /// Defaults to no raw retries. Keep response-level retries disabled when
+    /// a caller owns stream recovery separately.
+    pub fn with_request_retry(mut self, policy: crate::request_retry::RequestRetryConfig) -> Self {
+        self.client = self.client.with_generation_executor(super::transport::executor(policy));
+        self.transport_recovery = true;
+        self
     }
 
     /// Set the retry configuration (builder pattern).
@@ -508,6 +520,9 @@ fn merge_consecutive_messages(messages: &mut Vec<adk_anthropic::MessageParam>) {
 /// request ID, when present, is also recorded on the current tracing span as
 /// `anthropic.request_id` (Requirement 4.2).
 pub(super) fn convert_anthropic_error(e: adk_anthropic::Error) -> AdkError {
+    if let Some(error) = super::transport::preserved(&e) {
+        return error.with_source(e);
+    }
     if e.is_timeout() || e.is_connection() {
         let (category, code) = if e.is_timeout() {
             (adk_core::ErrorCategory::Timeout, "model.anthropic.timeout")
@@ -674,6 +689,7 @@ impl Llm for AnthropicClient {
         let max_tokens = self.max_tokens;
         let client = self.client.clone();
         let retry_config = self.retry_config.clone();
+        let transport_recovery = self.transport_recovery;
         let request_for_retry = request.clone();
         let anthropic_config = self.config.clone();
         let request_adapter = self.request_adapter.clone();
@@ -708,7 +724,7 @@ impl Llm for AnthropicClient {
                 })
                 .await?;
 
-                let mut responses = super::streaming::responses(event_stream);
+                let mut responses = super::streaming::responses(event_stream, transport_recovery);
                 while let Some(response) = responses.next().await {
                     yield response?;
                 }

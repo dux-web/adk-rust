@@ -30,6 +30,7 @@ mod responses_convert;
 mod responses_errors;
 mod responses_lines;
 mod responses_stream;
+mod responses_transport;
 pub mod schema_adapter;
 #[cfg(feature = "openai-ws")]
 pub mod ws_transport;
@@ -47,6 +48,7 @@ pub use config::{
 pub use conversations::ConversationsClient;
 pub use request::{RequestAdapter, ResponseObserver};
 pub use responses_client::OpenAIResponsesClient;
+pub use responses_transport::RequestRetryConfig;
 pub use schema_adapter::{OpenAiSchemaAdapter, OpenAiStrictSchemaAdapter};
 #[cfg(feature = "openai-ws")]
 pub use ws_transport::{TransportEvent, WsOptions, WsRefusal, WsTransport};

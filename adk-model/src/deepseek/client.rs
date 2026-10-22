@@ -8,6 +8,7 @@ use super::config::{DeepSeekConfig, ThinkingMode};
 use super::convert::{
     self, ChatCompletionRequest, ChatCompletionResponse, ResponseFormat, ThinkingConfig,
 };
+use crate::request_retry::{RequestRetryConfig, http as request_http};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
 use adk_core::{
     AdkError, ErrorComponent, FinishReason, GenericSchemaAdapter, Llm, LlmRequest, LlmResponse,
@@ -53,6 +54,7 @@ pub struct DeepSeekClient {
     client: Client,
     config: DeepSeekConfig,
     retry_config: RetryConfig,
+    request_retry: RequestRetryConfig,
 }
 
 impl DeepSeekClient {
@@ -62,10 +64,23 @@ impl DeepSeekClient {
         let client = crate::HttpTimeouts::default()
             .apply(Client::builder())
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|e| AdkError::model(format!("failed to create HTTP client: {e}")))?;
 
-        Ok(Self { client, config, retry_config: RetryConfig::default() })
+        Ok(Self {
+            client,
+            config,
+            retry_config: RetryConfig::default(),
+            request_retry: RequestRetryConfig::default(),
+        })
+    }
+
+    /// Configures retries of raw HTTP sends before a response body starts.
+    #[must_use]
+    pub fn with_request_retry(mut self, policy: RequestRetryConfig) -> Self {
+        self.request_retry = policy;
+        self
     }
 
     /// Sets the connect and idle timeouts of the HTTP transport, so a stalled stream fails
@@ -94,6 +109,7 @@ impl DeepSeekClient {
         self.client = timeouts
             .apply(Client::builder())
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|e| AdkError::model(format!("failed to create HTTP client: {e}")))?;
         Ok(self)
@@ -293,6 +309,7 @@ impl Llm for DeepSeekClient {
         let chat_request = self.build_request(&request, stream)?;
         let client = self.client.clone();
         let retry_config = self.retry_config.clone();
+        let request_retry = self.request_retry;
         let thinking_enabled = self.config.is_thinking_enabled();
 
         let response_stream = try_stream! {
@@ -302,19 +319,21 @@ impl Llm for DeepSeekClient {
                 let api_key = api_key.clone();
                 let chat_request = chat_request.clone();
                 async move {
-                    let response = client
+                    let request_error = |e: reqwest::Error| request_http::network(AdkError::new(
+                        ErrorComponent::Model,
+                        crate::http_timeouts::transport_category(&e),
+                        "model.deepseek.request",
+                        format!("DeepSeek API request failed: {e}"),
+                    ).with_provider("deepseek"), &e, "request");
+                    let request = client
                         .post(&api_url)
                         .header("Authorization", format!("Bearer {api_key}"))
                         .header("Content-Type", "application/json")
                         .json(&chat_request)
-                        .send()
-                        .await
-                        .map_err(|e| AdkError::new(
-                            ErrorComponent::Model,
-                            crate::http_timeouts::transport_category(&e),
-                            "model.deepseek.request",
-                            format!("DeepSeek API request failed: {e}"),
-                        ).with_provider("deepseek"))?;
+
+                        .build().map_err(&request_error)?;
+                    let response = request_http::send(&client, request, request_retry)
+                        .await.map_err(request_error)?;
 
                     if !response.status().is_success() {
                         let status = response.status();
@@ -324,6 +343,7 @@ impl Llm for DeepSeekClient {
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|value| value.to_str().ok())
                             .and_then(crate::retry::parse_retry_after);
+                        let deadline = request_http::deadline(&response);
                         let error_text = response.text().await.unwrap_or_default();
                         let error = AdkError::new(
                             ErrorComponent::Model,
@@ -334,10 +354,10 @@ impl Llm for DeepSeekClient {
                                 adk_core::upstream_excerpt(&error_text)
                             ),
                         ).with_upstream_status(status_code).with_provider("deepseek");
-                        return Err(crate::retry::with_retry_after(
-                            crate::error_metadata::from_body(error, &error_text),
-                            retry_after,
-                        ));
+                        let mut error = crate::retry::with_retry_after(
+                            crate::error_metadata::from_body(error, &error_text), retry_after);
+                        if let Some(deadline) = deadline { error = error.with_retry_deadline(deadline); }
+                        return Err(request_http::annotate(error, "request"));
                     }
 
                     Ok(response)
@@ -550,18 +570,18 @@ impl Llm for DeepSeekClient {
                 }
             } else {
                 // Non-streaming mode
-                let response_text = response.text().await.map_err(|e| AdkError::new(
+                let response_text = response.text().await.map_err(|e| request_http::network(AdkError::new(
                     ErrorComponent::Model,
                     crate::http_timeouts::transport_category(&e),
                     "model.deepseek.request",
                     format!("failed to read response: {e}"),
-                ).with_provider("deepseek"))?;
+                ).with_provider("deepseek"), &e, "stream"))?;
 
                 let chat_response: ChatCompletionResponse = serde_json::from_str(&response_text)
-                    .map_err(|e| AdkError::model(format!(
+                    .map_err(|e| request_http::annotate(AdkError::model(format!(
                         "failed to parse response: {}",
                         adk_core::json_error_summary(&e)
-                    )))?;
+                    )), "stream"))?;
 
                 yield convert::from_response(&chat_response);
             }

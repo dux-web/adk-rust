@@ -430,3 +430,156 @@ async fn streaming_failures_keep_status_and_retry_hints() {
         assert!(error.retry.should_retry);
     }
 }
+
+#[tokio::test]
+async fn request_retries_only_raw_server_failures() {
+    use adk_model::openai::RequestRetryConfig;
+    use std::time::Duration;
+    for (status, expected) in [(503, 5), (429, 1), (400, 1), (401, 1)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/responses"))
+            .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "0")
+                .set_body_json(json!({"error":{"message":"fixture failure","type":"api_error","code":"fixture"}})))
+            .expect(expected).mount(&server).await;
+        let client = client(&server.uri(), true).with_request_retry(RequestRetryConfig {
+            max_retries: 4,
+            initial_delay: Duration::ZERO,
+        });
+        let error = match client.generate_content(request(), true).await {
+            Err(error) => error,
+            Ok(stream) => stream.try_collect::<Vec<_>>().await.unwrap_err(),
+        };
+        assert_eq!(error.details.upstream_status_code, Some(status));
+        assert_eq!(error.details.metadata["transport_phase"], "request");
+        assert_eq!(error.details.metadata["provider_error_type"], "api_error");
+        assert!(error.retry_deadline().is_some());
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn recovery_ignores_only_standalone_errors() {
+    for (kind, code, completed) in [
+        ("error", "quota_custom", true),
+        ("error", "flex_unavailable", false),
+        ("response.failed", "quota_custom", false),
+    ] {
+        let server = MockServer::start().await;
+        let error = json!({"message":"fixture stream failure","code":code,"type":"api_error"});
+        let failed = if kind == "error" {
+            json!({"type":kind,"error":error})
+        } else {
+            json!({"type":kind,"response":{"error":error}})
+        };
+        let body = format!("data: {failed}\n\ndata: {}\n\n", completion());
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = client(&server.uri(), true)
+            .with_response_recovery(true)
+            .generate_content(request(), true)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await;
+        if completed {
+            assert!(result.unwrap().last().unwrap().turn_complete);
+        } else {
+            let error = result.unwrap_err();
+            assert_eq!(error.details.metadata["provider_event_type"], kind);
+            assert_eq!(error.details.metadata["provider_error_code"], code);
+            assert_eq!(error.details.metadata["transport_phase"], "stream");
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_projection_failures_cannot_replay() {
+    let server = MockServer::start().await;
+    let mut completed = completion();
+    completed["response"]["output"] =
+        json!([{"type":"function_call","call_id":"","name":"fixture","arguments":"{}"}]);
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {completed}\n\n")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server.uri(), true)
+        .with_response_recovery(true)
+        .generate_content(request(), true)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+    assert_eq!(error.details.metadata["response_completed"], true);
+}
+
+#[tokio::test]
+async fn interrupted_responses_continue_without_completing_summaries() {
+    let server = MockServer::start().await;
+    let mut interrupted = completion();
+    interrupted["type"] = json!("response.incomplete");
+    interrupted["response"]["status"] = json!("incomplete");
+    interrupted["response"]["incomplete_details"] = json!({"reason":"interrupted"});
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {interrupted}\n\n")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let responses = client(&server.uri(), true)
+        .with_response_recovery(true)
+        .generate_content(request(), true)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    let response = responses.last().unwrap();
+    assert!(response.interrupted);
+    assert_eq!(response.provider_metadata.as_ref().unwrap()["continue_turn"], true);
+}
+
+#[tokio::test]
+async fn completed_native_tools_mark_later_interruptions() {
+    let server = MockServer::start().await;
+    let event = json!({"type":"response.output_item.done","sequence_number":0,"output_index":0,
+        "item":{"id":"native-search","type":"web_search_call","status":"completed","action":{"type":"search","query":"fixture"}}});
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {event}\n\n")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server.uri(), true)
+        .with_response_recovery(true)
+        .generate_content(request(), true)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+    assert_eq!(error.details.metadata["provider_tool_completed"], true);
+    assert_eq!(error.details.metadata["transport_phase"], "stream");
+}

@@ -630,7 +630,7 @@ async fn adapter_can_remove_default_authorization() {
                 headers.insert("x-provider-token", http::HeaderValue::from_static("custom grant"));
                 Ok(())
             }))
-            .with_websocket(WsOptions::default());
+            .with_websocket(WsOptions { fallback_to_http: true, ..Default::default() });
         client.preconnect().await.unwrap();
         let mut stream = client
             .generate_content(
@@ -1017,7 +1017,7 @@ async fn fallback_retries_adapt_original_requests() {
             headers.append("x-nonce", http::HeaderValue::from_str(&attempt.to_string()).unwrap());
             Ok(())
         }))
-        .with_websocket(WsOptions::default());
+        .with_websocket(WsOptions { fallback_to_http: true, ..Default::default() });
     let responses: Vec<_> = client
         .generate_content(
             LlmRequest::new("test-model", vec![Content::new("user").with_text("first")]),
@@ -1091,6 +1091,7 @@ async fn fallback_preserves_the_adapted_request() {
                 Ok(())
             }))
             .with_websocket(WsOptions {
+                fallback_to_http: true,
                 observe: Arc::new(move |event| observed.lock().unwrap().push(event)),
                 ..Default::default()
             });
@@ -1156,6 +1157,7 @@ async fn first_event_deadline_bounds_unacknowledged_wait() {
             .unwrap()
             .with_retry_config(RetryConfig::disabled())
             .with_websocket(WsOptions {
+                fallback_to_http: true,
                 first_event_timeout: Duration::from_millis(100),
                 read_timeout: Duration::from_secs(5),
                 observe: Arc::new(move |event| observed.lock().unwrap().push(event)),
@@ -1306,4 +1308,28 @@ async fn honors_environment_proxy_bypass() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[tokio::test]
+async fn fallback_requires_explicit_opt_in() {
+    use adk_core::{Content, Llm, LlmRequest};
+    use adk_model::openai::{OpenAIResponsesClient, WsOptions};
+    let server =
+        Server::combined(Arc::new(|_| answer("unexpected HTTP")), Arc::new(|_| Some(426)), true)
+            .await;
+    let client = OpenAIResponsesClient::new(server.config())
+        .unwrap()
+        .with_retry_config(RetryConfig::disabled())
+        .with_websocket(WsOptions::default());
+    assert!(
+        client
+            .generate_content(
+                LlmRequest::new("test-model", vec![Content::new("user").with_text("first")]),
+                true
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(server.handshakes(), 1);
+    assert!(server.requests.lock().unwrap().is_empty());
 }

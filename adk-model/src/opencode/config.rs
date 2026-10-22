@@ -46,6 +46,8 @@ pub struct OpenCodeConfig {
     pub(super) thinking: Option<ThinkingMode>,
     pub(super) anthropic_effort: Option<Effort>,
     pub(super) retry: RetryConfig,
+    pub(super) response_recovery: bool,
+    pub(super) request_retry: crate::request_retry::RequestRetryConfig,
     pub(super) timeouts: Option<crate::HttpTimeouts>,
 }
 
@@ -79,8 +81,22 @@ impl OpenCodeConfig {
             thinking: None,
             anthropic_effort: None,
             retry: RetryConfig::default(),
+            request_retry: Default::default(),
+            response_recovery: false,
             timeouts: None,
         }
+    }
+
+    /// Enable explicit Responses stream recovery when the selected API is Responses.
+    pub fn with_response_recovery(mut self, enabled: bool) -> Self {
+        self.response_recovery = enabled;
+        self
+    }
+
+    /// Configures retries of raw HTTP sends before a response body starts.
+    pub fn with_request_retry(mut self, policy: crate::request_retry::RequestRetryConfig) -> Self {
+        self.request_retry = policy;
+        self
     }
 
     /// Sets the API explicitly, including for models added after this library release.

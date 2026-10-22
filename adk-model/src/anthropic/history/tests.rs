@@ -167,7 +167,7 @@ fn streamed_thinking_keeps_its_signature_for_replay() {
     ]
     .map(|event| Ok(serde_json::from_value::<adk_anthropic::MessageStreamEvent>(event).unwrap()));
     let responses = futures::executor::block_on(futures::TryStreamExt::try_collect::<Vec<_>>(
-        super::super::streaming::responses(futures::stream::iter(events)),
+        super::super::streaming::responses(futures::stream::iter(events), false),
     ))
     .unwrap();
     let complete = responses.last().unwrap().content.clone().unwrap();

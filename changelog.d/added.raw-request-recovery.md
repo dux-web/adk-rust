@@ -1,0 +1,1 @@
+Add opt-in raw HTTP request retries for native model clients, preserving transport phase, provider error fields, and monotonic server retry deadlines. Responses stream recovery can explicitly ignore standalone errors and continue interrupted responses through the existing agent turn loop. WebSocket HTTP fallback now requires explicit opt-in.
