@@ -291,8 +291,27 @@ async fn unreadable_error_bodies_preserve_response_headers() {
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut bytes = [0; 8192];
-                socket.read(&mut bytes).await.unwrap();
+                let mut received = Vec::new();
+                loop {
+                    let mut bytes = [0; 8192];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert_ne!(count, 0);
+                    received.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&received[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if received.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
                 socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: 1024\r\nRetry-After: 17\r\nConnection: close\r\n\r\n{{").as_bytes()).await.unwrap();
                 socket.shutdown().await.unwrap();
             });
