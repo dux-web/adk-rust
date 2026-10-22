@@ -41,7 +41,7 @@ where
                     let mut failure = convert_anthropic_error(error);
                     if let Some((kind, message)) = reported.lock().unwrap().take() {
                         failure.details.upstream_status_code = None;
-                        failure.message = adk_core::upstream_excerpt(&message);
+                        failure.message = adk_core::upstream_excerpt(&message).to_owned();
                         failure.details.metadata.insert("provider_event_type".into(), "error".into());
                         if kind.len() <= 128 && kind.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte)) {
                             failure.details.metadata.insert("provider_error_type".into(), kind.clone().into());

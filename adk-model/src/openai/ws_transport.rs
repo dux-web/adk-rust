@@ -239,6 +239,9 @@ impl WsTransport {
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
+    pub(super) fn fallback_to_http(&self) -> bool {
+        self.options.fallback_to_http
+    }
     pub(super) fn enabled(&self) -> bool {
         (self.options.enabled)() && !proxy_in_effect(&self.url)
     }

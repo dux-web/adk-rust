@@ -25,7 +25,7 @@ pub(crate) async fn send(
             if let Some(deadline) = deadline(&response) {
                 response.extensions_mut().insert(RetryDeadline(deadline));
             }
-            Ok(response)
+            Ok::<_, Error>(response)
         },
         |result| match result {
             Ok(response) => response.status().is_server_error(),

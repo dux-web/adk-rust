@@ -4,7 +4,7 @@ use async_openai::{
     error::OpenAIError,
     middleware::{HttpRequestFactory, ReqwestService},
 };
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tower::ServiceExt;
 
 pub use crate::request_retry::RequestRetryConfig;
@@ -115,7 +115,7 @@ pub(super) fn provider(mut error: AdkError, value: &serde_json::Value) -> AdkErr
         }
     }
     if let Some(message) = value.get("message").and_then(serde_json::Value::as_str) {
-        error.message = adk_core::upstream_excerpt(message);
+        error.message = adk_core::upstream_excerpt(message).to_owned();
     }
     if let Some(delay) = value
         .get("headers")
@@ -231,6 +231,7 @@ pub(super) fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     #[test]
     fn preserves_server_deadlines() {
         let mut headers = http::HeaderMap::new();

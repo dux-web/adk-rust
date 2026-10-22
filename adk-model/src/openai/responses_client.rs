@@ -1378,7 +1378,7 @@ impl Llm for OpenAIResponsesClient {
                     ));
                 }
                 Err(failure) => {
-                    if !websocket.options.fallback_to_http {
+                    if !websocket.fallback_to_http() {
                         return Err(failure.error);
                     }
                     let refusal = failure.refusal;
