@@ -42,6 +42,8 @@
 1 adk-harness hooks
 # The payments pack (spec 3.1 §7.16) links adk-payments, which no other harness feature does.
 1 adk-harness payments
+# The voice surface (spec 3.1 §7.17): the harness over adk-realtime's integrated runner.
+1 adk-harness voice
 # The crate docs' examples under the default tier: an `artifacts` example once compiled only
 # with `full`, and nothing ran the doctests below it.
 1 adk-rust minimal doc
@@ -82,6 +84,8 @@
 2 adk-cli audit-sql
 # The `chat` end-to-end tests in a pseudo-terminal: held calls, Ctrl-C, sessions.
 2 adk-cli scripted-model
+# `adk-rust --voice` (spec 3.1 §7.17) end to end on a scripted realtime provider.
+2 adk-cli voice,scripted-model
 
 # Shard 3 — adk-graph, adk-managed, adk-code.
 # No workspace member enables these four; four clippy failures and two uncompilable doc
@@ -129,9 +133,14 @@
 
 # Shard 5 — adk-realtime, adk-session, adk-memory, adk-eval, adk-deploy, adk-bench.
 5 adk-realtime integration
+# Held calls, metering and output guardrails on the integrated runner, and the scripted
+# provider the voice surface tests run on.
+5 adk-realtime integration,guardrails,scripted
 # The OpenAI realtime session and its WebSocket transport: compiled by the nightly `full`
 # build but never tested anywhere else.
 5 adk-realtime openai
+# The Gemini Live session: setup, usage reports, the audio stream end on commit.
+5 adk-realtime gemini
 5 adk-session vertex-session
 5 adk-session postgres
 # Durable stores on every backend: compiles them and runs the SQLite conformance suites;

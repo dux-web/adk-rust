@@ -321,6 +321,7 @@ version = "3.0.0"
 dependencies = [
  "adk-agent",
  "adk-artifact",
+ "adk-audio",
  "adk-auth",
  "adk-browser",
  "adk-core",
@@ -330,6 +331,7 @@ dependencies = [
  "adk-harness",
  "adk-mistralrs",
  "adk-model",
+ "adk-realtime",
  "adk-runner",
  "adk-server",
  "adk-session",
@@ -927,6 +929,7 @@ version = "3.0.0"
 dependencies = [
  "adk-core",
  "adk-gemini",
+ "adk-guardrail",
  "adk-memory",
  "adk-plugin",
  "adk-session",
