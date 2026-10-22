@@ -138,6 +138,7 @@ pub struct HarnessRuntime {
     pub(crate) hooks: Option<Arc<crate::hooks::HookRunner>>,
     pub(crate) effort: crate::posture::EffortPolicy,
     /// The model whose context the runner caches explicitly, when caching is on.
+    #[cfg(feature = "runner")]
     pub(crate) cache_capable: Option<Arc<dyn adk_core::CacheCapable>>,
     /// The payments pack's per-request reminder (spec 3.1 §7.16).
     #[cfg(feature = "payments")]
