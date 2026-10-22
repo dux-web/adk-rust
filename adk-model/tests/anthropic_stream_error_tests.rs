@@ -278,3 +278,55 @@ async fn recovery_keeps_stream_failures_typed() {
         }
     }
 }
+
+#[tokio::test]
+async fn unreadable_error_bodies_preserve_response_headers() {
+    use adk_model::request_retry::RequestRetryConfig;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (status, category) in
+        [(400, ErrorCategory::InvalidRequest), (429, ErrorCategory::RateLimited)]
+    {
+        for stream in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; 8192];
+                socket.read(&mut bytes).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: 1024\r\nRetry-After: 17\r\nConnection: close\r\n\r\n{{").as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let client = AnthropicClient::new(
+                AnthropicConfig::new("test-key", "claude-sonnet-4-6")
+                    .with_base_url(format!("http://{address}")),
+            )
+            .unwrap()
+            .with_retry_config(RetryConfig::disabled())
+            .with_request_retry(RequestRetryConfig::default());
+            let result = client
+                .generate_content(
+                    LlmRequest::new(
+                        "claude-sonnet-4-6",
+                        vec![Content::new("user").with_text("Hello")],
+                    ),
+                    stream,
+                )
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(mut events) => events.next().await.unwrap().unwrap_err(),
+            };
+            assert_eq!(error.details.upstream_status_code, Some(status));
+            assert_eq!(error.category, category);
+            assert_eq!(error.code, "model.anthropic.api");
+            assert_eq!(error.details.metadata["response_body_error"], true);
+            let delay = error
+                .retry_deadline()
+                .unwrap()
+                .saturating_duration_since(std::time::Instant::now());
+            assert!(delay > std::time::Duration::from_secs(15));
+            assert!(delay <= std::time::Duration::from_secs(17));
+            server.await.unwrap();
+        }
+    }
+}

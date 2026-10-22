@@ -44,18 +44,21 @@ async fn send(
     let status = response.status().as_u16();
     let deadline = http::deadline(&response);
     let body = response.text().await.map_err(|source| {
-        http::network(
+        let mut error = http::network(
             AdkError::new(
                 ErrorComponent::Model,
-                ErrorCategory::Unavailable,
-                "model.anthropic.transport",
+                crate::retry::category_for_status_code(status),
+                "model.anthropic.api",
                 "Anthropic error response could not be read",
             )
-            .with_provider("anthropic"),
+            .with_provider("anthropic")
+            .with_upstream_status(status),
             &source,
             "request",
         )
-        .with_source(source)
+        .with_source(source);
+        error.details.metadata.insert("response_body_error".into(), true.into());
+        preserve_deadline(error, deadline)
     })?;
     let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
     let provider = value.get("error").unwrap_or(&value);
@@ -80,6 +83,10 @@ async fn send(
             error.details.metadata.insert(target.into(), value.into());
         }
     }
+    Err(preserve_deadline(error, deadline))
+}
+
+fn preserve_deadline(mut error: AdkError, deadline: Option<std::time::Instant>) -> AdkError {
     if let Some(deadline) = deadline {
         error.retry = error
             .retry
@@ -87,7 +94,7 @@ async fn send(
             .with_retry_after(deadline.saturating_duration_since(std::time::Instant::now()));
         error = error.with_retry_deadline(deadline);
     }
-    Err(error)
+    error
 }
 
 pub(super) fn preserved(source: &adk_anthropic::Error) -> Option<AdkError> {
