@@ -6,11 +6,20 @@ use std::path::Path;
 use std::sync::Arc;
 
 use adk_cli::console::ConsoleIo;
+use adk_cli::harness::ultracode::{
+    ArchitectureChoice, BoardStatus, ChangeSignals, Focus, IndependentReviewer, ROUTER_VERSION,
+    RepoSignals, ReviewBoard, ReviewPlan, RouteDecision, RouteInputs, RouterMode, Rule,
+    SNAPSHOT_MAX_FILES, SettingSource, TaskFeatures, TurnStatus, UltracodeAudit, UltracodeFlags,
+    UltracodeLimits, Verdict, WorkspaceSnapshot, route,
+};
 use adk_cli::harness::{
     BearerTokenExtractor, ConsolePrompter, HarnessArgs, HarnessLauncher, OPERATOR_SCOPE,
     ResolvedHarnessArgs, SearchArg, TurnOutcome,
 };
-use adk_core::{ApprovalPolicy, ApprovalService, ApproverSelector, Effort, StoreApprovalService};
+use adk_core::audit_log::AuditRecorder;
+use adk_core::{
+    ApprovalPolicy, ApprovalService, ApproverSelector, Effort, Llm, RunBudget, StoreApprovalService,
+};
 use adk_devtools::Workspace;
 use adk_harness::{
     ApprovalPrompter, FileWorkspaceTrustStore, GOAL_STATE_KEY, GoalSpec, GoalState, GoalStatus,
@@ -55,6 +64,14 @@ struct Setup {
 #[derive(Clone)]
 struct Models {
     harness: BuiltModel,
+}
+
+/// What an `ultracode` implementer adds to a harness agent (spec 3.1 §7.10): its turn's
+/// `RunBudget` and the run's audit log.
+#[derive(Default)]
+struct AgentExtras {
+    budget: Option<RunBudget>,
+    audit: Option<Arc<dyn AuditRecorder>>,
 }
 
 /// Installs the process's tracing subscriber once, so a `warn!` or `error!` from the
@@ -149,10 +166,20 @@ impl Setup {
         prompter: Option<Arc<dyn ApprovalPrompter>>,
         approval_service: Option<Arc<dyn ApprovalService>>,
     ) -> Result<HarnessAgent> {
-        self.agent_with(self.resolved.effort, name, mode, sandbox, prompter, approval_service)
+        self.agent_with(
+            self.resolved.effort,
+            name,
+            mode,
+            sandbox,
+            prompter,
+            approval_service,
+            AgentExtras::default(),
+        )
     }
 
-    /// [`agent`](Self::agent) at the effort `policy`, which `/effort` replaces.
+    /// [`agent`](Self::agent) at the effort `policy`, which `/effort` replaces, with
+    /// `extras`.
+    #[allow(clippy::too_many_arguments)]
     fn agent_with(
         &self,
         effort: adk_harness::EffortPolicy,
@@ -161,6 +188,7 @@ impl Setup {
         sandbox: bool,
         prompter: Option<Arc<dyn ApprovalPrompter>>,
         approval_service: Option<Arc<dyn ApprovalService>>,
+        extras: AgentExtras,
     ) -> Result<HarnessAgent> {
         let workspace = Workspace::new(&self.resolved.workspace).allow_bash(true);
         let mut builder = HarnessAgent::builder(name)
@@ -263,6 +291,14 @@ impl Setup {
                 }
             };
         }
+        // `ultracode` bounds each implement turn and records into its run's log (spec 3.1
+        // §7.10, I63).
+        if let Some(budget) = extras.budget {
+            builder = builder.budget(budget);
+        }
+        if let Some(recorder) = extras.audit {
+            builder = builder.audit_log(recorder);
+        }
         // Servers the workspace declares in `.mcp.json` start once the workspace is trusted
         // (spec 3.1 §7.21, I3).
         if let Some(servers) = workspace_mcp_servers(&self.resolved.workspace)? {
@@ -296,6 +332,12 @@ impl Setup {
 
     /// A launcher for `agent` over this setup's sessions, user and session choice.
     async fn launcher(&self, agent: HarnessAgent) -> Result<HarnessLauncher> {
+        let session = self.session_id().await?;
+        Ok(self.launcher_in(agent, session))
+    }
+
+    /// A launcher for `agent` over this setup's sessions and user, in `session`.
+    fn launcher_in(&self, agent: HarnessAgent, session: Option<String>) -> HarnessLauncher {
         let hooks = match (self.resolved.hooks, agent.runtime().hooks()) {
             (false, _) => Some("off (--no-hooks)".to_string()),
             (true, Some(set)) => Some(format!("{} (/hooks lists them)", set.hooks.len())),
@@ -315,7 +357,7 @@ impl Setup {
         if self.resolved.mode_explicit {
             launcher = launcher.with_mode(self.resolved.mode);
         }
-        if let Some(session) = self.session_id().await? {
+        if let Some(session) = session {
             launcher = launcher.with_session_id(session);
         }
         launcher = launcher.with_status_line(
@@ -340,7 +382,7 @@ impl Setup {
         for note in &self.resolved.notes {
             launcher = launcher.with_banner_note(note.clone());
         }
-        Ok(launcher)
+        launcher
     }
 
     /// The prompter of a one-shot command: `--yes`, the terminal, or none, which holds
@@ -572,6 +614,7 @@ pub async fn repl(
                         setup.resolved.sandbox,
                         Some(prompter),
                         None,
+                        AgentExtras::default(),
                     )
                     .map_err(|error| adk_core::AdkError::config(error.to_string()))
             })
@@ -657,7 +700,8 @@ pub async fn voice(
 ) -> Result<i32> {
     use adk_session::{CreateRequest, GetRequest};
 
-    let mut setup = Setup::new(model, instruction, args, HarnessMode::Ask).await?;
+    // The realtime session reads the provider and its key from the resolved model.
+    let mut setup = Setup::new(model.clone(), instruction, args, HarnessMode::Ask).await?;
     setup.print_notes();
     setup.memory_notice();
     if !setup.resolved.packs.contains(&adk_harness::Pack::Voice) {
@@ -693,7 +737,7 @@ pub async fn voice(
     let script = voice.voice_script.as_deref();
     #[cfg(not(feature = "scripted-model"))]
     let script = None;
-    let realtime = crate::voice_cli::realtime_model(&setup.model, script)?;
+    let realtime = crate::voice_cli::realtime_model(&model, script)?;
     println!(
         "harness ({}) voice on {} · mode {} · shell {} · realtime {}\n",
         setup.model_id,
@@ -764,6 +808,12 @@ pub async fn goal(
             setup.resolved.mode
         );
     }
+    // Where the mirror's directory resolves before the agent runs (spec 3.1 §8.1).
+    let mirror = goal
+        .state
+        .as_deref()
+        .map(|path| OutputFile::prepare(Path::new(path), &setup.resolved.workspace))
+        .transpose()?;
     let console = ConsoleIo::terminal()?;
     let prompter = setup.unattended_prompter(&console);
     let agent =
@@ -811,8 +861,8 @@ pub async fn goal(
         launcher.run_goal(spec).await?
     };
     let state = launcher.goal().await?;
-    if let (Some(path), Some(state)) = (goal.state.as_deref(), &state) {
-        write_goal_mirror(Path::new(path), state)?;
+    if let (Some(mirror), Some(state)) = (&mirror, &state) {
+        write_goal_mirror(mirror, state)?;
     }
     let code = if !outcome.held.is_empty() {
         goal_held_exit(&outcome, persistent(&setup))
@@ -879,105 +929,669 @@ fn goal_held_exit(outcome: &TurnOutcome, persistent: bool) -> i32 {
 }
 
 /// Writes the `--state` JSON mirror of the goal.
-fn write_goal_mirror(path: &Path, state: &GoalState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&json!({
-            "goal": state.goal,
-            "until": state.until,
-            "iteration": state.iteration,
-            "status": serde_json::to_value(state.status)?,
-            "lastCheck": state.last_check,
-        }))?,
-    )
-    .with_context(|| format!("failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+fn write_goal_mirror(mirror: &OutputFile, state: &GoalState) -> Result<()> {
+    let text = serde_json::to_string_pretty(&json!({
+        "goal": state.goal,
+        "until": state.until,
+        "iteration": state.iteration,
+        "status": serde_json::to_value(state.status)?,
+        "lastCheck": state.last_check,
+    }))?;
+    mirror.write(text.as_bytes())
 }
 
-/// `adk-rust ultracode` on the harness (spec 3.1 §8.1).
+/// A file the CLI writes when a run ends, as the operator and outside any sandbox (spec 3.1
+/// §8.1): an agent can place links in its workspace, so the write is refused when a
+/// link inside the workspace is on the way to the file, or when the file's directory
+/// resolves elsewhere than it did before the agent ran. The content goes to a new file of an
+/// unpredictable name, created only if nothing is there, then renamed over the target,
+/// which replaces a link rather than following it.
+struct OutputFile {
+    /// The path, absolute and lexically normal.
+    path: std::path::PathBuf,
+    /// Its directory with every link resolved, before the run.
+    dir: std::path::PathBuf,
+    /// The workspace, resolved.
+    workspace: std::path::PathBuf,
+}
+
+impl OutputFile {
+    fn prepare(path: &Path, workspace: &Path) -> Result<Self> {
+        let absolute = std::path::absolute(path)
+            .with_context(|| format!("failed to resolve {}", path.display()))?;
+        let mut normal = std::path::PathBuf::new();
+        for part in absolute.components() {
+            match part {
+                std::path::Component::ParentDir => {
+                    normal.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => normal.push(other),
+            }
+        }
+        if normal.file_name().is_none() {
+            bail!("{} names no file", path.display());
+        }
+        let parent = normal.parent().unwrap_or(Path::new("/"));
+        let dir = resolve_dir(parent)
+            .with_context(|| format!("failed to resolve {}", parent.display()))?;
+        let workspace = resolve_dir(workspace)
+            .with_context(|| format!("failed to resolve {}", workspace.display()))?;
+        let file = Self { path: normal, dir, workspace };
+        file.refuse_workspace_links()?;
+        Ok(file)
+    }
+
+    /// Refuses a link inside the workspace on the way to the file's directory.
+    fn refuse_workspace_links(&self) -> Result<()> {
+        for ancestor in self.path.ancestors().skip(1) {
+            let is_link = std::fs::symlink_metadata(ancestor)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            let in_workspace = ancestor
+                .parent()
+                .and_then(|container| resolve_dir(container).ok())
+                .is_some_and(|container| container.starts_with(&self.workspace));
+            if is_link && in_workspace {
+                bail!(
+                    "refusing to write {}: {} is a link inside the workspace, which an agent \
+                     may have placed; choose a path without one",
+                    self.path.display(),
+                    ancestor.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn write(&self, bytes: &[u8]) -> Result<()> {
+        use std::io::Write as _;
+        let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) else {
+            bail!("{} names no file", self.path.display());
+        };
+        self.refuse_workspace_links()?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+        let now = std::fs::canonicalize(parent)
+            .with_context(|| format!("failed to resolve {}", parent.display()))?;
+        if now != self.dir {
+            bail!(
+                "refusing to write {}: its directory now resolves to {}, not to {} as when the \
+                 run started; a link was placed on the way during the run",
+                self.path.display(),
+                now.display(),
+                self.dir.display()
+            );
+        }
+        let tmp = now.join(format!(".{}.{}.tmp", name.to_string_lossy(), uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        let written = file.write_all(bytes).and_then(|()| file.sync_all());
+        drop(file);
+        let renamed = written.and_then(|()| std::fs::rename(&tmp, now.join(name)));
+        if let Err(error) = renamed {
+            std::fs::remove_file(&tmp).ok();
+            return Err(error).with_context(|| format!("failed to write {}", self.path.display()));
+        }
+        Ok(())
+    }
+}
+
+/// `dir` with its deepest existing ancestor canonicalized, which resolves every link on the
+/// way, and the components that do not exist yet appended.
+fn resolve_dir(dir: &Path) -> std::io::Result<std::path::PathBuf> {
+    let mut existing = dir.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(mut resolved) => {
+                resolved.extend(missing.iter().rev());
+                return Ok(resolved);
+            }
+            Err(error) => {
+                let Some(name) = existing.file_name().map(std::ffi::OsStr::to_os_string) else {
+                    return Err(error);
+                };
+                missing.push(name);
+                if !existing.pop() {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+/// `adk-rust ultracode` beyond the shared flags (spec 3.1 §8.1).
+pub struct UltracodeArgs {
+    pub task: String,
+    /// `--max-rounds`.
+    pub max_rounds: Option<i64>,
+    /// `--architecture`.
+    pub architecture: Option<ArchitectureChoice>,
+    /// `--router`.
+    pub router: Option<RouterMode>,
+    /// `--max-model-calls`.
+    pub max_model_calls: Option<u64>,
+    /// `--receipt`.
+    pub receipt: Option<std::path::PathBuf>,
+}
+
+/// `sha256:<hex>` of `bytes`.
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+/// `adk-rust ultracode` on the harness (spec 3.1 §7.10, §8.1): one implement turn in the
+/// user's mode, the review routed once to the parallel graph or a Blackboard board, then
+/// review and revise under the run's model-call budget, every step in one audit log.
 pub async fn ultracode(
     model: ResolvedModel,
     instruction: Option<String>,
     args: HarnessArgs,
-    task: String,
-    max_rounds: i64,
+    ultra: UltracodeArgs,
 ) -> Result<i32> {
     let setup = Arc::new(Setup::new(model, instruction, args, HarnessMode::Ask).await?);
     setup.print_notes();
+    let flags = UltracodeFlags {
+        architecture: ultra.architecture,
+        router: ultra.router,
+        max_rounds: ultra.max_rounds,
+        max_model_calls: ultra.max_model_calls,
+    };
+    let limits =
+        UltracodeLimits::resolve(user_config().as_deref(), &setup.resolved.workspace, &flags)?;
+    for note in &limits.notes {
+        println!("note: {note}");
+    }
+    // Where the receipt's directory resolves before the implementer runs (spec 3.1 §8.1).
+    let receipt = ultra
+        .receipt
+        .as_deref()
+        .map(|path| OutputFile::prepare(path, &setup.resolved.workspace))
+        .transpose()?;
+    let task = ultra.task;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    // One signed log per run: the implementer's, the reviewers' and the board's records and
+    // the run's own, in one hash chain (spec 3.1 §9.3).
+    let log = Arc::new(adk_harness::EphemeralAuditLog::new()?);
+    let recorder: Arc<dyn AuditRecorder> = log.clone();
+    let session_id = match setup.session_id().await? {
+        Some(session) => session,
+        None => uuid::Uuid::new_v4().to_string(),
+    };
     let console = ConsoleIo::terminal()?;
     let prompter = setup.unattended_prompter(&console);
-    let agent =
-        setup.agent(APP_NAME, setup.resolved.mode, setup.resolved.sandbox, prompter, None)?;
-    let launcher = setup.launcher(agent).await?.with_console(console);
+    let agent = setup.agent_with(
+        setup.resolved.effort,
+        APP_NAME,
+        setup.resolved.mode,
+        setup.resolved.sandbox,
+        prompter,
+        None,
+        AgentExtras {
+            budget: Some(RunBudget::new().max_model_calls(limits.implement_model_calls)),
+            audit: Some(recorder.clone()),
+        },
+    )?;
+    let runtime = agent.runtime().clone();
+    let launcher = setup.launcher_in(agent, Some(session_id.clone())).with_console(console);
+    let audit = UltracodeAudit::new(recorder.clone(), &setup.user, &run_id, session_id);
+    let task_digest = sha256(task.as_bytes());
+    audit
+        .record(
+            "harness.ultracode.started",
+            json!({
+                "runId": run_id,
+                "taskDigest": task_digest,
+                "requested": limits.architecture,
+                "source": limits.architecture_source,
+                "routerMode": limits.router,
+                "limits": limits,
+                "worstCaseModelCalls": limits.worst_case_model_calls(),
+                "modelCallBound": limits.model_call_bound(),
+                "notes": limits.notes,
+            }),
+        )
+        .await?;
+
+    let workspace = setup.resolved.workspace.clone();
+    println!("ultracode ({}) on {}", setup.model_id, workspace.display());
+    println!("task: {task}");
+    println!(
+        "budget: at most {} model calls (worst case {}) · max rounds {}\n",
+        limits.model_call_bound(),
+        limits.worst_case_model_calls(),
+        limits.max_rounds
+    );
+
+    let roles = RoleModels {
+        router: setup.models.harness.llm.clone(),
+        reviewers: std::collections::BTreeMap::new(),
+        default_reviewer: setup.models.harness.llm.clone(),
+        board: setup.models.harness.llm.clone(),
+    };
+    let before = snapshot(&workspace, &limits).await;
     let agents = Arc::new(HarnessUltra {
         setup: setup.clone(),
         implementer: tokio::sync::Mutex::new(launcher),
+        implementer_runtime: runtime,
         held: std::sync::Mutex::new(None),
+        last_turn: std::sync::Mutex::new(TurnStatus::Completed),
+        start: before.clone(),
+        after_turn: tokio::sync::Mutex::new(None),
+        plan: std::sync::Mutex::new(None),
+        escalated: std::sync::atomic::AtomicBool::new(false),
+        roles,
+        limits: limits.clone(),
+        recorder,
+        audit: audit.clone(),
+        run_id: run_id.clone(),
+        task_digest: task_digest.clone(),
+        calls: std::sync::atomic::AtomicU64::new(0),
+        charged: std::sync::atomic::AtomicU64::new(0),
     });
-    ultra::run_with(
-        agents.clone(),
-        &setup.model_id,
-        &setup.resolved.workspace.display().to_string(),
-        task,
-        max_rounds,
-    )
-    .await?;
+
+    println!("━━ implement ━━");
+    agents.implement(&task).await;
+    let after = agents.after_turn.lock().await.clone().unwrap_or_default();
+    let mut change = before.diff_with(&after, &limits);
+    change.first_turn = *agents.last_turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let inputs = RouteInputs {
+        features: TaskFeatures::extract(&task),
+        change,
+        repo: RepoSignals::from_snapshot(&after),
+        limits: limits.clone(),
+    };
+    // The router call runs at the session's `members` effort (spec 3.1 §7.23).
+    let decision =
+        route(&agents.roles.router, Some(setup.resolved.effort.members), &task, inputs).await;
+    agents.charged.store(decision.usage.model_calls, std::sync::atomic::Ordering::SeqCst);
+    // Write-ahead: no review starts unless the routing decision is on record (I62).
+    audit.record("harness.ultracode.routed", decision.record_ext(&run_id, &task_digest)).await?;
+    print_route(&decision, &limits);
+    *agents.plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(decision.plan.clone());
+
+    let plan = ultra::ReviewLoop::routed(&decision.plan, decision.plan.escalated(&limits).as_ref());
+    let budget = ultra::UltraBudget {
+        max_model_calls: limits.max_model_calls,
+        implement_model_calls: limits.implement_model_calls,
+        reviewer_model_calls: limits.reviewer_model_calls,
+        board_model_calls: limits.board_model_calls,
+    };
+    let outcome =
+        ultra::run_plan(agents.clone(), &plan, &budget, &task, decision.usage.model_calls).await?;
     let held = agents.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    audit
+        .record(
+            "harness.ultracode.finished",
+            json!({
+                "runId": run_id,
+                "rounds": outcome.rounds,
+                "decision": outcome.decision,
+                "architecture": decision.plan.architecture,
+                "escalated": agents.escalated.load(std::sync::atomic::Ordering::SeqCst),
+                "modelCalls": agents.model_calls() + decision.usage.model_calls,
+                "heldCalls": held.as_ref().map_or(0, |outcome| outcome.held.len()),
+            }),
+        )
+        .await?;
+    if let Some(receipt) = &receipt {
+        let raw = decision.router.as_ref().and_then(|router| router.raw.clone());
+        write_receipt(receipt, &log, &run_id, raw).await?;
+        println!("receipt: {}", receipt.path.display());
+    }
     Ok(match held {
         Some(outcome) => held_exit(&outcome, persistent(&setup)),
         None => 0,
     })
 }
 
-/// Implements in the user's mode in one session; reviews in read-only mode.
+/// A metadata snapshot of `workspace` that enters the skipped directories the `sensitive_paths`
+/// of `limits` name, taken off the async runtime.
+async fn snapshot(workspace: &Path, limits: &UltracodeLimits) -> WorkspaceSnapshot {
+    let root = workspace.to_path_buf();
+    let globs: Vec<String> =
+        limits.sensitive_paths.iter().chain(&limits.workspace_sensitive_paths).cloned().collect();
+    tokio::task::spawn_blocking(move || WorkspaceSnapshot::capture_with(&root, &globs))
+        .await
+        .unwrap_or_default()
+}
+
+/// Why `change` is sensitive, for the console: the first sensitive path, or the cap.
+fn sensitive_reason(change: &ChangeSignals) -> String {
+    let path = change
+        .protected
+        .iter()
+        .chain(&change.security)
+        .chain(&change.sensitive_matched)
+        .chain(&change.workspace_sensitive_matched)
+        .next();
+    match path {
+        Some(path) => format!("a sensitive path changed: {}", adk_harness::escape_control(path)),
+        None if change.truncated => format!(
+            "the workspace has more than {SNAPSHOT_MAX_FILES} files, so the change could not \
+             be seen whole"
+        ),
+        None => "the change is sensitive".to_string(),
+    }
+}
+
+/// Prints the routed plan and why it was chosen; a model's rationale is escaped and shown
+/// here only, never to an agent (spec 3.1 §9.2 I62).
+fn print_route(decision: &RouteDecision, limits: &UltracodeLimits) {
+    let plan = &decision.plan;
+    let rule = match &decision.fallback {
+        Some(fallback) => format!("{}: {}", decision.rule, fallback.code),
+        None => decision.rule.to_string(),
+    };
+    let reviewers: Vec<&str> = plan.reviewers.iter().map(|focus| focus.name()).collect();
+    println!(
+        "route: {} ({rule}) · reviewers {} · board rounds {} · review rounds {}",
+        plan.architecture,
+        reviewers.join(", "),
+        plan.board_rounds,
+        plan.review_rounds
+    );
+    let change = &decision.inputs.change;
+    let why = match decision.rule {
+        Rule::Override => format!(
+            "{} set the architecture to {}",
+            match limits.architecture_source {
+                SettingSource::Flag => "--architecture",
+                SettingSource::ProjectConfig => adk_cli::harness::PROJECT_CONFIG_FILE,
+                SettingSource::UserConfig | SettingSource::Default => "your config",
+            },
+            limits.architecture
+        ),
+        Rule::Unchanged => match change.first_turn {
+            TurnStatus::Completed => {
+                "the first turn changed no file; the fixed review applies".to_string()
+            }
+            status => format!("the first turn ended {status:?}; the fixed review applies"),
+        },
+        Rule::Sensitive => sensitive_reason(change),
+        Rule::Model => {
+            decision.router.as_ref().and_then(|router| router.rationale.clone()).unwrap_or_default()
+        }
+        Rule::Heuristic => format!(
+            "heuristic score {} ({})",
+            decision.heuristic.score,
+            if decision.heuristic.triggers.is_empty() {
+                "no trigger".to_string()
+            } else {
+                decision.heuristic.triggers.join(", ")
+            }
+        ),
+    };
+    println!("why: {why}\n");
+}
+
+/// Writes the `--receipt` file atomically: the run's `harness.ultracode.*` records, the
+/// verification of the whole signed log, and the router's raw answer.
+async fn write_receipt(
+    receipt_file: &OutputFile,
+    log: &adk_harness::EphemeralAuditLog,
+    run_id: &str,
+    router_answer: Option<String>,
+) -> Result<()> {
+    let verified = log.verify().await?;
+    let records: Vec<adk_core::audit_log::AuditRecord> = log
+        .records()
+        .await?
+        .into_iter()
+        .filter(|record| record.action.starts_with("harness.ultracode."))
+        .collect();
+    let ext = |record: &adk_core::audit_log::AuditRecord| {
+        serde_json::Value::Object(record.ext.clone().into_iter().collect())
+    };
+    let one = |action: &str| records.iter().find(|record| record.action == action).map(ext);
+    let reviewed: Vec<serde_json::Value> = records
+        .iter()
+        .filter(|record| record.action == "harness.ultracode.reviewed")
+        .map(ext)
+        .collect();
+    let receipt = json!({
+        "runId": run_id,
+        "chainVerified": verified,
+        "verifierKey": log.verifier_key(),
+        "started": one("harness.ultracode.started"),
+        "routed": one("harness.ultracode.routed"),
+        "escalated": one("harness.ultracode.escalated"),
+        "reviewed": reviewed,
+        "finished": one("harness.ultracode.finished"),
+        "records": records,
+        "routerAnswer": router_answer,
+    });
+    receipt_file.write(serde_json::to_string_pretty(&receipt)?.as_bytes())
+}
+
+/// The models of each `ultracode` role (spec 3.1 §7.10): every role uses the session's
+/// client, per focus when one is set, and each call carries its effort from the session's
+/// `EffortPolicy` (spec 3.1 §7.23): the router and board seats `members`, independent
+/// reviewers `read_only`.
+struct RoleModels {
+    router: Arc<dyn Llm>,
+    reviewers: std::collections::BTreeMap<Focus, Arc<dyn Llm>>,
+    default_reviewer: Arc<dyn Llm>,
+    board: Arc<dyn Llm>,
+}
+
+impl RoleModels {
+    fn reviewer(&self, focus: &str) -> Arc<dyn Llm> {
+        Focus::from_name(focus)
+            .and_then(|focus| self.reviewers.get(&focus))
+            .cloned()
+            .unwrap_or_else(|| self.default_reviewer.clone())
+    }
+}
+
+/// Implements in the user's mode in one session; reviews in read-only mode, independently
+/// or on a board; counts every model call against the run (spec 3.1 §9.2 I61, I63).
 struct HarnessUltra {
     setup: Arc<Setup>,
     implementer: tokio::sync::Mutex<HarnessLauncher>,
+    /// The implementer's runtime, whose spend counts its model calls.
+    implementer_runtime: adk_harness::HarnessRuntime,
     held: std::sync::Mutex<Option<TurnOutcome>>,
+    last_turn: std::sync::Mutex<TurnStatus>,
+    /// The workspace before the first turn, which every revise is compared with.
+    start: WorkspaceSnapshot,
+    /// The workspace after the latest implement or revise turn, which the review stage
+    /// that follows must leave as it is (spec 3.1 §9.2 I61).
+    after_turn: tokio::sync::Mutex<Option<WorkspaceSnapshot>>,
+    /// The plan in effect: the routed one, tightened once a revise makes the change
+    /// sensitive.
+    plan: std::sync::Mutex<Option<ReviewPlan>>,
+    escalated: std::sync::atomic::AtomicBool,
+    roles: RoleModels,
+    limits: UltracodeLimits,
+    recorder: Arc<dyn AuditRecorder>,
+    audit: UltracodeAudit,
+    run_id: String,
+    task_digest: String,
+    /// Model calls of the implementer, reviewers and boards.
+    calls: std::sync::atomic::AtomicU64,
+    /// Model calls made outside the agents: the router's.
+    charged: std::sync::atomic::AtomicU64,
+}
+
+impl HarnessUltra {
+    fn reviewer(&self, focus: &str) -> IndependentReviewer {
+        IndependentReviewer::new(self.roles.reviewer(focus), &self.setup.resolved.workspace)
+            .effort(self.setup.resolved.effort)
+            .guidance(self.setup.instruction.clone())
+            .audit_log(self.recorder.clone())
+            .user(self.setup.user.clone())
+            .model_calls(self.limits.reviewer_model_calls)
+    }
+
+    fn charge(&self, calls: u64) {
+        self.calls.fetch_add(calls, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[async_trait]
 impl UltraAgents for HarnessUltra {
     async fn implement(&self, prompt: &str) {
+        let before = self.implementer_runtime.spend(None).model_calls;
         let mut launcher = self.implementer.lock().await;
-        match launcher.run_once(prompt).await {
+        let turn = launcher.run_once(prompt).await;
+        // The turn's streamed text ends without a newline.
+        println!();
+        let status = match turn {
             Ok(outcome) if !outcome.held.is_empty() => {
                 println!("  {} call(s) held for a decision", outcome.held.len());
                 *self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
                     Some(outcome);
+                TurnStatus::Held
             }
-            Ok(_) => {}
-            Err(error) => println!("  implement failed: {error}"),
+            Ok(outcome) if outcome.interrupted => TurnStatus::Interrupted,
+            Ok(outcome) if outcome.ended_by_denial => TurnStatus::Failed,
+            Ok(_) => TurnStatus::Completed,
+            Err(error) => {
+                println!("  implement failed: {error}");
+                TurnStatus::Failed
+            }
+        };
+        *self.last_turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = status;
+        let after = self.implementer_runtime.spend(None).model_calls;
+        self.charge(after.saturating_sub(before));
+        *self.after_turn.lock().await =
+            Some(snapshot(&self.setup.resolved.workspace, &self.limits).await);
+    }
+
+    async fn escalate(&self, round: i64) -> Result<bool> {
+        let plan = self.plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let Some((plan, escalated)) =
+            plan.and_then(|plan| plan.escalated(&self.limits).map(|escalated| (plan, escalated)))
+        else {
+            return Ok(false);
+        };
+        let Some(after) = self.after_turn.lock().await.clone() else {
+            return Ok(false);
+        };
+        // The whole change since the run began: a revise turn is reviewed as the first
+        // turn would have been (spec 3.1 §7.10).
+        let mut change = self.start.diff_with(&after, &self.limits);
+        change.first_turn =
+            *self.last_turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !change.is_sensitive() {
+            return Ok(false);
         }
+        let reviewers: Vec<&str> = escalated.reviewers.iter().map(|focus| focus.name()).collect();
+        println!(
+            "━━ escalate ━━ {}; reviewers now {}",
+            sensitive_reason(&change),
+            reviewers.join(", ")
+        );
+        // Write-ahead: no stage reviews with the new roster unless it is on record (I62).
+        self.audit
+            .record(
+                "harness.ultracode.escalated",
+                json!({
+                    "runId": self.run_id,
+                    "taskDigest": self.task_digest,
+                    "routerVersion": ROUTER_VERSION,
+                    "round": round,
+                    "change": change,
+                    "from": plan,
+                    "plan": escalated,
+                }),
+            )
+            .await?;
+        *self.plan.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(escalated);
+        self.escalated.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(true)
     }
 
     async fn review(&self, focus: &str, desc: &str, prompt: &str) -> String {
-        let reviewer = async {
-            let instruction =
-                ultra::review_instruction(focus, desc, self.setup.instruction.as_deref());
-            let workspace = Workspace::new(&self.setup.resolved.workspace);
-            let agent = HarnessAgent::builder(format!("review-{focus}"))
-                .model(self.setup.models.harness.llm.clone())
-                .effort(self.setup.resolved.effort)
-                .workspace(workspace)
-                .mode(HarnessMode::ReadOnly)
-                .without_shell()
-                .instruction(instruction)
-                .build()?;
-            let mut launcher = HarnessLauncher::new(agent)
-                .app_name(APP_NAME)
-                .with_user_id(self.setup.user.clone())
-                .with_session_service(Arc::new(InMemorySessionService::new()))
-                .with_console(ConsoleIo::scripted([], false))
-                .quiet();
-            launcher.run_once(prompt).await.map(|outcome| outcome.text)
-        };
-        reviewer.await.unwrap_or_else(|error: adk_core::AdkError| format!("review failed: {error}"))
+        let run = self.reviewer(focus).run(focus, desc, prompt).await;
+        self.charge(run.model_calls);
+        run.text
+    }
+
+    async fn review_board(&self, plan: &ultra::ReviewLoop, prompt: &str) -> ultra::BoardStage {
+        let roster: Vec<Focus> =
+            plan.reviewers.iter().filter_map(|(focus, _)| Focus::from_name(focus)).collect();
+        println!("━━ review board ━━ {} seat(s), {} round(s)", roster.len(), plan.board_rounds);
+        let used = self.model_calls() + self.charged.load(std::sync::atomic::Ordering::SeqCst);
+        let remaining = self.limits.max_model_calls.saturating_sub(used);
+        let fallback = self.reviewer(Focus::Correctness.name());
+        let outcome = ReviewBoard::new(self.roles.board.clone(), &self.setup.resolved.workspace)
+            .effort(self.setup.resolved.effort)
+            .guidance(self.setup.instruction.clone())
+            .audit_log(self.recorder.clone())
+            .roster(roster)
+            .rounds(plan.board_rounds)
+            .model_calls(self.limits.board_model_calls)
+            .user(self.setup.user.clone())
+            .fallback(fallback, remaining)
+            .run(prompt)
+            .await;
+        self.charge(outcome.model_calls);
+        if let Some(code) = &outcome.error_code {
+            println!("  board ended with {code}");
+        }
+        ultra::BoardStage {
+            seats: outcome
+                .seats
+                .iter()
+                .map(|seat| ultra::SeatReview {
+                    focus: seat.focus.name().to_string(),
+                    review: match seat.verdict {
+                        Verdict::Approve => ultra::Review::Approve,
+                        Verdict::Changes => ultra::Review::Changes,
+                        Verdict::Failed => ultra::Review::Failed,
+                    },
+                    notes: seat.notes.clone(),
+                })
+                .collect(),
+            status: match outcome.status {
+                BoardStatus::Completed => "completed",
+                BoardStatus::Failed => "failed",
+                BoardStatus::BudgetExhausted => "budgetExhausted",
+            }
+            .to_string(),
+            fallback: outcome.fallback.iter().map(|focus| focus.name().to_string()).collect(),
+        }
+    }
+
+    fn model_calls(&self) -> u64 {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn stage_reviewed(&self, stage: &ultra::StageReport) -> Result<()> {
+        let notes: Vec<&str> = stage.seats.iter().map(|seat| seat.notes.as_str()).collect();
+        let now = snapshot(&self.setup.resolved.workspace, &self.limits).await;
+        let unchanged = self.after_turn.lock().await.as_ref().map(|turn| *turn == now);
+        self.audit
+            .record(
+                "harness.ultracode.reviewed",
+                json!({
+                    "runId": self.run_id,
+                    "round": stage.round,
+                    "architecture": if stage.board { "blackboard" } else { "graph" },
+                    "verdicts": stage.seats.iter().map(|seat| json!({
+                        "focus": seat.focus,
+                        "verdict": match seat.review {
+                            ultra::Review::Approve => "approve",
+                            ultra::Review::Changes => "changes",
+                            ultra::Review::Failed => "failed",
+                        },
+                    })).collect::<Vec<_>>(),
+                    "status": stage.status,
+                    "fallback": stage.fallback,
+                    "modelCalls": stage.model_calls,
+                    "notesDigest": sha256(notes.join("\n").as_bytes()),
+                    "workspaceUnchanged": unchanged,
+                }),
+            )
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -1094,4 +1708,64 @@ fn workspace_mcp_servers(
         anyhow::anyhow!("{} is not valid MCP configuration: {error}", path.display())
     })?;
     Ok(Some(file.mcp_servers))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_output_file_never_follows_a_planted_link() {
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("authorized_keys");
+        std::fs::write(&victim, "keep").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+
+        // The temporary name the receipt and the goal mirror used to write through.
+        let receipt = OutputFile::prepare(&ws.path().join("receipt.json"), ws.path()).unwrap();
+        std::os::unix::fs::symlink(&victim, ws.path().join("receipt.json.tmp")).unwrap();
+        receipt.write(b"{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(std::fs::read_to_string(ws.path().join("receipt.json")).unwrap(), "{}");
+
+        // A link at the target itself is replaced, not followed.
+        std::fs::remove_file(ws.path().join("receipt.json")).unwrap();
+        std::os::unix::fs::symlink(&victim, ws.path().join("receipt.json")).unwrap();
+        receipt.write(b"{\"again\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(!ws.path().join("receipt.json").symlink_metadata().unwrap().is_symlink());
+
+        // A directory link placed during the run.
+        let out = OutputFile::prepare(&ws.path().join("out/r.json"), ws.path()).unwrap();
+        std::os::unix::fs::symlink(outside.path(), ws.path().join("out")).unwrap();
+        let error = out.write(b"{}").unwrap_err().to_string();
+        assert!(error.contains("is a link inside the workspace"), "{error}");
+        assert!(!outside.path().join("r.json").exists());
+
+        // A directory link placed before the run, by an earlier one.
+        let error = OutputFile::prepare(&ws.path().join("out/r.json"), ws.path())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("is a link inside the workspace"), "{error}");
+
+        // A directory swapped for a link the check cannot see as one: it resolves elsewhere.
+        let file = OutputFile {
+            path: ws.path().join("sub/r.json"),
+            dir: ws.path().join("sub"),
+            workspace: outside.path().join("elsewhere"),
+        };
+        std::fs::create_dir(ws.path().join("real")).unwrap();
+        std::os::unix::fs::symlink(ws.path().join("real"), ws.path().join("sub")).unwrap();
+        let error = file.write(b"{}").unwrap_err().to_string();
+        assert!(error.contains("now resolves to"), "{error}");
+        assert!(!ws.path().join("real/r.json").exists());
+
+        // A link outside the workspace, such as the operator's own, is fine.
+        let linked = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), linked.path().join("receipts")).unwrap();
+        let file = OutputFile::prepare(&linked.path().join("receipts/r.json"), ws.path()).unwrap();
+        file.write(b"{}").unwrap();
+        assert!(outside.path().join("r.json").exists());
+    }
 }
