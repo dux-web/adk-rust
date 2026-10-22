@@ -351,7 +351,16 @@ adk-harness/     Governed harness agent (spec 3.1): HarnessAgent over LlmAgent w
                  durable goals, spend and loop guard, RBAC and shell credentials, working
                  notes and long-term facts with provenance (FactStore, FactIndex, recall,
                  distillation), `.adk/harness.toml` (HarnessConfig), and the `coding`
-                 preset. Umbrella feature `harness`. Beta.
+                 preset. Umbrella feature `harness`; `kernel` feature hosts it in adk-kernel
+                 (Harness::kernel, goal stall parking). Beta.
+adk-kernel/      Agent kernel (spec 3.2): Kernel supervisor with a DurableWorker per QueueClass
+                 (interactive, background, maintenance) and the DurableScheduler, ProcessTable
+                 (ps, spawn, kill, nice, suspend, resume, live ProcessView with spend),
+                 WakeSet sleepers with no lease woken through keyed `kernel.wake` runs (cron,
+                 file, webhook, queue, approval, run-finished, time), standing Triggers,
+                 EventBus, freeze that parks across replicas, control plane on a Unix socket
+                 and loopback HTTP with ControlClient. ProcessStore on in-memory, SQLite,
+                 PostgreSQL, Redis. Beta.
 adk-bench/       Benchmarking framework: framework-level runtime performance with real LLM APIs
                  and cross-framework (Python ADK) comparison
 adk-sandbox/     Sandboxed execution environments — process/WASM backends, OS-level sandbox profiles
@@ -991,7 +1000,7 @@ Always verify builds during publish — never use `--no-verify`. Verification en
 Crates must be published in dependency order. `cargo xtask publish` (via
 `./publish.sh`) computes the order from the workspace graph, so this list is
 documentation rather than configuration — `scripts/check-publish-order.sh` is the
-gate that keeps it satisfiable. The current 11 tiers over 44 publishable crates:
+gate that keeps it satisfiable. The current 11 tiers over 45 publishable crates:
 
 ```
 Tier 1: adk-anthropic, adk-core, adk-enterprise, adk-rust-macros, adk-telemetry,
@@ -1003,7 +1012,7 @@ Tier 3: adk-artifact, adk-code, adk-deploy, adk-graph, adk-memory, adk-model,
 Tier 4: adk-realtime, adk-runner, adk-tool
 Tier 5: adk-acp, adk-agent, adk-audio, adk-eval
 Tier 6: adk-bench, adk-codeact-monty, adk-managed, adk-server
-Tier 7: adk-auth, cargo-adk
+Tier 7: adk-auth, adk-kernel, cargo-adk
 Tier 8: adk-computer-use, adk-payments
 Tier 9: adk-harness
 Tier 10: adk-cli
