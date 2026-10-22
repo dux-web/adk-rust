@@ -28,6 +28,7 @@ async fn separates_raw_attempts_and_stream_completion() {
                 .count(),
             1
         );
+        current.finish(Outcome::Failed);
         Err::<(), _>(())
     })
     .await
@@ -71,12 +72,13 @@ async fn isolates_nested_calls_and_unscoped_requests() {
     let (inner, inner_events) = recorder();
     Attempt::start(Transport::Http, None).headers(200, None);
     scope(outer, async {
-        Attempt::start(Transport::Http, None);
+        let outer_attempt = Attempt::start(Transport::Http, None);
         scope(inner, async {
-            Attempt::start(Transport::WebSocket, None);
+            Attempt::start(Transport::WebSocket, None).finish(Outcome::Succeeded);
             Ok::<_, ()>(())
         })
         .await?;
+        outer_attempt.finish(Outcome::Succeeded);
         Ok::<_, ()>(())
     })
     .await
@@ -87,4 +89,26 @@ async fn isolates_nested_calls_and_unscoped_requests() {
         assert!(events.iter().all(|event| event.attempt == 1));
         assert!(matches!(events[1].kind, Kind::Finished { outcome: Outcome::Succeeded, .. }));
     }
+}
+
+#[tokio::test]
+async fn successful_scope_does_not_complete_abandoned_attempts() {
+    let (observer, events) = recorder();
+    scope(observer, async {
+        Attempt::start(Transport::Http, None).headers(200, None);
+        let next = Attempt::start(Transport::Http, None);
+        next.finish(Outcome::Succeeded);
+        Ok::<_, ()>(())
+    })
+    .await
+    .unwrap();
+    let events = events.lock().unwrap();
+    let endings: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.kind {
+            Kind::Finished { outcome, .. } => Some((event.attempt, outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(endings, [(2, Outcome::Succeeded), (1, Outcome::Cancelled)]);
 }

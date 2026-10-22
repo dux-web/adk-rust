@@ -158,7 +158,9 @@ pub async fn scope<T, E>(
     let state = Arc::new(State { observer, pending: Mutex::new(Pending::default()) });
     let guard = Guard(state.clone());
     let result = CURRENT.scope(state, future).await;
-    guard.0.finish_all(if result.is_ok() { Outcome::Succeeded } else { Outcome::Failed });
+    // Only the protocol/response owner knows whether its own attempt completed.
+    // Unfinished attempts remain cancellations even if a later retry succeeded.
+    drop(guard);
     result
 }
 
@@ -212,11 +214,141 @@ impl Attempt {
         }
     }
 
-    /// Ends a failed raw send before another attempt. Repeated finishes are ignored.
-    /// Successful streams remain pending until the enclosing scope finishes.
+    /// Ends this attempt at its own response boundary. Repeated finishes are ignored.
     pub fn finish(&self, outcome: Outcome) {
         if let Some((state, id, _)) = &self.0 {
             state.finish(*id, outcome);
         }
+    }
+}
+
+impl Attempt {
+    /// Keeps this attempt alive until its owner finishes it or drops the guard.
+    ///
+    /// Move the guard with the response/decoder, not into a client or session cache.
+    /// A guard dropped before an explicit finish reports cancellation.
+    pub fn guard(&self) -> AttemptGuard {
+        AttemptGuard(self.clone())
+    }
+
+    fn current() -> Self {
+        CURRENT
+            .try_with(|state| {
+                state
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .attempts
+                    .last_key_value()
+                    .map(|(&id, &start)| Self(Some((state.clone(), id, start))))
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    fn active(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|(state, id, _)| state.pending.lock().unwrap().attempts.contains_key(id))
+    }
+}
+
+/// Non-cloneable lifetime guard for one raw transport attempt.
+pub struct AttemptGuard(Attempt);
+
+impl AttemptGuard {
+    /// Records the response owner's terminal outcome, at most once.
+    pub fn finish(&self, outcome: Outcome) {
+        self.0.finish(outcome);
+    }
+}
+
+impl Drop for AttemptGuard {
+    fn drop(&mut self) {
+        self.finish(Outcome::Cancelled);
+    }
+}
+
+struct Operation {
+    state: Option<Arc<State>>,
+    after: u64,
+}
+impl Operation {
+    fn finish(&mut self, outcome: Outcome) {
+        if let Some(state) = self.state.take() {
+            let attempts =
+                state.pending.lock().unwrap().attempts.split_off(&self.after.saturating_add(1));
+            for (id, start) in attempts {
+                state.emit(id, Kind::Finished { elapsed: start.elapsed(), outcome });
+            }
+        }
+    }
+}
+impl Drop for Operation {
+    fn drop(&mut self) {
+        self.finish(Outcome::Cancelled);
+    }
+}
+
+/// Observes an individual request/parse operation before its caller may retry it.
+///
+/// An error finishes only attempts started by this operation, before any retry
+/// backoff. Success leaves response consumption to [`observe_stream`] or an
+/// explicit [`AttemptGuard`]. Cancellation finishes this operation's attempts.
+/// Use one scope per logical invocation; do not share it between concurrent calls.
+pub async fn operation<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, E> {
+    let state = CURRENT.try_with(Arc::clone).ok();
+    let after = state.as_ref().map_or(0, |state| state.pending.lock().unwrap().next);
+    let mut guard = Operation { state, after };
+    let result = future.await;
+    if result.is_err() {
+        guard.finish(Outcome::Failed);
+    } else {
+        guard.state = None;
+    }
+    result
+}
+
+/// Finishes a model stream's attempt at its semantic terminal, error, or drop.
+///
+/// HTTP body EOF alone is not success. The provider parser must emit a complete
+/// response; error responses and EOF without a terminal finish as failures.
+/// This wrapper does not alter results, retry requests, or retain their content.
+pub fn observe_stream(stream: crate::LlmResponseStream) -> crate::LlmResponseStream {
+    Box::pin(ObservedStream { stream, guard: Attempt::current().guard() })
+}
+
+struct ObservedStream {
+    stream: crate::LlmResponseStream,
+    guard: AttemptGuard,
+}
+impl futures::Stream for ObservedStream {
+    type Item = Result<crate::LlmResponse, crate::AdkError>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let result = self.stream.as_mut().poll_next(cx);
+        // Some providers start the raw request lazily on the first stream poll.
+        // Failed retries have already finished at their own operation boundary.
+        if !self.guard.0.active() {
+            self.guard = Attempt::current().guard();
+        }
+        match &result {
+            std::task::Poll::Ready(Some(Err(_))) => self.guard.finish(Outcome::Failed),
+            std::task::Poll::Ready(Some(Ok(response))) => {
+                if response.error_code.is_some() || response.error_message.is_some() {
+                    self.guard.finish(Outcome::Failed);
+                } else if response.turn_complete
+                    || (!response.partial && response.finish_reason.is_some())
+                {
+                    self.guard.finish(Outcome::Succeeded);
+                }
+            }
+            std::task::Poll::Ready(None) => self.guard.finish(Outcome::Failed),
+            std::task::Poll::Pending => {}
+        }
+        result
     }
 }

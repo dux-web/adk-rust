@@ -599,7 +599,7 @@ impl WsTransport {
                 )
             })
         }));
-        Ok(stream)
+        Ok(adk_core::model_observation::observe_stream(stream))
         }.await;
         if result.is_err() {
             attempt.finish(Outcome::Failed);

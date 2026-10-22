@@ -1402,3 +1402,49 @@ async fn completed_mcp_calls_mark_stream_interruptions() {
         assert_eq!(error.details.metadata["transport"], "websocket");
     }
 }
+
+#[tokio::test]
+async fn observations_finish_at_socket_stream_boundaries() {
+    use adk_core::model_observation::{self, Kind, Outcome};
+    for cancel in [false, true] {
+        let server = Server::start(
+            Arc::new(move |_| {
+                if cancel {
+                    vec![Step::Send(delta("partial")), Step::Pause(500), Step::Close]
+                } else {
+                    vec![Step::Send(delta("partial")), Step::Close]
+                }
+            }),
+            accept_all(),
+        )
+        .await;
+        let transport = WsTransport::lazy(&server.base, "sk-test", Default::default());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        model_observation::scope(
+            Arc::new(move |event| output.lock().unwrap().push(event)),
+            async {
+                let mut stream = transport.send_request(request("fixture")).await.unwrap();
+                assert!(stream.next().await.unwrap().unwrap().partial);
+                if !cancel {
+                    assert!(stream.next().await.unwrap().is_err());
+                }
+                drop(stream);
+                let expected = if cancel { Outcome::Cancelled } else { Outcome::Failed };
+                let captured = events.lock().unwrap();
+                let endings: Vec<_> = captured
+                    .iter()
+                    .filter_map(|event| match event.kind {
+                        Kind::Finished { outcome, .. } => Some(outcome),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(endings, [expected]);
+                Ok::<_, ()>(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+}

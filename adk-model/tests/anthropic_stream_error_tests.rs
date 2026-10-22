@@ -284,7 +284,7 @@ async fn unreadable_error_bodies_preserve_response_headers() {
     use adk_model::request_retry::RequestRetryConfig;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for (status, category) in
-        [(400, ErrorCategory::InvalidRequest), (429, ErrorCategory::RateLimited)]
+        [(400, ErrorCategory::InvalidInput), (429, ErrorCategory::RateLimited)]
     {
         for stream in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

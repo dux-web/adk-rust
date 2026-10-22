@@ -611,3 +611,120 @@ async fn completed_mcp_calls_mark_stream_interruptions() {
     assert_eq!(error.details.metadata["transport"], "http");
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn observations_finish_before_body_retry_backoff() {
+    use adk_core::model_observation::{self, Kind, Outcome};
+    use std::{io::Write, sync::Mutex, time::Duration};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let body = completion()["response"].to_string();
+    let server = std::thread::spawn(move || {
+        for index in 0..2 {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            read_request(&mut socket);
+            if index == 0 {
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{").unwrap();
+            } else {
+                std::thread::sleep(Duration::from_millis(80));
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+            }
+        }
+    });
+    let model = client(&base, true).with_retry_config(
+        RetryConfig::default().with_max_retries(1).with_initial_delay(Duration::from_millis(150)),
+    );
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let output = events.clone();
+    model_observation::scope(Arc::new(move |event| output.lock().unwrap().push(event)), async {
+        model.generate_content(request(), false).await?.try_collect::<Vec<_>>().await
+    })
+    .await
+    .unwrap();
+    server.join().unwrap();
+    let events = events.lock().unwrap();
+    let endings: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.kind {
+            Kind::Finished { elapsed, outcome } => Some((event.attempt, elapsed, outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(endings.len(), 2);
+    assert_eq!((endings[0].0, endings[0].2), (1, Outcome::Failed));
+    assert_eq!((endings[1].0, endings[1].2), (2, Outcome::Succeeded));
+    assert!(endings[1].1 >= Duration::from_millis(70));
+    let first_end = events
+        .iter()
+        .position(|event| event.attempt == 1 && matches!(event.kind, Kind::Finished { .. }))
+        .unwrap();
+    let next_start = events
+        .iter()
+        .position(|event| event.attempt == 2 && matches!(event.kind, Kind::Started { .. }))
+        .unwrap();
+    assert!(first_end < next_start, "failed body must finish before backoff and next send");
+}
+
+#[tokio::test]
+async fn observations_follow_stream_outcomes() {
+    use adk_core::model_observation::{self, Kind, Outcome};
+    use std::sync::Mutex;
+    let delta = json!({"type":"response.output_text.delta", "sequence_number":0,
+        "output_index":0, "item_id":"msg_test", "content_index":0, "delta":"partial", "logprobs":[]});
+    let mut failed = completion();
+    failed["type"] = "response.failed".into();
+    failed["response"]["status"] = "failed".into();
+    failed["response"]["error"] = json!({"code":"server_error", "message":"fixture"});
+    for (event, outcome, stop_early) in [
+        (completion(), Outcome::Succeeded, false),
+        (failed, Outcome::Failed, false),
+        (delta.clone(), Outcome::Failed, false),
+        (delta, Outcome::Cancelled, true),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {event}\n\n")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let model = client(&server.uri(), true).with_response_recovery(true);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        model_observation::scope(
+            Arc::new(move |event| output.lock().unwrap().push(event)),
+            async {
+                let mut stream = model.generate_content(request(), true).await.unwrap();
+                if stop_early {
+                    assert!(stream.next().await.unwrap().unwrap().partial);
+                } else {
+                    while let Some(item) = stream.next().await {
+                        if item.is_err() {
+                            break;
+                        }
+                        if item.unwrap().turn_complete {
+                            break;
+                        }
+                    }
+                }
+                drop(stream);
+                // The attempt must finish now, not when the successful outer scope ends.
+                assert!(events.lock().unwrap().iter().any(|event|
+                matches!(event.kind, Kind::Finished {outcome: actual, ..} if actual == outcome)));
+                Ok::<_, ()>(())
+            },
+        )
+        .await
+        .unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.iter().filter(|event| matches!(event.kind, Kind::Finished { .. })).count(),
+            1
+        );
+        server.verify().await;
+    }
+}
