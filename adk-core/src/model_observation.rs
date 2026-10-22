@@ -33,30 +33,58 @@ pub struct Event {
 #[derive(Clone, Debug)]
 pub enum Kind {
     /// Execution has reached the generation transport.
-    Started { transport: Transport, reused: Option<bool> },
+    Started {
+        /// Transport selected for this attempt.
+        transport: Transport,
+        /// Whether a connection was reused, when known at attempt start.
+        reused: Option<bool>,
+    },
     /// The actual serialized JSON request after provider customization.
-    Prepared { body: Value },
+    Prepared {
+        /// Adapted request body; project sensitive fields without retaining them.
+        body: Value,
+    },
     /// A WebSocket connection has been selected for this generation.
-    Connection { reused: bool },
+    Connection {
+        /// Whether this generation uses an existing WebSocket connection.
+        reused: bool,
+    },
     /// Actual HTTP response or WebSocket upgrade headers have arrived.
     /// A reused socket does not emit fabricated headers for a new generation.
-    Headers { status: u16, elapsed: Duration, reused: Option<bool> },
+    Headers {
+        /// HTTP response status, including a WebSocket upgrade status.
+        status: u16,
+        /// Monotonic time from attempt start to header arrival.
+        elapsed: Duration,
+        /// Connection reuse state when the transport can determine it.
+        reused: Option<bool>,
+    },
     /// The request failed, the enclosing response consumption finished, or it was dropped.
-    Finished { elapsed: Duration, outcome: Outcome },
+    Finished {
+        /// Monotonic time from attempt start to its observed end.
+        elapsed: Duration,
+        /// Whether the attempt completed, failed, or was dropped.
+        outcome: Outcome,
+    },
 }
 
 /// The transport used by this attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
+    /// A generation request carried by HTTP, including streaming responses.
     Http,
+    /// A generation request carried by a WebSocket connection.
     WebSocket,
 }
 
 /// The observed result, independent of retry eligibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Outcome {
+    /// The enclosing response consumption completed successfully.
     Succeeded,
+    /// The raw request or enclosing response consumption returned an error.
     Failed,
+    /// The observation scope was dropped before completion.
     Cancelled,
 }
 
