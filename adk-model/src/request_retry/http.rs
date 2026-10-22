@@ -3,7 +3,7 @@ use super::RequestRetryConfig;
 use adk_core::AdkError;
 use adk_core::model_observation::{Attempt, Outcome, Transport};
 use reqwest::{Client, Error, Request, Response};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
 struct RetryDeadline(Instant);
@@ -37,13 +37,69 @@ pub(crate) async fn send(
     .await
 }
 
+#[derive(Debug)]
+pub(crate) enum SendError {
+    Request(Error),
+    HeadersTimeout,
+}
+
+pub(crate) async fn send_timed(
+    client: &Client,
+    request: Request,
+    policy: RequestRetryConfig,
+    headers_timeout: Duration,
+) -> Result<Response, SendError> {
+    if request.try_clone().is_none() {
+        return observed_timed(client, request, Some(headers_timeout)).await;
+    }
+    super::execute(
+        policy,
+        || {
+            observed_timed(
+                client,
+                request.try_clone().expect("buffered request remains cloneable"),
+                Some(headers_timeout),
+            )
+        },
+        |result| match result {
+            Ok(response) => response.status().is_server_error(),
+            Err(SendError::HeadersTimeout) => true,
+            Err(SendError::Request(error)) => !error.is_builder() && !error.is_redirect(),
+        },
+        |result| result.as_ref().ok().and_then(deadline),
+    )
+    .await
+}
+
 async fn observed(client: &Client, request: Request) -> Result<Response, Error> {
+    match observed_timed(client, request, None).await {
+        Ok(response) => Ok(response),
+        Err(SendError::Request(error)) => Err(error),
+        Err(SendError::HeadersTimeout) => unreachable!("no explicit header timeout"),
+    }
+}
+
+async fn observed_timed(
+    client: &Client,
+    request: Request,
+    timeout: Option<Duration>,
+) -> Result<Response, SendError> {
     let attempt = Attempt::start(Transport::Http, None);
     attempt.prepared(request.body().and_then(|body| body.as_bytes()));
-    let result = client.execute(request).await;
-    match &result {
+    let send = client.execute(request);
+    let mut result = match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, send).await {
+            Ok(result) => result.map_err(SendError::Request),
+            Err(_) => Err(SendError::HeadersTimeout),
+        },
+        None => send.await.map_err(SendError::Request),
+    };
+    match &mut result {
         Ok(response) => {
             attempt.headers(response.status().as_u16(), None);
+            if let Some(deadline) = deadline(response) {
+                response.extensions_mut().insert(RetryDeadline(deadline));
+            }
             if !response.status().is_success() {
                 attempt.finish(Outcome::Failed);
             }

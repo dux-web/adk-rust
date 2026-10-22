@@ -82,3 +82,72 @@ async fn classifies_response_header_timeouts() {
         server.verify().await;
     }
 }
+
+#[tokio::test]
+async fn raw_retries_bound_each_header_wait() {
+    use adk_model::request_retry::RequestRetryConfig;
+    for explicit in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let mut model = AnthropicClient::new(
+            AnthropicConfig::new("key", "claude-sonnet-4-6")
+                .with_base_url(server.uri())
+                .with_request_timeout(Duration::from_secs(1)),
+        )
+        .unwrap()
+        .with_retry_config(RetryConfig::disabled())
+        .with_request_retry(RequestRetryConfig { max_retries: 1, initial_delay: Duration::ZERO });
+        if explicit {
+            // Updating timeouts after installing the executor must also take effect.
+            model = model
+                .with_timeouts(HttpTimeouts::new(Duration::from_secs(1), Duration::from_millis(40)))
+                .unwrap();
+        }
+        let error = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = model.generate_content(request(), true).await.unwrap();
+            events.next().await.unwrap().unwrap_err()
+        })
+        .await
+        .expect("both individual sends must have bounded header waits");
+        assert_eq!(error.category, ErrorCategory::Timeout);
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn header_deadline_excludes_server_backoff() {
+    use adk_model::request_retry::RequestRetryConfig;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let server = MockServer::start().await;
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    Mock::given(method("POST")).respond_with(move |_: &wiremock::Request| {
+        if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            ResponseTemplate::new(503).insert_header("retry-after", "1")
+        } else {
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({"error":{"type":"invalid_request_error","message":"fixture"}}))
+        }
+    }).expect(2).mount(&server).await;
+    let model = AnthropicClient::new(
+        AnthropicConfig::new("key", "claude-sonnet-4-6").with_base_url(server.uri()),
+    )
+    .unwrap()
+    .with_retry_config(RetryConfig::disabled())
+    .with_timeouts(HttpTimeouts::new(Duration::from_secs(1), Duration::from_millis(100)))
+    .unwrap()
+    .with_request_retry(RequestRetryConfig { max_retries: 1, initial_delay: Duration::ZERO });
+    let started = std::time::Instant::now();
+    let mut events = model.generate_content(request(), true).await.unwrap();
+    let error = events.next().await.unwrap().unwrap_err();
+    assert_eq!(error.details.upstream_status_code, Some(400));
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+}

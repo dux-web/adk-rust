@@ -108,6 +108,19 @@ pub type GenerationExecutor = Arc<
         + Sync,
 >;
 
+/// Generation executor receiving the current per-send response-header timeout.
+///
+/// The timeout applies to each send, excluding retry backoff and response bodies.
+pub type TimedGenerationExecutor = Arc<
+    dyn Fn(
+            ReqwestClient,
+            reqwest::Request,
+            Duration,
+        ) -> futures::future::BoxFuture<'static, Result<Response>>
+        + Send
+        + Sync,
+>;
+
 /// Client for the Anthropic API with performance optimizations.
 ///
 /// # Timeouts
@@ -131,7 +144,7 @@ pub struct Anthropic {
     stream_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     max_retries: usize,
-    generation_executor: Option<GenerationExecutor>,
+    generation_executor: Option<TimedGenerationExecutor>,
     throughput_ops_sec: f64,
     reserve_capacity: f64,
     /// Cached headers for performance - Arc for cheap cloning
@@ -769,6 +782,16 @@ impl Anthropic {
     /// Callers providing request retries should also disable `with_max_retries`
     /// to avoid nesting the SDK response-level retry policy.
     pub fn with_generation_executor(mut self, executor: GenerationExecutor) -> Self {
+        self.generation_executor =
+            Some(Arc::new(move |client, request, _| executor(client, request)));
+        self
+    }
+
+    /// Installs a generation executor with the current per-send header deadline.
+    ///
+    /// Unlike a timer around the executor, this lets retries wait their full
+    /// backoff while bounding each individual send. Parsing stays with this SDK.
+    pub fn with_timed_generation_executor(mut self, executor: TimedGenerationExecutor) -> Self {
         self.generation_executor = Some(executor);
         self
     }
@@ -782,7 +805,7 @@ impl Anthropic {
         if request.url().path().ends_with("/messages")
             && let Some(executor) = &self.generation_executor
         {
-            return executor(client.clone(), request).await;
+            return executor(client.clone(), request, self.timeout).await;
         }
         client.execute(request).await.map_err(|error| self.map_request_error(error))
     }

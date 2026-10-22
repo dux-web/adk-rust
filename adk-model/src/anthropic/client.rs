@@ -213,7 +213,8 @@ impl AnthropicClient {
     /// Defaults to no raw retries. Keep response-level retries disabled when
     /// a caller owns stream recovery separately.
     pub fn with_request_retry(mut self, policy: crate::request_retry::RequestRetryConfig) -> Self {
-        self.client = self.client.with_generation_executor(super::transport::executor(policy));
+        self.client =
+            self.client.with_timed_generation_executor(super::transport::executor(policy));
         self.transport_recovery = true;
         self
     }

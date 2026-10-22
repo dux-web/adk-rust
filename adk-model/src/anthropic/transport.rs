@@ -2,10 +2,10 @@
 use crate::request_retry::{RequestRetryConfig, http};
 use adk_core::{AdkError, ErrorCategory, ErrorComponent};
 
-pub(super) fn executor(policy: RequestRetryConfig) -> adk_anthropic::GenerationExecutor {
-    std::sync::Arc::new(move |client, request| {
+pub(super) fn executor(policy: RequestRetryConfig) -> adk_anthropic::TimedGenerationExecutor {
+    std::sync::Arc::new(move |client, request, headers_timeout| {
         Box::pin(async move {
-            send(&client, request, policy).await.map_err(|error| {
+            send(&client, request, policy, headers_timeout).await.map_err(|error| {
                 adk_anthropic::Error::http_client(
                     "Generation transport failed",
                     Some(Box::new(error)),
@@ -19,25 +19,44 @@ async fn send(
     client: &reqwest::Client,
     request: reqwest::Request,
     policy: RequestRetryConfig,
+    headers_timeout: std::time::Duration,
 ) -> Result<reqwest::Response, AdkError> {
-    let response = http::send(client, request, policy).await.map_err(|source| {
-        http::network(
-            AdkError::new(
-                ErrorComponent::Model,
-                if source.is_timeout() {
-                    ErrorCategory::Timeout
-                } else {
-                    ErrorCategory::Unavailable
-                },
-                "model.anthropic.transport",
-                adk_core::upstream_excerpt(&source.to_string()),
+    let response =
+        http::send_timed(client, request, policy, headers_timeout).await.map_err(|failure| {
+            let source = match failure {
+                http::SendError::Request(source) => source,
+                http::SendError::HeadersTimeout => {
+                    let mut error = http::annotate(
+                        AdkError::new(
+                            ErrorComponent::Model,
+                            ErrorCategory::Timeout,
+                            "model.anthropic.timeout",
+                            "Timed out waiting for Anthropic response headers",
+                        )
+                        .with_provider("anthropic"),
+                        "request",
+                    );
+                    error.details.metadata.insert("transport_error_kind".into(), "timeout".into());
+                    return error;
+                }
+            };
+            http::network(
+                AdkError::new(
+                    ErrorComponent::Model,
+                    if source.is_timeout() {
+                        ErrorCategory::Timeout
+                    } else {
+                        ErrorCategory::Unavailable
+                    },
+                    "model.anthropic.transport",
+                    adk_core::upstream_excerpt(&source.to_string()),
+                )
+                .with_provider("anthropic"),
+                &source,
+                "request",
             )
-            .with_provider("anthropic"),
-            &source,
-            "request",
-        )
-        .with_source(source)
-    })?;
+            .with_source(source)
+        })?;
     if response.status().is_success() {
         return Ok(response);
     }
