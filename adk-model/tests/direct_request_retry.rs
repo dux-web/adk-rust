@@ -1,7 +1,10 @@
 //! Raw request retries stay below generation preparation and stream consumption.
 #![cfg(all(feature = "openai", feature = "deepseek", feature = "azure-ai"))]
 
-use adk_core::{AdkError, Content, Llm, LlmRequest};
+use adk_core::{
+    AdkError, Content, Llm, LlmRequest,
+    model_observation::{self, Kind, Outcome},
+};
 use adk_model::{
     OpenAICompatible, OpenAICompatibleConfig,
     azure_ai::{AzureAIClient, AzureAIConfig},
@@ -13,7 +16,7 @@ use adk_model::{
 use futures::StreamExt;
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -129,13 +132,31 @@ async fn preserves_prepared_request() {
         headers.insert("x-prepared", "once".parse().unwrap());
         Ok(())
     }));
-    failure(&client, true).await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let output = events.clone();
+    model_observation::scope(Arc::new(move |event| output.lock().unwrap().push(event)), async {
+        Err::<(), _>(failure(&client, true).await)
+    })
+    .await
+    .unwrap_err();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 5);
     for request in &requests {
         assert_eq!(request.body, requests[0].body);
         assert_eq!(request.headers["x-prepared"], "once");
+    }
+    let events = events.lock().unwrap();
+    for attempt in 1..=5 {
+        let attempt_events: Vec<_> =
+            events.iter().filter(|event| event.attempt == attempt).collect();
+        assert_eq!(attempt_events.len(), 4);
+        assert!(matches!(attempt_events[0].kind, Kind::Started { .. }));
+        assert!(
+            matches!(&attempt_events[1].kind, Kind::Prepared { body } if body == &serde_json::from_slice::<serde_json::Value>(&requests[0].body).unwrap())
+        );
+        assert!(matches!(attempt_events[2].kind, Kind::Headers { status: 500, .. }));
+        assert!(matches!(attempt_events[3].kind, Kind::Finished { outcome: Outcome::Failed, .. }));
     }
 }
 

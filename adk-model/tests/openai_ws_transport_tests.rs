@@ -1333,3 +1333,49 @@ async fn fallback_requires_explicit_opt_in() {
     assert_eq!(server.handshakes(), 1);
     assert!(server.requests.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn observes_generation_without_replaying_handshake_headers() {
+    use adk_core::model_observation::{self, Kind, Outcome};
+    let server = Server::start(Arc::new(|_| answer("answer")), accept_all()).await;
+    let transport = WsTransport::lazy(&server.base, "sk-test", Default::default());
+    for reused in [false, true] {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        model_observation::scope(
+            Arc::new(move |event| output.lock().unwrap().push(event)),
+            async {
+                let (_, error) = collect(&transport, if reused { "q2" } else { "q1" }).await;
+                match error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let events = events.lock().unwrap();
+        assert!(events.iter().all(|event| event.attempt == 1));
+        assert!(events.iter().any(
+            |event| matches!(event.kind, Kind::Connection { reused: actual } if actual == reused)
+        ));
+        let headers: Vec<_> =
+            events.iter().filter(|event| matches!(event.kind, Kind::Headers { .. })).collect();
+        assert_eq!(headers.len(), usize::from(!reused));
+        if !reused {
+            assert!(matches!(
+                headers[0].kind,
+                Kind::Headers { status: 101, reused: Some(false), .. }
+            ));
+        }
+        assert!(matches!(
+            events.last().unwrap().kind,
+            Kind::Finished { outcome: Outcome::Succeeded, .. }
+        ));
+        let requests = server.requests.lock().unwrap();
+        assert!(events.iter().any(
+            |event| matches!(&event.kind, Kind::Prepared { body } if Some(body)==requests.last())
+        ));
+    }
+    assert_eq!(server.handshakes(), 1);
+}

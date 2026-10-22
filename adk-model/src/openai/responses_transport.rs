@@ -1,5 +1,6 @@
 //! Raw Responses HTTP retries and content-free transport provenance.
 use adk_core::AdkError;
+use adk_core::model_observation::{Attempt, Outcome, Transport};
 use async_openai::{
     error::OpenAIError,
     middleware::{HttpRequestFactory, ReqwestService},
@@ -22,7 +23,35 @@ pub(super) async fn send(
             let factory = factory.clone();
             let observer = observer.clone();
             async move {
+                let observed = std::sync::Arc::new(std::sync::Mutex::new(Attempt::default()));
+                let prepared = observed.clone();
+                let factory = HttpRequestFactory::new(move || {
+                    let factory = factory.clone();
+                    let prepared = prepared.clone();
+                    async move {
+                        let request = factory.build().await?;
+                        // Background polling and other SDK resources are not generation attempts.
+                        if request.method() == http::Method::POST
+                            && request.url().path().ends_with("/responses")
+                        {
+                            let attempt = Attempt::start(Transport::Http, None);
+                            attempt.prepared(request.body().and_then(|body| body.as_bytes()));
+                            *prepared.lock().unwrap() = attempt;
+                        }
+                        Ok(request)
+                    }
+                });
                 let mut result = transport.oneshot(factory).await;
+                let attempt = observed.lock().unwrap().clone();
+                match &result {
+                    Ok(response) => {
+                        attempt.headers(response.status().as_u16(), None);
+                        if !response.status().is_success() {
+                            attempt.finish(Outcome::Failed);
+                        }
+                    }
+                    Err(_) => attempt.finish(Outcome::Failed),
+                }
                 if let Ok(response) = &mut result
                     && let Some(deadline) = retry_at(response.headers())
                 {

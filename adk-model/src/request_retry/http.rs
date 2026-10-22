@@ -1,6 +1,7 @@
 //! Request retries for native clients using reqwest 0.12.
 use super::RequestRetryConfig;
 use adk_core::AdkError;
+use adk_core::model_observation::{Attempt, Outcome, Transport};
 use reqwest::{Client, Error, Request, Response};
 use std::time::Instant;
 
@@ -14,14 +15,14 @@ pub(crate) async fn send(
 ) -> Result<Response, Error> {
     // Streaming uploads cannot be replayed. Model JSON requests are buffered.
     if request.try_clone().is_none() {
-        return client.execute(request).await;
+        return observed(client, request).await;
     }
     super::execute(
         policy,
         || async {
-            let mut response = client
-                .execute(request.try_clone().expect("buffered request remains cloneable"))
-                .await?;
+            let mut response =
+                observed(client, request.try_clone().expect("buffered request remains cloneable"))
+                    .await?;
             if let Some(deadline) = deadline(&response) {
                 response.extensions_mut().insert(RetryDeadline(deadline));
             }
@@ -34,6 +35,22 @@ pub(crate) async fn send(
         |result| result.as_ref().ok().and_then(deadline),
     )
     .await
+}
+
+async fn observed(client: &Client, request: Request) -> Result<Response, Error> {
+    let attempt = Attempt::start(Transport::Http, None);
+    attempt.prepared(request.body().and_then(|body| body.as_bytes()));
+    let result = client.execute(request).await;
+    match &result {
+        Ok(response) => {
+            attempt.headers(response.status().as_u16(), None);
+            if !response.status().is_success() {
+                attempt.finish(Outcome::Failed);
+            }
+        }
+        Err(_) => attempt.finish(Outcome::Failed),
+    }
+    result
 }
 
 pub(crate) fn deadline(response: &Response) -> Option<Instant> {

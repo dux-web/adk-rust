@@ -1,0 +1,1 @@
+Added opt-in call-scoped generation observation with prepared JSON, transport attempt identities, actual response-header timings, and completion or cancellation outcomes. Reused WebSocket connections report reuse without replaying earlier handshake timings. Observation callbacks do not change request or retry behavior.
