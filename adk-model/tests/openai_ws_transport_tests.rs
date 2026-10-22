@@ -1379,3 +1379,26 @@ async fn observes_generation_without_replaying_handshake_headers() {
     }
     assert_eq!(server.handshakes(), 1);
 }
+
+#[tokio::test]
+async fn completed_mcp_calls_mark_stream_interruptions() {
+    for (kind, completed) in
+        [("response.mcp_call.completed", true), ("response.mcp_call.in_progress", false)]
+    {
+        let event =
+            json!({"type":kind, "sequence_number":1, "output_index":0, "item_id":"mcp-call"});
+        let (_, error) =
+            single(Arc::new(move |_| vec![Step::Send(event.clone()), Step::Close])).await;
+        let error = error.expect("unfinished response must fail");
+        assert_eq!(
+            error
+                .details
+                .metadata
+                .get("provider_tool_completed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            completed
+        );
+        assert_eq!(error.details.metadata["transport"], "websocket");
+    }
+}

@@ -172,6 +172,15 @@ pub(super) fn ignore_event(value: &serde_json::Value) -> bool {
 }
 
 pub(super) fn tool_completed(value: &serde_json::Value) -> bool {
+    // The pinned Responses SDK defines this as successful execution, independently
+    // of the later output-item and response terminal events.
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("response.mcp_call.completed")
+    {
+        return serde_json::from_value::<
+            async_openai::types::responses::ResponseMCPCallCompletedEvent,
+        >(value.clone())
+        .is_ok();
+    }
     value.get("type").and_then(serde_json::Value::as_str) == Some("response.output_item.done")
         && matches!(
             value.pointer("/item/type").and_then(serde_json::Value::as_str),

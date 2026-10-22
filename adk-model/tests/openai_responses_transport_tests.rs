@@ -583,3 +583,31 @@ async fn completed_native_tools_mark_later_interruptions() {
     assert_eq!(error.details.metadata["provider_tool_completed"], true);
     assert_eq!(error.details.metadata["transport_phase"], "stream");
 }
+
+#[tokio::test]
+async fn completed_mcp_calls_mark_stream_interruptions() {
+    let server = MockServer::start().await;
+    let event = json!({"type":"response.mcp_call.completed", "sequence_number":1,
+        "output_index":0, "item_id":"mcp-call"});
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {event}\n\n")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let error = client(&server.uri(), true)
+        .with_response_recovery(true)
+        .generate_content(request(), true)
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+    assert_eq!(error.details.metadata["provider_tool_completed"], true);
+    assert_eq!(error.details.metadata["transport"], "http");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
