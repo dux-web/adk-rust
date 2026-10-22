@@ -630,7 +630,7 @@ async fn adapter_can_remove_default_authorization() {
                 headers.insert("x-provider-token", http::HeaderValue::from_static("custom grant"));
                 Ok(())
             }))
-            .with_websocket(WsOptions::default());
+            .with_websocket(WsOptions { fallback_to_http: true, ..Default::default() });
         client.preconnect().await.unwrap();
         let mut stream = client
             .generate_content(
@@ -725,7 +725,7 @@ async fn read_timeout_is_classified() {
     );
     let error = transport.send_request(request("first")).await.err().unwrap();
     assert_eq!(error.category, ErrorCategory::Timeout);
-    assert!(error.is_retryable());
+    assert!(!error.is_retryable(), "the server may have accepted the request");
 }
 
 #[tokio::test]
@@ -1017,7 +1017,7 @@ async fn fallback_retries_adapt_original_requests() {
             headers.append("x-nonce", http::HeaderValue::from_str(&attempt.to_string()).unwrap());
             Ok(())
         }))
-        .with_websocket(WsOptions::default());
+        .with_websocket(WsOptions { fallback_to_http: true, ..Default::default() });
     let responses: Vec<_> = client
         .generate_content(
             LlmRequest::new("test-model", vec![Content::new("user").with_text("first")]),
@@ -1091,6 +1091,7 @@ async fn fallback_preserves_the_adapted_request() {
                 Ok(())
             }))
             .with_websocket(WsOptions {
+                fallback_to_http: true,
                 observe: Arc::new(move |event| observed.lock().unwrap().push(event)),
                 ..Default::default()
             });
@@ -1131,6 +1132,56 @@ async fn fallback_preserves_the_adapted_request() {
 }
 
 #[tokio::test]
+async fn fallback_is_disabled_by_default() {
+    use adk_core::{Content, Llm, LlmRequest};
+    use adk_model::openai::{OpenAIResponsesClient, TransportEvent, WsOptions};
+
+    assert!(!WsOptions::default().fallback_to_http);
+    for failure in ["handshake", "close", "timeout"] {
+        let server = Server::combined(
+            Arc::new(move |request| {
+                if request["type"] != "response.create" {
+                    return answer("unexpected HTTP");
+                }
+                if failure == "close" { vec![Step::Close] } else { vec![Step::Pause(300)] }
+            }),
+            Arc::new(move |_| (failure == "handshake").then_some(426)),
+            true,
+        )
+        .await;
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = observations.clone();
+        let client =
+            OpenAIResponsesClient::new(server.config()).unwrap().with_websocket(WsOptions {
+                first_event_timeout: Duration::from_millis(50),
+                observe: Arc::new(move |event| observed.lock().unwrap().push(event)),
+                ..Default::default()
+            });
+        let error = match client
+            .generate_content(
+                LlmRequest::new("test-model", vec![Content::new("user").with_text("first")]),
+                true,
+            )
+            .await
+        {
+            Ok(_) => panic!("failed WebSocket attempt must be returned"),
+            Err(error) => error,
+        };
+        if failure != "handshake" {
+            assert!(!error.is_retryable(), "unacknowledged delivery is uncertain");
+        }
+        assert_eq!(server.handshakes(), 1);
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), usize::from(failure != "handshake"));
+        assert!(requests.iter().all(|request| request["type"] == "response.create"));
+        assert!(!observations.lock().unwrap().iter().any(|event| matches!(
+            event,
+            TransportEvent::Fallback { .. } | TransportEvent::HttpCompleted { .. }
+        )));
+    }
+}
+
+#[tokio::test]
 async fn first_event_deadline_bounds_unacknowledged_wait() {
     use adk_core::{Content, Llm, LlmRequest};
     use adk_model::openai::{OpenAIResponsesClient, TransportEvent, WsOptions, WsRefusal};
@@ -1156,6 +1207,7 @@ async fn first_event_deadline_bounds_unacknowledged_wait() {
             .unwrap()
             .with_retry_config(RetryConfig::disabled())
             .with_websocket(WsOptions {
+                fallback_to_http: true,
                 first_event_timeout: Duration::from_millis(100),
                 read_timeout: Duration::from_secs(5),
                 observe: Arc::new(move |event| observed.lock().unwrap().push(event)),
@@ -1215,6 +1267,7 @@ async fn provider_acknowledgment_prevents_http_replay() {
                 .unwrap()
                 .with_retry_config(RetryConfig::disabled())
                 .with_websocket(WsOptions {
+                    fallback_to_http: true,
                     first_event_timeout: Duration::from_millis(100),
                     read_timeout: Duration::from_millis(if completes { 500 } else { 50 }),
                     observe: Arc::new(move |event| observed.lock().unwrap().push(event)),

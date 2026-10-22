@@ -53,7 +53,7 @@ gemini = ["dep:adk-gemini", "dep:reqwest"]
 gemini-vertex = ["gemini", "adk-gemini/vertex"]
 gemini-interactions = ["gemini", "adk-gemini/interactions"]
 openai = ["dep:async-openai", "dep:reqwest", "dep:reqwest-openai", "dep:http", "dep:tower", "tokio/rt"]
-openai-ws = ["openai", "dep:hyper-util", "dep:tokio-tungstenite", "dep:rustls", "dep:rustls-platform-verifier"]
+openai-ws = ["openai", "adk-core/rustls", "dep:hyper-util", "dep:tokio-tungstenite", "dep:rustls", "dep:rustls-platform-verifier"]
 openai-conversations = ["openai"]
 # openai-webhooks feature removed: it only forwarded a dep on adk-server, creating the
 # cycle adk-model -> adk-server -> adk-agent -> (dev) adk-model. The webhooks

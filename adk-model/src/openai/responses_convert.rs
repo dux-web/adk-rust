@@ -43,6 +43,7 @@ pub fn request_uses_native_tools(request: &LlmRequest) -> bool {
             .is_some_and(|tools| tools.iter().any(native_tool))
 }
 
+#[cfg(feature = "openai-ws")]
 pub(super) fn uses_native_tools(body: &serde_json::Value) -> bool {
     body.get("tools")
         .and_then(serde_json::Value::as_array)

@@ -628,8 +628,11 @@ Both transports treat only non-function entries of `x-adk-openai-tool` declarati
 ordinary function tool.
 
 `WsOptions::first_event_timeout` defaults to 15 seconds. Ping and pong frames do not
-extend this deadline. Without a first provider event, the client can fall back to HTTP even
-if the server already accepted the WebSocket request, which may generate and bill twice.
+extend this deadline. HTTP fallback is disabled by default. Opt in with
+`WsOptions { fallback_to_http: true, ..Default::default() }` to allow HTTP fallback before
+the first provider event. The server may already have accepted the WebSocket request,
+so opting in can generate and bill twice. With fallback disabled, uncertain delivery
+failures are returned without automatic retry.
 After any provider event confirms acceptance, a socket delivery failure or read timeout is
 reported without automatically resending the generation. Explicit provider failures retain
 their error and retry classification.
@@ -638,7 +641,8 @@ System and environment proxy rules, including `NO_PROXY`, match the HTTP client'
 A destination that requires a proxy uses HTTP; a bypassed destination can use WebSocket.
 
 Secure WebSocket connections use the platform certificate verifier and the default HTTP client's
-crypto provider selection. A certificate rejection is a definitive refusal; capability policy can
+crypto provider selection through `adk_core::ensure_crypto_provider()`, preserving a
+caller-installed provider. A certificate rejection is a definitive refusal; capability policy can
 remember it after a successful HTTP fallback.
 
 `examples/gemini_ws_outcomes` runs each WebSocket case against a scripted local server and,

@@ -171,6 +171,7 @@ impl OpenAIResponsesClient {
     }
 
     /// Select WebSocket for eligible streamed generations; HTTP remains available.
+    /// HTTP fallback after a WebSocket failure requires `WsOptions::fallback_to_http`.
     ///
     /// # Example
     ///
@@ -1296,6 +1297,9 @@ impl Llm for OpenAIResponsesClient {
                     ));
                 }
                 Err(failure) => {
+                    if !websocket.options.fallback_to_http {
+                        return Err(failure.error);
+                    }
                     let refusal = failure.refusal;
                     websocket.observe(super::ws_transport::TransportEvent::Fallback { refusal });
                     let stream = self

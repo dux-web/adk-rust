@@ -366,3 +366,29 @@ fn honors_proxy_bypass_rules() {
         assert!(uses_proxy(url, &matcher), "{url}");
     }
 }
+
+#[test]
+fn tls_respects_the_installed_provider() {
+    const CHILD: &str = "ADK_WS_TLS_PROVIDER_FIXTURE";
+    if let Ok(mode) = std::env::var(CHILD) {
+        if mode == "caller" {
+            let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+            provider.cipher_suites.reverse();
+            provider.install_default().expect("isolated caller provider");
+        } else {
+            adk_core::ensure_crypto_provider();
+        }
+        let expected = rustls::crypto::CryptoProvider::get_default().unwrap().clone();
+        let config = tls_config().expect("platform verifier configuration");
+        assert!(Arc::ptr_eq(config.crypto_provider(), &expected));
+        return;
+    }
+    for mode in ["workspace", "caller"] {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "openai::ws_transport::tests::tls_respects_the_installed_provider"])
+            .env(CHILD, mode)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{mode} provider must be preserved");
+    }
+}

@@ -219,9 +219,11 @@ Create helper clients without `with_websocket` to keep their generations on HTTP
 `WsOptions` exposes connection deadlines and capability observations; socket reuse compares the
 complete adapted headers. The standalone `WsTransport` API remains
 available for typed Responses requests. The default `first_event_timeout` is 15 seconds;
-control frames do not extend it. A timeout before the first provider event can fall back to
-HTTP even if the server already accepted the original request. This may generate and bill
-twice. After any provider event acknowledges acceptance, a lost socket or read timeout is
+control frames do not extend it. HTTP fallback is disabled by default. Set
+`WsOptions { fallback_to_http: true, ..Default::default() }` to explicitly allow fallback
+before the first provider event. This may generate and bill twice if the server already
+accepted the original request. With fallback disabled, uncertain delivery failures are
+returned without automatic retry. After any provider event acknowledges acceptance, a lost socket or read timeout is
 reported without automatically resending the generation. An explicit provider failure keeps
 its normal error and retry classification.
 

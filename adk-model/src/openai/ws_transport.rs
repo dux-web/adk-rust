@@ -85,6 +85,10 @@ pub struct WsOptions {
     /// Defaults to 15 seconds. HTTP fallback can generate and bill twice if the
     /// server accepted the WebSocket request without delivering its first event.
     pub first_event_timeout: Duration,
+    /// Allow `OpenAIResponsesClient` to fall back to HTTP before its first provider event.
+    /// Defaults to false. Enabling this can generate and bill twice when the server
+    /// accepted the WebSocket request but its first event did not reach the client.
+    pub fallback_to_http: bool,
     /// Maximum interval without any WebSocket frame after the provider acknowledges the request.
     pub read_timeout: Duration,
     /// Idle lifetime checked at a request boundary.
@@ -104,6 +108,7 @@ impl Default for WsOptions {
         Self {
             connect_timeout: Duration::from_secs(15),
             first_event_timeout: Duration::from_secs(15),
+            fallback_to_http: false,
             read_timeout: Duration::from_secs(300),
             idle_timeout: Duration::from_secs(240),
             max_age: Duration::from_secs(55 * 60),
@@ -114,7 +119,7 @@ impl Default for WsOptions {
     }
 }
 
-/// A failure before any server event permits HTTP fallback. The server may still
+/// A failure before any server event permits explicitly opted-in HTTP fallback. The server may still
 /// have accepted the original request; absence of an event is not proof of non-delivery.
 pub(super) struct BeforeEvent {
     pub error: AdkError,
@@ -177,7 +182,7 @@ pub struct WsTransport {
     connection: Arc<Mutex<Connection>>,
     url: String,
     key: String,
-    options: WsOptions,
+    pub(super) options: WsOptions,
     retry_config: RetryConfig,
     connected: Arc<AtomicBool>,
     tls: OnceCell<Arc<rustls::ClientConfig>>,
@@ -379,7 +384,8 @@ impl WsTransport {
             read(lease, self.options.read_timeout),
         )
         .await
-        .map_err(|_| before(timeout(), WsRefusal::Transient))?
+        .map_err(|_| before(delivery(timeout()), WsRefusal::Transient))?
+        .map_err(|failure| before(delivery(failure.error), failure.refusal))
     }
     /// Send a typed request using the standalone transport API.
     pub async fn send_request(
@@ -456,22 +462,11 @@ impl WsTransport {
             }
             None => create_event(&body).map_err(|error| before(error, WsRefusal::Definitive))?,
         };
-        if let Err(error) = send(&mut lease, &frame).await {
-            if !reused {
-                return Err(before(error, WsRefusal::Transient));
-            }
-            lease.guard.socket = None;
-            self.ensure(&mut lease, handshake_headers.clone(), observer.as_ref()).await?;
-            observe_headers(&mut lease, observer.as_ref());
-            reused = false;
-            incremental = false;
-            send(
-                &mut lease,
-                &create_event(&body).map_err(|error| before(error, WsRefusal::Definitive))?,
-            )
+        // A failed write can have partially delivered the frame. Do not reconnect
+        // and replay it automatically, even when reusing an existing socket.
+        send(&mut lease, &frame)
             .await
-            .map_err(|error| before(error, WsRefusal::Transient))?;
-        }
+            .map_err(|error| before(delivery(error), WsRefusal::Transient))?;
         let mut first = self.initial(&mut lease).await?;
         if incremental && missing(&first) {
             lease.guard.continuation = None;
@@ -483,15 +478,9 @@ impl WsTransport {
                 reused = false;
             }
             let full = create_event(&body).map_err(|error| before(error, WsRefusal::Definitive))?;
-            if send(&mut lease, &full).await.is_err() {
-                lease.guard.socket = None;
-                self.ensure(&mut lease, handshake_headers, observer.as_ref()).await?;
-                observe_headers(&mut lease, observer.as_ref());
-                reused = false;
-                send(&mut lease, &full)
-                    .await
-                    .map_err(|error| before(error, WsRefusal::Transient))?;
-            }
+            send(&mut lease, &full)
+                .await
+                .map_err(|error| before(delivery(error), WsRefusal::Transient))?;
             first = self.initial(&mut lease).await?;
         }
         if first.get("type").and_then(Value::as_str) == Some("error")
@@ -882,7 +871,8 @@ fn upgrade_headers(mut headers: HeaderMap) -> Result<HeaderMap, AdkError> {
 fn tls_config() -> Result<Arc<rustls::ClientConfig>, ()> {
     use rustls_platform_verifier::BuilderVerifierExt;
 
-    // Match reqwest's default verifier and its caller-installed crypto provider.
+    adk_core::ensure_crypto_provider();
+    // Match reqwest's default verifier and respect a caller-installed crypto provider.
     let provider = rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
