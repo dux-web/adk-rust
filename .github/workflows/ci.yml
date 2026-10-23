@@ -30,6 +30,11 @@ jobs:
         with:
           cache-key: windows-enforcer-diagnostics
           cache-save: 'true'
+      - name: Build the native probe without a dynamic CRT
+        if: inputs.test_target == 'windows_spawn_diagnostics'
+        run: |
+          rustc --edition=2024 -C target-feature=+crt-static adk-sandbox/tests/support/windows_peer.rs -o windows-peer.exe
+          "ADK_WINDOWS_PROBE_EXE=$((Resolve-Path windows-peer.exe).Path)" >> $env:GITHUB_ENV
       - name: Run the selected Windows enforcer tests
         env:
           TEST_TARGET: ${{ inputs.test_target }}
