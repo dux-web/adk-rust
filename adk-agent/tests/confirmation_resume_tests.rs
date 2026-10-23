@@ -529,7 +529,7 @@ async fn a_denied_held_call_is_answered_with_the_refusal_and_does_not_execute() 
     assert!(confirmation_requests(&second).is_empty());
     assert_eq!(
         model.function_responses(),
-        vec![(Some("call-1".to_string()), json!({ "isError": true, "error": DENIED }))]
+        vec![(Some("call-1".to_string()), json!({ "error": DENIED }))]
     );
 
     // The refusal answers the call, so a later approval does not resume it.

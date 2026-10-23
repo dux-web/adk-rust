@@ -999,7 +999,7 @@ async fn run_authorized_tool(
     .await
     {
         Ok(Ok(ledgered)) => ledgered,
-        Ok(Err(answer)) => return Ok(ToolRun::Finished(Err(render_value(&answer)))),
+        Ok(Err(answer)) => return Ok(ToolRun::Finished(Err(render_value(&answer.value)))),
         Err(error) => return Ok(ToolRun::Abort(error)),
     };
 
@@ -1104,7 +1104,7 @@ async fn run_authorized_tool(
     let failure = if outcome_unknown {
         crate::tool_ledger::interrupted_call_response(&last_error)
     } else {
-        serde_json::json!({ "error": last_error })
+        crate::tool_response::ToolResponse::error(&last_error).value
     };
     let failure_message = if outcome_unknown { render_value(&failure) } else { last_error.clone() };
 

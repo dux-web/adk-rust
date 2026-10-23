@@ -327,7 +327,7 @@ pub use tool_response::{
 pub use types::{
     BlobResourceContents, Content, EmbeddedResource, FileDataPart, FunctionResponseData,
     GENERATED_CALL_ID_PREFIX, InlineDataPart, MAX_INLINE_DATA_SIZE, Part, ProviderData,
-    ProviderOrigin, TextResourceContents,
+    ProviderOrigin, TOOL_RESULT_STATUS_KEY, TextResourceContents, ToolResultStatus,
 };
 pub use url::Url;
 

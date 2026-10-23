@@ -6,8 +6,8 @@ use adk_core::{
     GovernedCall, InstructionProvider, InvocationContext, Llm, LlmRequest, LlmResponse,
     MemoryEntry, OnToolErrorCallback, Part, ReadonlyContext, Result, RetryBudget, Tool,
     ToolAuthorization, ToolCallbackContext, ToolConfirmationPolicy, ToolConfirmationRequest,
-    ToolContext, ToolEffect, ToolExecutionStrategy, ToolGate, ToolOutcome, Toolset,
-    authorize_tool_call,
+    ToolContext, ToolEffect, ToolExecutionStrategy, ToolGate, ToolOutcome, ToolResultStatus,
+    Toolset, authorize_tool_call,
 };
 use async_stream::stream;
 use async_trait::async_trait;
@@ -32,6 +32,7 @@ use crate::{
     invocation_hooks::HookCallbacks,
     skill_shim::{SelectionPolicy, SkillIndex, apply_skill_injection},
     tool_call_markup::normalize_option_content,
+    tool_response::ToolResponse,
     workflow::with_user_content_override,
 };
 
@@ -2263,7 +2264,7 @@ fn callback_tool_response(
     content: Content,
     name: &str,
     id: Option<&String>,
-    wrap_text: impl FnOnce(String) -> serde_json::Value,
+    wrap_text: impl FnOnce(String) -> ToolResponse,
 ) -> Content {
     let mut text = String::new();
     let mut response = None;
@@ -2286,18 +2287,8 @@ fn callback_tool_response(
             }
         }
     }
-    let response = response.unwrap_or_else(|| Part::FunctionResponse {
-        function_response: FunctionResponseData::new(name, wrap_text(text)),
-        id: id.cloned(),
-        annotations: None,
-    });
+    let response = response.unwrap_or_else(|| wrap_text(text).into_part(name, id));
     Content { role: "function".to_string(), parts: vec![response] }
-}
-
-// Only dispatcher-owned failures are marked; successful tool JSON stays intact.
-fn mark_failure(mut response: serde_json::Value) -> serde_json::Value {
-    response["isError"] = serde_json::Value::Bool(true);
-    response
 }
 
 #[derive(Clone, Copy)]
@@ -2573,16 +2564,8 @@ impl ToolExecutor<'_> {
         // Set once `execute` was called, so its side effect may have happened.
         let mut tool_executed = false;
         let mut pending_confirmation: Option<ToolConfirmationRequest> = None;
-        let respond = |response: serde_json::Value| Content {
-            role: "function".to_string(),
-            parts: vec![Part::FunctionResponse {
-                function_response: FunctionResponseData::new(name.clone(), response),
-                id: id.clone(),
-                annotations: None,
-            }],
-        };
-        let error_response =
-            |message: String| respond(mark_failure(serde_json::json!({ "error": message })));
+        let respond = |response: ToolResponse| response.into_content(&name, id.as_ref());
+        let error_response = |message: String| respond(ToolResponse::error(message));
         // A callback's error message stays local unless the agent exposes error messages.
         let callback_failure = |error: &adk_core::AdkError| {
             if self.expose_tool_error_messages { error.to_string() } else { error.redacted() }
@@ -2658,9 +2641,12 @@ impl ToolExecutor<'_> {
                         error.message = %self.logged_message(&e.message),
                         "before-tool plugin failed; the tool was not run"
                     );
-                    response_content = Some(error_response(format!(
-                        "tool '{name}' was not run: a before-tool plugin failed with {}",
-                        callback_failure(&e)
+                    response_content = Some(respond(ToolResponse::error_for(
+                        format!(
+                            "tool '{name}' was not run: a before-tool plugin failed with {}",
+                            callback_failure(&e)
+                        ),
+                        &e,
                     )));
                     run_after_tool_callbacks = false;
                 }
@@ -2696,10 +2682,12 @@ impl ToolExecutor<'_> {
                         )
                         .await?;
                         // The tool did not run, so text is reported as the call's error.
-                        response_content =
-                            Some(callback_tool_response(c, &name, id.as_ref(), |text| {
-                                mark_failure(serde_json::json!({ "error": text }))
-                            }));
+                        response_content = Some(callback_tool_response(
+                            c,
+                            &name,
+                            id.as_ref(),
+                            ToolResponse::error,
+                        ));
                         break;
                     }
                     Ok(None) => continue,
@@ -2711,9 +2699,12 @@ impl ToolExecutor<'_> {
                             error.message = %self.logged_message(&e.message),
                             "before-tool callback failed; the tool was not run"
                         );
-                        response_content = Some(error_response(format!(
-                            "tool '{name}' was not run: a before-tool callback failed with {}",
-                            callback_failure(&e)
+                        response_content = Some(respond(ToolResponse::error_for(
+                            format!(
+                                "tool '{name}' was not run: a before-tool callback failed with {}",
+                                callback_failure(&e)
+                            ),
+                            &e,
                         )));
                         run_after_tool_callbacks = false;
                         break;
@@ -2780,8 +2771,10 @@ impl ToolExecutor<'_> {
                     run_after_tool_callbacks = false;
                 }
                 Ok(ToolAuthorization::Pending { request, reason }) => {
-                    response_content =
-                        Some(respond(adk_core::confirmation_pending_response(reason)));
+                    response_content = Some(respond(ToolResponse::with_status(
+                        adk_core::confirmation_pending_response(reason),
+                        ToolResultStatus::Pending,
+                    )));
                     pending_confirmation = Some(request);
                     run_after_tool_callbacks = false;
                 }
@@ -2848,17 +2841,7 @@ impl ToolExecutor<'_> {
                     Err(answer) => {
                         return Ok(ToolExecutionResult {
                             index,
-                            content: Content {
-                                role: "function".to_string(),
-                                parts: vec![Part::FunctionResponse {
-                                    function_response: FunctionResponseData::from_tool_result(
-                                        name.clone(),
-                                        answer,
-                                    ),
-                                    id: id.clone(),
-                                    annotations: None,
-                                }],
-                            },
+                            content: answer.into_content(&name, id.as_ref()),
                             actions: tool_actions,
                             escalate_or_skip: false,
                             pending: None,
@@ -3000,17 +2983,16 @@ impl ToolExecutor<'_> {
                 // What the model is told about the failure: the agent's own timeout and panic
                 // messages, or the tool error without its message by default.
                 let failure_response = match (&retry_result, &last_error) {
-                    (None, Some(error)) if outcome_unknown => {
-                        Some(crate::tool_ledger::interrupted_call_response(&error.message))
-                    }
-                    (None, Some(error)) if interrupted => {
-                        Some(mark_failure(serde_json::json!({ "error": error.message })))
-                    }
-                    (None, Some(error)) => Some(mark_failure(adk_core::tool_error_response(
+                    (None, Some(error)) if outcome_unknown => Some(ToolResponse::with_status(
+                        crate::tool_ledger::interrupted_call_response(&error.message),
+                        ToolResultStatus::OutcomeUnknown,
+                    )),
+                    (None, Some(error)) if interrupted => Some(ToolResponse::error(&error.message)),
+                    (None, Some(error)) => Some(ToolResponse::from_error(
                         &name,
                         error,
                         self.expose_tool_error_messages,
-                    ))),
+                    )),
                     (None, None) | (Some(_), _) => None,
                 };
                 if outcome_unknown {
@@ -3030,7 +3012,7 @@ impl ToolExecutor<'_> {
                 {
                     let failure_text = failure_response
                         .as_ref()
-                        .and_then(|response| response.get("error"))
+                        .and_then(|response| response.value.get("error"))
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or_default();
                     ledgered.complete(&name, retry_result.as_ref(), failure_text).await;
@@ -3044,12 +3026,9 @@ impl ToolExecutor<'_> {
                     });
                 let tool_success = retry_result.is_some();
                 let function_response = match retry_result {
-                    Some(value) => value,
-                    None => failure_response.unwrap_or_else(|| {
-                        mark_failure(
-                            serde_json::json!({ "error": format!("tool '{name}' failed") }),
-                        )
-                    }),
+                    Some(value) => ToolResponse::new(value),
+                    None => failure_response
+                        .unwrap_or_else(|| ToolResponse::error(format!("tool '{name}' failed"))),
                 };
 
                 let outcome = ToolOutcome {
@@ -3104,7 +3083,7 @@ impl ToolExecutor<'_> {
                             }
                         }
                     }
-                    fallback_result.unwrap_or(function_response)
+                    fallback_result.map(ToolResponse::new).unwrap_or(function_response)
                 } else {
                     function_response
                 };
@@ -3124,29 +3103,21 @@ impl ToolExecutor<'_> {
                         tool_actions.escalate = false;
                         pending_confirmation = Some(request);
                         run_after_tool_callbacks = false;
-                        if adk_core::is_confirmation_pending(&final_function_response) {
-                            final_function_response
-                        } else {
-                            adk_core::confirmation_pending_response(format!(
-                                "Tool '{name}' is waiting for a confirmation"
-                            ))
-                        }
+                        let value =
+                            if adk_core::is_confirmation_pending(&final_function_response.value) {
+                                final_function_response.value
+                            } else {
+                                adk_core::confirmation_pending_response(format!(
+                                    "Tool '{name}' is waiting for a confirmation"
+                                ))
+                            };
+                        ToolResponse::with_status(value, ToolResultStatus::Pending)
                     }
                     None => final_function_response,
                 };
                 executed_tool = Some(tool.clone());
-                executed_tool_response = Some(final_function_response.clone());
-                response_content = Some(Content {
-                    role: "function".to_string(),
-                    parts: vec![Part::FunctionResponse {
-                        function_response: FunctionResponseData::from_tool_result(
-                            name.clone(),
-                            final_function_response,
-                        ),
-                        id: id.clone(),
-                        annotations: None,
-                    }],
-                });
+                executed_tool_response = Some(final_function_response.value.clone());
+                response_content = Some(respond(final_function_response));
             } else {
                 response_content = Some(error_response(format!("Tool {name} not found")));
             }
@@ -3173,12 +3144,10 @@ impl ToolExecutor<'_> {
             {
                 match callback(cb_ctx.clone()).await {
                     Ok(Some(modified)) => {
-                        response_content = callback_tool_response(
-                            modified,
-                            &name,
-                            id.as_ref(),
-                            |text| serde_json::json!({ "result": text }),
-                        );
+                        response_content =
+                            callback_tool_response(modified, &name, id.as_ref(), |text| {
+                                ToolResponse::new(serde_json::json!({ "result": text }))
+                            });
                         break;
                     }
                     Ok(None) => continue,
@@ -3255,17 +3224,13 @@ impl ToolExecutor<'_> {
                     .await
                 {
                     Ok(adk_plugin::AfterToolCallResult::Continue(modified_result)) => {
-                        response_content = Content {
-                            role: "function".to_string(),
-                            parts: vec![Part::FunctionResponse {
-                                function_response: FunctionResponseData::from_tool_result(
-                                    name.clone(),
-                                    modified_result,
-                                ),
-                                id: id.clone(),
-                                annotations: None,
-                            }],
+                        let status =
+                            response_content.parts.iter().find_map(Part::tool_result_status);
+                        let response = match status {
+                            Some(status) => ToolResponse::with_status(modified_result, status),
+                            None => ToolResponse::new(modified_result),
                         };
+                        response_content = respond(response);
                     }
                     Err(e) => failure = Some(e),
                 }
@@ -3283,15 +3248,21 @@ impl ToolExecutor<'_> {
                 // The tool's side effect stands and its ledger record says so; the model is
                 // told not to repeat it, since a new call has a new idempotency key.
                 response_content = if tool_executed {
-                    respond(mark_failure(adk_core::result_withheld_response(
-                        &name,
+                    respond(ToolResponse::for_error(
+                        adk_core::result_withheld_response(
+                            &name,
+                            &error,
+                            self.expose_tool_error_messages,
+                        ),
                         &error,
-                        self.expose_tool_error_messages,
-                    )))
+                    ))
                 } else {
-                    error_response(format!(
-                        "tool '{name}' was not run, and its after-tool pipeline failed with {}",
-                        callback_failure(&error)
+                    respond(ToolResponse::error_for(
+                        format!(
+                            "tool '{name}' was not run, and its after-tool pipeline failed with {}",
+                            callback_failure(&error)
+                        ),
+                        &error,
                     ))
                 };
             }
@@ -4441,22 +4412,10 @@ impl Agent for LlmAgent {
 
                             let valid_target = valid_transfer_targets.iter().any(|n| n == &target_agent);
                             if !valid_target {
-                                let error_content = Content {
-                                    role: "function".to_string(),
-                                    parts: vec![Part::FunctionResponse {
-                                        function_response: FunctionResponseData::new(
-                                            call.name.clone(),
-                                            serde_json::json!({
-                                                "error": format!(
-                                                    "Agent '{}' not found. Available agents: {:?}",
-                                                    target_agent, valid_transfer_targets
-                                                )
-                                            }),
-                                        ),
-                                        id: call.id.clone(),
-                                        annotations: None,
-                                    }],
-                                };
+                                let error_content = ToolResponse::error(format!(
+                                    "Agent '{}' not found. Available agents: {:?}",
+                                    target_agent, valid_transfer_targets
+                                )).into_content(&call.name, call.id.as_ref());
                                 conversation_history.push(error_content.clone());
                                 let mut error_event = Event::new(&invocation_id);
                                 error_event.author = agent_name.clone();
@@ -4473,20 +4432,13 @@ impl Agent for LlmAgent {
                                 .filter(|other| !answered_calls.contains(&other.index))
                                 .map(|other| {
                                     let response = if other.index == call.index {
-                                        serde_json::json!({ "transferred_to": target_agent })
+                                        ToolResponse::new(serde_json::json!({ "transferred_to": target_agent }))
                                     } else {
-                                        serde_json::json!({
+                                        ToolResponse::with_status(serde_json::json!({
                                             "error": format!("not run: control transferred to {target_agent}")
-                                        })
+                                        }), ToolResultStatus::Cancelled)
                                     };
-                                    Part::FunctionResponse {
-                                        function_response: FunctionResponseData::new(
-                                            other.name.clone(),
-                                            response,
-                                        ),
-                                        id: other.id.clone(),
-                                        annotations: None,
-                                    }
+                                    response.into_part(&other.name, other.id.as_ref())
                                 })
                                 .collect();
                             let mut transfer_event = Event::new(&invocation_id);
@@ -4529,14 +4481,8 @@ impl Agent for LlmAgent {
                     {
                         let parts = fc_parts
                             .iter()
-                            .map(|call| Part::FunctionResponse {
-                                function_response: FunctionResponseData::new(
-                                    call.name.clone(),
-                                    mark_failure(serde_json::json!({ "error": format!("not run: {exceeded}") })),
-                                ),
-                                id: call.id.clone(),
-                                annotations: None,
-                            })
+                            .map(|call| ToolResponse::error(format!("not run: {exceeded}"))
+                                .into_part(&call.name, call.id.as_ref()))
                             .collect();
                         let mut budget_event = Event::new(&invocation_id);
                         budget_event.author = agent_name.clone();
