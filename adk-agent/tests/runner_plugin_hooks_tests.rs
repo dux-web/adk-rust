@@ -237,7 +237,10 @@ async fn a_runner_plugin_before_tool_callback_blocks_the_tool() {
             .await;
 
     assert_eq!(calls.load(Ordering::SeqCst), 0, "the plugin's denial must stop the tool");
-    assert_eq!(function_responses(&events), vec![json!({ "error": "blocked by policy" })]);
+    assert_eq!(
+        function_responses(&events),
+        vec![json!({ "isError": true, "error": "blocked by policy" })]
+    );
     assert_call_answered(&model);
     assert_eq!(
         *seen.lock().unwrap(),
@@ -370,7 +373,10 @@ async fn an_agent_before_tool_denial_answers_the_call() {
     .await;
 
     assert_eq!(calls.load(Ordering::SeqCst), 0, "the denial must stop the tool");
-    assert_eq!(function_responses(&events), vec![json!({ "error": "denied by policy" })]);
+    assert_eq!(
+        function_responses(&events),
+        vec![json!({ "isError": true, "error": "denied by policy" })]
+    );
     assert_call_answered(&model);
 }
 

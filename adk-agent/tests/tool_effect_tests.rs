@@ -351,7 +351,7 @@ async fn a_non_idempotent_tool_with_a_retryable_error_runs_once() {
     // The model is told the category and code; the message stays local by default.
     assert_eq!(
         responses(&events)[0],
-        json!({ "error": "tool 'pay' failed: tool.unavailable (tool.test.down)" })
+        json!({ "isError": true, "error": "tool 'pay' failed: tool.unavailable (tool.test.down)" })
     );
 }
 

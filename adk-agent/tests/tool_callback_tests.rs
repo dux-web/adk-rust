@@ -265,7 +265,7 @@ async fn test_before_tool_callback_short_circuits_tool_execution() {
         if let Some(content) = event.llm_response.content {
             for part in content.parts {
                 if let Part::FunctionResponse { function_response, id, .. } = part
-                    && function_response.response == json!({ "error": "blocked" })
+                    && function_response.response == json!({ "isError": true, "error": "blocked" })
                     && id.as_deref() == Some("call-1")
                 {
                     saw_blocked = true;

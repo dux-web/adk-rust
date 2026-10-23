@@ -2294,6 +2294,12 @@ fn callback_tool_response(
     Content { role: "function".to_string(), parts: vec![response] }
 }
 
+// Only dispatcher-owned failures are marked; successful tool JSON stays intact.
+fn mark_failure(mut response: serde_json::Value) -> serde_json::Value {
+    response["isError"] = serde_json::Value::Bool(true);
+    response
+}
+
 #[derive(Clone, Copy)]
 enum ToolDispatchMode {
     Sequential,
@@ -2575,7 +2581,8 @@ impl ToolExecutor<'_> {
                 annotations: None,
             }],
         };
-        let error_response = |message: String| respond(serde_json::json!({ "error": message }));
+        let error_response =
+            |message: String| respond(mark_failure(serde_json::json!({ "error": message })));
         // A callback's error message stays local unless the agent exposes error messages.
         let callback_failure = |error: &adk_core::AdkError| {
             if self.expose_tool_error_messages { error.to_string() } else { error.redacted() }
@@ -2689,12 +2696,10 @@ impl ToolExecutor<'_> {
                         )
                         .await?;
                         // The tool did not run, so text is reported as the call's error.
-                        response_content = Some(callback_tool_response(
-                            c,
-                            &name,
-                            id.as_ref(),
-                            |text| serde_json::json!({ "error": text }),
-                        ));
+                        response_content =
+                            Some(callback_tool_response(c, &name, id.as_ref(), |text| {
+                                mark_failure(serde_json::json!({ "error": text }))
+                            }));
                         break;
                     }
                     Ok(None) => continue,
@@ -2999,13 +3004,13 @@ impl ToolExecutor<'_> {
                         Some(crate::tool_ledger::interrupted_call_response(&error.message))
                     }
                     (None, Some(error)) if interrupted => {
-                        Some(serde_json::json!({ "error": error.message }))
+                        Some(mark_failure(serde_json::json!({ "error": error.message })))
                     }
-                    (None, Some(error)) => Some(adk_core::tool_error_response(
+                    (None, Some(error)) => Some(mark_failure(adk_core::tool_error_response(
                         &name,
                         error,
                         self.expose_tool_error_messages,
-                    )),
+                    ))),
                     (None, None) | (Some(_), _) => None,
                 };
                 if outcome_unknown {
@@ -3040,9 +3045,11 @@ impl ToolExecutor<'_> {
                 let tool_success = retry_result.is_some();
                 let function_response = match retry_result {
                     Some(value) => value,
-                    None => failure_response.unwrap_or_else(
-                        || serde_json::json!({ "error": format!("tool '{name}' failed") }),
-                    ),
+                    None => failure_response.unwrap_or_else(|| {
+                        mark_failure(
+                            serde_json::json!({ "error": format!("tool '{name}' failed") }),
+                        )
+                    }),
                 };
 
                 let outcome = ToolOutcome {
@@ -3276,11 +3283,11 @@ impl ToolExecutor<'_> {
                 // The tool's side effect stands and its ledger record says so; the model is
                 // told not to repeat it, since a new call has a new idempotency key.
                 response_content = if tool_executed {
-                    respond(adk_core::result_withheld_response(
+                    respond(mark_failure(adk_core::result_withheld_response(
                         &name,
                         &error,
                         self.expose_tool_error_messages,
-                    ))
+                    )))
                 } else {
                     error_response(format!(
                         "tool '{name}' was not run, and its after-tool pipeline failed with {}",
@@ -4525,7 +4532,7 @@ impl Agent for LlmAgent {
                             .map(|call| Part::FunctionResponse {
                                 function_response: FunctionResponseData::new(
                                     call.name.clone(),
-                                    serde_json::json!({ "error": format!("not run: {exceeded}") }),
+                                    mark_failure(serde_json::json!({ "error": format!("not run: {exceeded}") })),
                                 ),
                                 id: call.id.clone(),
                                 annotations: None,

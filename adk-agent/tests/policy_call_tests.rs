@@ -199,7 +199,7 @@ async fn evaluate_call_receives_the_origin_and_call_id_from_the_governed_path() 
         vec![
             (
                 Some("scripted_tc_0_0".to_string()),
-                json!({ "error": "Tool 'search' denied by policy: tools from mcp:evil are blocked" })
+                json!({ "isError": true, "error": "Tool 'search' denied by policy: tools from mcp:evil are blocked" })
             ),
             (Some("scripted_tc_0_1".to_string()), json!({ "status": "ok" })),
         ],
@@ -365,6 +365,7 @@ async fn a_handlers_edit_the_policy_denies_is_not_executed() {
         vec![(
             Some("scripted_tc_0_0".to_string()),
             json!({
+                "isError": true,
                 "error": "Tool 'transfer' with the approver's edited arguments denied by policy: \
                           over the transfer limit"
             })
@@ -418,6 +419,7 @@ async fn a_handlers_denial_message_reaches_the_model() {
         vec![(
             Some("scripted_tc_0_0".to_string()),
             json!({
+                "isError": true,
                 "error": "Tool 'transfer' was not run; the approver declined it: pay from the \
                           treasury account instead"
             })

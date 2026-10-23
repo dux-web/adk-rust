@@ -499,7 +499,7 @@ async fn a_handler_that_never_answers_denies_after_the_timeout() {
     let responses = model.function_responses();
     assert_eq!(
         responses[0].1,
-        json!({ "error": "Tool 'transfer' execution denied by confirmation policy" })
+        json!({ "isError": true, "error": "Tool 'transfer' execution denied by confirmation policy" })
     );
 }
 

@@ -600,7 +600,7 @@ fn runtime_denial_content() -> Value {
         parts: vec![Part::FunctionResponse {
             function_response: adk_core::FunctionResponseData::new(
                 "test_tool",
-                json!({ "error": "Tool 'test_tool' execution denied by confirmation policy" }),
+                json!({ "isError": true, "error": "Tool 'test_tool' execution denied by confirmation policy" }),
             ),
             id: Some("call-runtime".to_string()),
             annotations: None,

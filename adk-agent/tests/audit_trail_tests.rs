@@ -740,7 +740,7 @@ async fn a_short_circuit_without_an_audit_trail_records_nothing_and_answers_the_
         event.llm_response.content.as_ref().is_some_and(|content| {
             content.parts.iter().any(|part| {
                 matches!(part, Part::FunctionResponse { function_response, .. }
-                    if function_response.response == json!({ "error": "cached" }))
+                    if function_response.response == json!({ "isError": true, "error": "cached" }))
             })
         })
     });
