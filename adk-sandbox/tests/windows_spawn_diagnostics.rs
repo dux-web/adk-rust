@@ -46,10 +46,8 @@ fn native_child_launch() {
     let root = tempfile::tempdir().unwrap();
     let workspace = std::fs::canonicalize(root.path()).unwrap();
     let executable = std::env::current_exe().unwrap();
-    let mut policy = SandboxPolicyBuilder::new()
-        .allow_read_write(&workspace)
-        .allow_read_only(&executable)
-        .build();
+    let mut policy =
+        SandboxPolicyBuilder::new().allow_read_write(&workspace).allow_read(&executable).build();
     for key in ["SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
         if let Ok(value) = std::env::var(key) {
             policy.env.insert(key.into(), value);
