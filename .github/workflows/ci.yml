@@ -7,6 +7,11 @@ on:
         description: Revision to check out
         required: false
         type: string
+      strict:
+        description: Run formatting, changelog, lint and Windows token unit checks
+        required: false
+        type: boolean
+        default: false
       trace:
         description: Capture the native child failure with Process Monitor
         required: false
@@ -35,6 +40,13 @@ jobs:
         with:
           cache-key: windows-enforcer-diagnostics
           cache-save: 'true'
+      - name: Validate the scoped Windows changes
+        if: inputs.strict
+        run: |
+          cargo fmt --all -- --check
+          python scripts/changelog-assemble.py --check
+          cargo clippy --locked -p adk-sandbox --features sandbox-windows --all-targets -- -D warnings
+          cargo test --locked -p adk-sandbox --features sandbox-windows --lib sandbox::windows::tests -- --nocapture
       - name: Build the native probe without a dynamic CRT
         if: inputs.test_target == 'windows_spawn_diagnostics'
         run: |
