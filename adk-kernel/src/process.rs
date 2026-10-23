@@ -814,10 +814,25 @@ impl ProcessTable {
     ///
     /// # Errors
     ///
-    /// Returns [`KernelError::Frozen`] while the kernel is frozen, the run store's error when
-    /// `run` is invalid or its concurrency key refuses it, or a store error.
+    /// Returns [`KernelError::Frozen`] while the kernel is frozen, [`KernelError::Quota`] when
+    /// the partition already queues its `max_queued` processes (spec 3.2 §7.9), the run
+    /// store's error when `run` is invalid or its concurrency key refuses it, or a store
+    /// error.
     pub async fn spawn(&self, mut run: NewRun, spec: ProcessSpec) -> Result<Process> {
         self.refuse_while_frozen()?;
+        if let Some(sup) = &self.sup
+            && let Some(max) = sup.quotas.max_queued
+        {
+            let queued = sup.queued_in(&spec.partition).await;
+            if queued >= max {
+                return Err(KernelError::Quota {
+                    partition: spec.partition.to_string(),
+                    reason: format!(
+                        "{queued} processes queued, the most max_queued ({max}) allows"
+                    ),
+                });
+            }
+        }
         let asleep = spec.wake.is_some();
         // The key carries the sleep intent to the claim, so a sleeper parks before its first
         // model call however long its row below takes to write; the caller's key follows
@@ -845,6 +860,13 @@ impl ProcessTable {
                 .into());
             }
         };
+        let mut labels = spec.labels;
+        // A cron sleeper recurs: its successor sleeps on the same set (spec 3.2 §8.1).
+        if let Some(wake) = &spec.wake
+            && wake.any_of.iter().any(|wake| matches!(wake, crate::wake::Wake::Cron { .. }))
+        {
+            labels.insert(crate::supervise::RECUR_LABEL.to_string(), serde_json::to_string(wake)?);
+        }
         let meta = ProcessMeta {
             pid: record.run_id.clone(),
             parent: spec.parent,
@@ -855,7 +877,7 @@ impl ProcessTable {
             suspended_by: None,
             suspend_requested: asleep,
             agenda_item: spec.agenda_item,
-            labels: spec.labels,
+            labels,
         };
         self.processes.put(meta.clone()).await?;
         if let Some(sup) = &self.sup {

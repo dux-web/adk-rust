@@ -55,14 +55,17 @@ use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::agenda::{Agenda, AgendaHandle, AgendaStore, ProactivityPolicy};
 use crate::audit;
 use crate::bus::{EventBus, EventSink, EventSubscriber, KernelEvent};
+use crate::consolidation::{ConsolidationExecutor, ConsolidationTicker, Consolidator};
 use crate::control::{ControlPlane, ControlPlaneConfig};
 use crate::error::{KernelError, Result};
+use crate::partition::PartitionId;
 use crate::process::{ProcessHandle, ProcessTable, ProgressSource, Suspension};
-use crate::sched::QueueClass;
+use crate::sched::{QueueClass, QuietHours, Quotas};
 use crate::stores::ProcessFilter;
-use crate::stores::{InMemoryProcessStore, ProcessStore};
+use crate::stores::{InMemoryAgendaStore, InMemoryProcessStore, ProcessStore};
 use crate::supervise::{KernelHooks, Supervision};
 use crate::wake::{
     FileWakeSource, KernelWakeExecutor, RunFinishedWakeSource, Trigger, Wake, WakeRouter,
@@ -71,7 +74,8 @@ use crate::wake::{
 
 /// How the kernel runs (spec 3.2 §7.2).
 ///
-/// The proactivity policy and quiet hours of §7.2 join in phase 2 (§7.5, §7.9).
+/// `proactivity`, `quiet_hours` and `quotas` apply to every partition (§7.5, §7.9); the
+/// partition records of phase 3 carry their own.
 ///
 /// # Example
 ///
@@ -118,6 +122,16 @@ pub struct KernelConfig {
     /// store the same clock (`SqliteRunStore::with_clock`), since it decides leases and
     /// `not_before`.
     pub clock: Arc<dyn Clock>,
+    /// The proactivity limits of every partition: open proposals, the daily proactive
+    /// budget, quiet hours, how proposals are approved, the consolidation tick (spec 3.2
+    /// §7.5). Defaults to [`ProactivityPolicy::default`].
+    pub proactivity: ProactivityPolicy,
+    /// A local-time window in which no proactive or maintenance process starts, beside the
+    /// proactivity policy's (spec 3.2 §7.2, §7.9). Defaults to none.
+    pub quiet_hours: Option<QuietHours>,
+    /// Every partition's quotas: max running, max queued, the daily spend cap (spec 3.2
+    /// §7.9). Defaults to none.
+    pub quotas: Quotas,
 }
 
 impl Default for KernelConfig {
@@ -132,11 +146,35 @@ impl Default for KernelConfig {
             control: ControlPlaneConfig::default(),
             fail_if_sandbox_unavailable: false,
             clock: Arc::new(SystemClock),
+            proactivity: ProactivityPolicy::default(),
+            quiet_hours: None,
+            quotas: Quotas::default(),
         }
     }
 }
 
 impl KernelConfig {
+    /// Sets the proactivity limits (spec 3.2 §7.5).
+    #[must_use]
+    pub fn with_proactivity(mut self, proactivity: ProactivityPolicy) -> Self {
+        self.proactivity = proactivity;
+        self
+    }
+
+    /// Sets the kernel's quiet hours (spec 3.2 §7.2, §7.9).
+    #[must_use]
+    pub fn with_quiet_hours(mut self, quiet_hours: QuietHours) -> Self {
+        self.quiet_hours = Some(quiet_hours);
+        self
+    }
+
+    /// Sets every partition's quotas (spec 3.2 §7.9).
+    #[must_use]
+    pub fn with_quotas(mut self, quotas: Quotas) -> Self {
+        self.quotas = quotas;
+        self
+    }
+
     /// The mirrored kill switch's poll interval on multi-replica (K-I8): no backend
     /// implements `GovernanceWatch`, so the default 2 s poll would miss the one-second bound.
     pub const GOVERNANCE_POLL: Duration = Duration::from_millis(250);
@@ -368,6 +406,7 @@ struct KernelInner {
     config: KernelConfig,
     sup: Arc<Supervision>,
     processes: ProcessTable,
+    agenda: Agenda,
     router: WakeRouter,
     schedules: Option<Arc<dyn ScheduleStore>>,
     approvals: Option<Arc<dyn ApprovalService>>,
@@ -376,6 +415,7 @@ struct KernelInner {
     workflows: Option<Arc<dyn WorkflowExecutor>>,
     wake_sources: Vec<Arc<dyn WakeSource>>,
     queue_ingresses: Vec<QueueIngress>,
+    consolidation: Option<ConsolidationTicker>,
     runtime: tokio::sync::Mutex<Runtime>,
     status: Arc<RwLock<Status>>,
 }
@@ -542,6 +582,8 @@ impl Kernel {
         tasks.push(spawn_maintenance(
             Arc::clone(&sup),
             self.inner.router.clone(),
+            self.inner.agenda.clone(),
+            self.inner.consolidation.clone(),
             Arc::clone(&self.inner.status),
             config.scheduler_tick,
             stop.clone(),
@@ -789,6 +831,11 @@ impl Kernel {
     /// The process table.
     pub fn processes(&self) -> &ProcessTable {
         &self.inner.processes
+    }
+
+    /// The agenda (spec 3.2 §7.5).
+    pub fn agenda(&self) -> &Agenda {
+        &self.inner.agenda
     }
 
     /// The event bus.
@@ -1093,10 +1140,14 @@ fn spawn_mirror(sup: Arc<Supervision>, stop: CancellationToken) -> JoinHandle<()
 }
 
 /// Every scheduler tick: expires wake sets and fires time wakes, claims wake runs enqueued
-/// from outside the kernel, attributes spend, and measures the store.
+/// from outside the kernel, attributes spend, applies the agenda's decisions, makes the
+/// daily review, runs the admission sweep (preempted processes whose preemptor finished,
+/// processes waiting for a slot, budgets replenished), and measures the store.
 fn spawn_maintenance(
     sup: Arc<Supervision>,
     router: WakeRouter,
+    agenda: Agenda,
+    consolidation: Option<ConsolidationTicker>,
     status: Arc<RwLock<Status>>,
     tick: Duration,
     stop: CancellationToken,
@@ -1107,6 +1158,7 @@ fn spawn_maintenance(
                 () = stop.cancelled() => return,
                 () = tokio::time::sleep(tick) => {}
             }
+            sup.fire_crons(&router).await;
             match router.sweep_expired(sup.clock.now()).await {
                 Ok(outcomes) if !outcomes.is_empty() => sup.nudge(),
                 Ok(_) => {}
@@ -1119,6 +1171,27 @@ fn spawn_maintenance(
                 sup.nudge();
             }
             sup.attribute_all().await;
+            agenda.tick().await;
+            sup.review().await;
+            if let Some(consolidation) = &consolidation {
+                consolidation.tick().await;
+            }
+            // A preemptor that finished on another replica, a slot freed there, a new day.
+            sup.requeue_preempted(None).await;
+            if sup.quotas.max_running.is_some() {
+                sup.admit_waiters().await;
+            }
+            let today = sup.clock.now().date_naive();
+            for partition in sup.replenished_partitions().await {
+                let event = crate::wake::WakeEvent::new(
+                    "budget",
+                    crate::wake::keys::budget(partition.as_str(), today),
+                    json!({ "partition": partition, "day": today }),
+                );
+                if let Err(error) = router.submit(&event, &sup.app_name).await {
+                    tracing::debug!(partition = %partition, error = %error, "could not submit a budget wake");
+                }
+            }
             let probe = tokio::time::Instant::now();
             let running = sup.running().await;
             let latency = probe.elapsed();
@@ -1259,6 +1332,10 @@ pub struct KernelBuilder {
     sinks: Vec<Arc<dyn EventSink>>,
     progress: Option<Arc<dyn ProgressSource>>,
     queue_ingresses: Vec<QueueIngress>,
+    agenda: Option<Arc<dyn AgendaStore>>,
+    agenda_handles: Vec<AgendaHandle>,
+    rule_source: Option<Arc<dyn crate::review::StandingRuleSource>>,
+    consolidators: BTreeMap<PartitionId, Arc<dyn Consolidator>>,
 }
 
 impl fmt::Debug for KernelBuilder {
@@ -1399,6 +1476,41 @@ impl KernelBuilder {
         self
     }
 
+    /// Sets the agenda's store (spec 3.2 §7.5). Defaults to [`InMemoryAgendaStore`].
+    #[must_use]
+    pub fn agenda_store(mut self, store: Arc<dyn AgendaStore>) -> Self {
+        self.agenda = Some(store);
+        self
+    }
+
+    /// Binds `handle` to the built kernel's agenda, so a tool created before the kernel —
+    /// the harness's `propose_followup` — reaches it (spec 3.2 §7.5, §10 HK1).
+    #[must_use]
+    pub fn agenda_handle(mut self, handle: AgendaHandle) -> Self {
+        self.agenda_handles.push(handle);
+        self
+    }
+
+    /// Sets where the daily review reads standing rules (spec 3.2 §9.1); `Harness::kernel`
+    /// sets the harness's rule store.
+    #[must_use]
+    pub fn standing_rules(mut self, source: Arc<dyn crate::review::StandingRuleSource>) -> Self {
+        self.rule_source = Some(source);
+        self
+    }
+
+    /// Registers `consolidator` for `partition`: the kernel runs its consolidation tick
+    /// there when [`ProactivityPolicy::consolidation`] is set (spec 3.2 §7.5, §10 HK2).
+    #[must_use]
+    pub fn consolidator(
+        mut self,
+        partition: impl Into<PartitionId>,
+        consolidator: Arc<dyn Consolidator>,
+    ) -> Self {
+        self.consolidators.insert(partition.into(), consolidator);
+        self
+    }
+
     /// Builds the kernel. Nothing runs until [`Kernel::start`].
     ///
     /// # Errors
@@ -1455,12 +1567,33 @@ impl KernelBuilder {
             roots_changed: tokio::sync::Notify::new(),
             watched: std::sync::Mutex::new(BTreeMap::new()),
             clock: Arc::clone(&config.clock),
+            proactivity: config.proactivity.clone(),
+            quiet_hours: config.quiet_hours,
+            quotas: config.quotas.clone(),
+            agenda: self.agenda.unwrap_or_else(|| Arc::new(InMemoryAgendaStore::new())),
+            admission: tokio::sync::Mutex::new(()),
+            rule_source: self.rule_source,
+            reviewed: std::sync::Mutex::new(None),
+            crons: std::sync::Mutex::new(BTreeMap::new()),
         });
         let run_finished = Arc::new(RunFinishedWakeSource::new());
         let hooks =
             Arc::new(KernelHooks { sup: Arc::clone(&sup), run_finished: run_finished.clone() });
+        // The consolidation tick's workflow sits before the caller's (spec 3.2 §7.5).
+        let consolidators = Arc::new(self.consolidators);
+        let tick_agenda = AgendaHandle::new();
+        let user_workflows = if consolidators.is_empty() {
+            self.workflows.clone()
+        } else {
+            Some(Arc::new(ConsolidationExecutor::new(
+                Arc::clone(&sup),
+                Arc::clone(&consolidators),
+                tick_agenda.clone(),
+                self.workflows.clone(),
+            )) as Arc<dyn WorkflowExecutor>)
+        };
         let workflows = Arc::new(KernelWorkflows {
-            user: self.workflows.clone(),
+            user: user_workflows,
             wake: KernelWakeExecutor::new(router.clone()),
         });
         let workers = config
@@ -1485,11 +1618,18 @@ impl KernelBuilder {
         let mut wake_sources = self.wake_sources;
         wake_sources.push(run_finished);
         let processes = ProcessTable::supervised(Arc::clone(&sup), self.spend);
+        let agenda = Agenda::new(Arc::clone(&sup), processes.clone(), self.approvals.clone());
+        for handle in self.agenda_handles.iter().chain([&tick_agenda]) {
+            handle.bind(&agenda);
+        }
+        let consolidation = (!consolidators.is_empty())
+            .then(|| ConsolidationTicker::new(Arc::clone(&sup), processes.clone(), consolidators));
         Ok(Kernel {
             inner: Arc::new(KernelInner {
                 config,
                 sup,
                 processes,
+                agenda,
                 router,
                 schedules: self.schedules,
                 approvals: self.approvals,
@@ -1498,6 +1638,7 @@ impl KernelBuilder {
                 workflows: self.workflows,
                 wake_sources,
                 queue_ingresses: self.queue_ingresses,
+                consolidation,
                 runtime: tokio::sync::Mutex::new(Runtime::default()),
                 status: Arc::new(RwLock::new(Status::default())),
             }),
@@ -1561,6 +1702,122 @@ mod tests {
 
         kernel.processes().kill(&process.meta.pid, "not needed").await.unwrap();
         eventually("the root to be dropped", || kernel.inner.sup.watched_roots().is_empty()).await;
+        kernel.stop().await.unwrap();
+    }
+
+    /// A sleeper on a cron wake no registered source covers (spec 3.2 §7.4, §8.1 `wake
+    /// --cron`), on a manual clock: the kernel fires it at each occurrence — the first
+    /// sleeper, then the successor it re-armed — and forgets the expression once the
+    /// series is killed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cron_sleeper_wakes_at_each_occurrence_until_it_is_killed() {
+        use adk_core::{Llm, ManualClock, RunState};
+        use adk_model::{ScriptedLlm, ScriptedResponse};
+
+        let clock = ManualClock::new(chrono::Utc::now());
+        let runs: Arc<dyn DurableRunStore> =
+            Arc::new(InMemoryRunStore::new().with_clock(Arc::new(clock.clone())));
+        let model = Arc::new(ScriptedLlm::new(
+            "scripted",
+            ["first occurrence", "second occurrence"].map(ScriptedResponse::text),
+        ));
+        let agent = adk_agent::LlmAgentBuilder::new("agent")
+            .model(Arc::clone(&model) as Arc<dyn Llm>)
+            .build()
+            .unwrap();
+        let runner = Arc::new(
+            Runner::builder()
+                .app_name("adk-rust")
+                .agent(Arc::new(agent))
+                .session_service(Arc::new(adk_session::InMemorySessionService::new()))
+                .build()
+                .unwrap(),
+        );
+        let kernel = Kernel::builder()
+            .config(
+                KernelConfig::default()
+                    .with_scheduler_tick(Duration::from_millis(50))
+                    .with_clock(Arc::new(clock.clone()))
+                    .with_control(ControlPlaneConfig::default().without_socket()),
+            )
+            .run_store(Arc::clone(&runs))
+            .agent("adk-rust", runner)
+            .build()
+            .unwrap();
+        kernel.start().await.unwrap();
+        let hourly = "0 0 * * * *";
+        let wake = WakeSet::any_of([Wake::Cron {
+            expr: hourly.into(),
+            missed: adk_core::MissedFirePolicy::Skip,
+        }]);
+        let run =
+            NewRun::new("background", "adk-rust", "alice", "adk-rust", json!({ "text": "x" }));
+        let first = kernel
+            .processes()
+            .spawn(run, ProcessSpec::new(ProcessKind::Scheduled).with_wake(wake.clone()))
+            .await
+            .unwrap()
+            .meta
+            .pid;
+        let state = |pid: String| {
+            let runs = Arc::clone(&runs);
+            async move { runs.get(&pid).await.unwrap().map(|run| run.state) }
+        };
+        let wait_for = |what: &'static str, pid: String, wanted: RunState| async move {
+            let started = tokio::time::Instant::now();
+            while state(pid.clone()).await != Some(wanted) {
+                assert!(started.elapsed() < Duration::from_secs(5), "timed out waiting for {what}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let successor = |parent: String| {
+            let kernel = kernel.clone();
+            async move {
+                let started = tokio::time::Instant::now();
+                loop {
+                    let processes = kernel.processes().ps(ProcessFilter::default()).await.unwrap();
+                    if let Some(next) =
+                        processes.iter().find(|p| p.meta.parent.as_deref() == Some(parent.as_str()))
+                    {
+                        return next.meta.pid.clone();
+                    }
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "timed out waiting for the successor of {parent}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        };
+        wait_for("the sleeper asleep", first.clone(), RunState::Waiting).await;
+        eventually("the expression to be fired by the kernel", || {
+            kernel.inner.sup.watched_crons() == [hourly]
+        })
+        .await;
+        assert_eq!(model.requests().len(), 0, "asleep until the hour");
+
+        clock.advance(Duration::from_secs(3_601));
+        wait_for("the first occurrence's run", first.clone(), RunState::Completed).await;
+        let second = successor(first.clone()).await;
+        wait_for("the successor asleep", second.clone(), RunState::Waiting).await;
+        let meta = kernel.processes().get(&second).await.unwrap().unwrap().meta;
+        assert_eq!(meta.wake, Some(wake.clone()), "the successor sleeps on the same cron wake");
+
+        clock.advance(Duration::from_secs(3_601));
+        wait_for("the second occurrence's run", second.clone(), RunState::Completed).await;
+        assert_eq!(model.requests().len(), 2, "one run per occurrence");
+        let third = successor(second).await;
+        wait_for("the next successor asleep", third.clone(), RunState::Waiting).await;
+
+        kernel.processes().kill(&third, "the series ends").await.unwrap();
+        eventually("the expression to be dropped", || kernel.inner.sup.watched_crons().is_empty())
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let processes = kernel.processes().ps(ProcessFilter::default()).await.unwrap();
+        assert!(
+            !processes.iter().any(|p| p.meta.parent.as_deref() == Some(third.as_str())),
+            "a killed sleeper is not re-armed"
+        );
         kernel.stop().await.unwrap();
     }
 }

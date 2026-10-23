@@ -26,6 +26,7 @@
 //! | `MemberSpec`, `HarnessTeam` (feature `team`) | §7.10 |
 //! | `PlanGraphs`, `compile_plan` (feature `graph`), [`GoalSpec`], [`GoalStore`], [`UntilCheckAgent`] | §7.11 |
 //! | `MemoryFact`, `FactStore`, `FactIndex`, `LongTermMemoryConfig`, `memory_search`, `memory_remember` (feature `memory`) | §7.15.2 |
+//! | `ConsolidationConfig`, `ConsolidationRequest`, `ConsolidationRecord`, `undo_consolidation`, `Harness::{distill_sessions, consolidate_memory}` (feature `memory`) | spec 3.2 §7.5, §10 HK2 |
 //! | `hooks::HookSpec`, `hooks::HookSet`, `hooks::HookRunner` (feature `hooks`) | §7.22 |
 //! | `packs::managed::{HarnessDef, HarnessResolver}` (feature `managed`) | §7.18 |
 //! | [`coding::CodingAgent`] | §7.19 |
@@ -134,11 +135,19 @@ pub use facts::RagEmbedder;
 pub use facts::SqliteFactStore;
 #[cfg(feature = "memory")]
 pub use facts::{
+    BesideKnown, CONSOLIDATION_CLUSTER_SCORE, ChangeReason, ConsolidationConfig,
+    ConsolidationRecord, ConsolidationRequest, ConsolidationUndo, FactChange, SessionDistillation,
+    find_consolidation, undo_consolidation,
+};
+#[cfg(feature = "memory")]
+pub use facts::{
     FACT_AUTHOR_PREFIX, FACT_TEXT_MAX_CHARS, FactFilter, FactIndex, FactKind, FactProjects,
     FactScope, FactSource, FactStatus, FactStore, FileFactStore, InMemoryFactStore, LocalFactIndex,
     LongTermMemoryConfig, MemoryFact, MemoryServiceIndex, Provenance, fact_digest,
     redact_fact_text,
 };
+#[cfg(all(feature = "memory", feature = "kernel"))]
+pub use facts::{HarnessConsolidator, SessionStateFilter};
 pub use fsutil::redact_store_url;
 #[cfg(feature = "graph")]
 pub use goal::GoalEngine;
