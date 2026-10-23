@@ -12,8 +12,8 @@ use adk_core::{
     ActionLedger, ActionOutcome, AdkError, BackpressurePolicy, Content, ErrorCategory,
     ErrorComponent, Event, InMemoryActionLedger, Llm, LlmRequest, LlmResponse, LlmResponseStream,
     Part, RESULT_WITHHELD_STATUS, Result, RunConfig, SessionId, TOOL_ERROR_MESSAGE_LIMIT,
-    TOOL_INVALID_ARGUMENTS_CODE, Tool, ToolConcurrencyConfig, ToolContext, ToolEffect,
-    ToolResultStatus, UserId,
+    TOOL_INVALID_ARGUMENTS_CODE, TOOL_RESULT_STATUS_KEY, Tool, ToolConcurrencyConfig, ToolContext,
+    ToolEffect, ToolResultStatus, UserId,
 };
 use adk_plugin::{Plugin, PluginConfig, PluginManager};
 use adk_runner::Runner;
@@ -145,6 +145,17 @@ struct Run {
 }
 
 impl Run {
+    fn response(&self) -> &Part {
+        self.session_events
+            .iter()
+            .filter_map(|event| event.llm_response.content.as_ref())
+            .flat_map(|content| &content.parts)
+            .find(
+                |part| matches!(part, Part::FunctionResponse { id: Some(id), .. } if id == "call-1"),
+            )
+            .expect("call-1 is answered")
+    }
+
     /// The response that answers `call-1`, as the session holds it.
     fn answer(&self) -> Value {
         self.session_events
@@ -820,6 +831,142 @@ async fn cancellation_keeps_its_distinct_status() {
         };
         assert_eq!(outcome.answer(), expected);
     }
+}
+
+#[tokio::test]
+async fn full_callback_preserves_execution_status() {
+    for status in
+        [ToolResultStatus::Failed, ToolResultStatus::Cancelled, ToolResultStatus::OutcomeUnknown]
+    {
+        let model = ScriptedModel::new(vec![call("lookup_order", json!({}))]);
+        let (mut tool, runs) = match status {
+            ToolResultStatus::Failed => CountingTool::failing(
+                "lookup_order",
+                ErrorCategory::Unavailable,
+                "tool.unavailable",
+                "offline",
+            ),
+            ToolResultStatus::Cancelled => CountingTool::failing(
+                "lookup_order",
+                ErrorCategory::Cancelled,
+                "tool.cancelled",
+                "stopped",
+            ),
+            _ => CountingTool::ok("lookup_order", json!({"row": 1})),
+        };
+        if status == ToolResultStatus::OutcomeUnknown {
+            tool.delay = Some(Duration::from_secs(5));
+        }
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let seen = callbacks.clone();
+        let agent = LlmAgentBuilder::new("support")
+            .model(model.clone())
+            .tool(Arc::new(tool))
+            .tool_timeout(Duration::from_millis(50))
+            .after_tool_callback_full(Box::new(move |_, _, _, response| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { Ok(Some(response)) })
+            }))
+            .build()
+            .unwrap();
+        let ledger = Arc::new(InMemoryActionLedger::new());
+        let outcome =
+            run(agent, None, RunConfig::builder().action_ledger(ledger.clone()).build()).await;
+        let value = match status {
+            ToolResultStatus::Failed => {
+                json!({"error": "tool 'lookup_order' failed: tool.unavailable (tool.unavailable)"})
+            }
+            ToolResultStatus::Cancelled => {
+                json!({"error": "tool 'lookup_order' failed: tool.cancelled (tool.cancelled)"})
+            }
+            _ => adk_core::outcome_unknown_response(
+                "Tool 'lookup_order' timed out after 50ms. The call may have taken effect; check its result before calling it again.",
+            ),
+        };
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            outcome.response(),
+            &Part::FunctionResponse {
+                function_response: adk_core::FunctionResponseData::new(
+                    "lookup_order",
+                    value.clone()
+                ),
+                id: Some("call-1".to_string()),
+                annotations: Some(json!({TOOL_RESULT_STATUS_KEY: status})),
+            }
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let sent: Vec<_> = requests[1]
+            .contents
+            .iter()
+            .flat_map(|content| &content.parts)
+            .filter(|part| matches!(part, Part::FunctionResponse { .. }))
+            .collect();
+        assert_eq!(sent, vec![outcome.response()]);
+        let key = format!("outcomes/user/session/{}/call-1", outcome.invocation_id());
+        let recorded = ledger.get(&key).await.unwrap().expect("ledger record");
+        let expected = if status == ToolResultStatus::OutcomeUnknown {
+            None
+        } else {
+            Some(ActionOutcome::Failed { error: value["error"].as_str().unwrap().to_string() })
+        };
+        assert_eq!(recorded.outcome, expected);
+    }
+}
+
+#[tokio::test]
+async fn full_callback_preserves_other_annotations() {
+    let value = json!({"isError": true, "error": "domain row"});
+    let annotations = json!({"trace": {"source": "callback"}});
+    let model = ScriptedModel::new(vec![call("lookup_order", json!({}))]);
+    let (tool, runs) = CountingTool::ok("lookup_order", value.clone());
+    let result = value.clone();
+    let retained = annotations.clone();
+    let agent = LlmAgentBuilder::new("support")
+        .model(model.clone())
+        .tool(Arc::new(tool))
+        .after_tool_callback(Box::new(move |_| {
+            let result = result.clone();
+            let annotations = retained.clone();
+            Box::pin(async move {
+                Ok(Some(Content {
+                    role: "function".to_string(),
+                    parts: vec![Part::FunctionResponse {
+                        function_response: adk_core::FunctionResponseData::new("cached", result),
+                        id: None,
+                        annotations: Some(annotations),
+                    }],
+                }))
+            })
+        }))
+        .after_tool_callback_full(Box::new(|_, _, _, response| {
+            Box::pin(async move { Ok(Some(response)) })
+        }))
+        .build()
+        .unwrap();
+    let outcome = run(agent, None, RunConfig::default()).await;
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.status(), None);
+    assert_eq!(
+        outcome.response(),
+        &Part::FunctionResponse {
+            function_response: adk_core::FunctionResponseData::new("lookup_order", value),
+            id: Some("call-1".to_string()),
+            annotations: Some(annotations),
+        }
+    );
+    let requests = model.requests();
+    let sent: Vec<_> = requests[1]
+        .contents
+        .iter()
+        .flat_map(|content| &content.parts)
+        .filter(|part| matches!(part, Part::FunctionResponse { .. }))
+        .collect();
+    assert_eq!(sent, vec![outcome.response()]);
 }
 
 #[tokio::test]

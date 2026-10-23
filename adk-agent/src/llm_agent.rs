@@ -3247,6 +3247,8 @@ impl ToolExecutor<'_> {
                     .await
                     {
                         Ok(Some(modified_value)) => {
+                            let annotations =
+                                response_content.parts.iter().find_map(Part::annotations).cloned();
                             response_content = Content {
                                 role: "function".to_string(),
                                 parts: vec![Part::FunctionResponse {
@@ -3255,7 +3257,7 @@ impl ToolExecutor<'_> {
                                         modified_value,
                                     ),
                                     id: id.clone(),
-                                    annotations: None,
+                                    annotations,
                                 }],
                             };
                             break;
