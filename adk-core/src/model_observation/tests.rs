@@ -62,7 +62,7 @@ async fn cancels_pending_stream_without_fabricating_headers() {
     assert!(!events.iter().any(|event| matches!(event.kind, Kind::Headers { .. })));
     assert!(matches!(
         events.last().unwrap().kind,
-        Kind::Finished { outcome: Outcome::Cancelled, .. }
+        Kind::Finished { outcome: Outcome::Cancelled, failure: None, .. }
     ));
 }
 
@@ -87,7 +87,10 @@ async fn isolates_nested_calls_and_unscoped_requests() {
         let events = events.lock().unwrap();
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| event.attempt == 1));
-        assert!(matches!(events[1].kind, Kind::Finished { outcome: Outcome::Succeeded, .. }));
+        assert!(matches!(
+            events[1].kind,
+            Kind::Finished { outcome: Outcome::Succeeded, failure: None, .. }
+        ));
     }
 }
 
@@ -111,4 +114,129 @@ async fn successful_scope_does_not_complete_abandoned_attempts() {
         })
         .collect();
     assert_eq!(endings, [(2, Outcome::Succeeded), (1, Outcome::Cancelled)]);
+}
+
+#[tokio::test]
+async fn projects_only_fixed_failure_fields() {
+    use crate::{AdkError, ErrorCategory, ErrorComponent};
+    let (observer, events) = recorder();
+    let mut error = AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::Unavailable,
+        "model.fixture.failed",
+        "private response body",
+    )
+    .with_provider("private provider")
+    .with_request_id("private upstream request")
+    .with_upstream_status(503);
+    error.details.metadata.insert("provider_error_code".into(), "private code".into());
+    let expected = Failure {
+        code: "model.fixture.failed",
+        component: ErrorComponent::Model,
+        category: ErrorCategory::Unavailable,
+        upstream_status: Some(503),
+    };
+    scope(observer, async {
+        let attempt = Attempt::start(Transport::Http, None);
+        attempt.fail(&error);
+        attempt.finish(Outcome::Succeeded);
+        Ok::<_, ()>(())
+    })
+    .await
+    .unwrap();
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[1].kind,
+        Kind::Finished { outcome: Outcome::Failed, failure: Some(failure), .. }
+            if failure == expected
+    ));
+    assert!(!format!("{:?}", events[1]).contains("private"));
+}
+
+#[tokio::test]
+async fn retains_failure_before_successful_retry() {
+    use crate::{AdkError, ErrorCategory, ErrorComponent};
+    let (observer, events) = recorder();
+    let error = AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::Timeout,
+        "model.fixture.timeout",
+        "private timeout detail",
+    );
+    scope(observer, async {
+        operation_with_failure(
+            async {
+                Attempt::start(Transport::Http, None);
+                Err::<(), _>(error)
+            },
+            |error| Failure::from(error),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            events.lock().unwrap().last().unwrap().kind,
+            Kind::Finished { outcome: Outcome::Failed, failure: Some(_), .. }
+        ));
+        Attempt::start(Transport::Http, None).finish(Outcome::Succeeded);
+        Ok::<_, ()>(())
+    })
+    .await
+    .unwrap();
+    let events = events.lock().unwrap();
+    let endings: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.kind {
+            Kind::Finished { outcome, failure, .. } => Some((event.attempt, outcome, failure)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        endings,
+        [
+            (
+                1,
+                Outcome::Failed,
+                Some(Failure {
+                    code: "model.fixture.timeout",
+                    component: ErrorComponent::Model,
+                    category: ErrorCategory::Timeout,
+                    upstream_status: None,
+                }),
+            ),
+            (2, Outcome::Succeeded, None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn preserves_typed_stream_failure() {
+    use crate::{AdkError, ErrorCategory, ErrorComponent};
+    use futures::StreamExt;
+    let (observer, events) = recorder();
+    let error = AdkError::new(
+        ErrorComponent::Model,
+        ErrorCategory::Internal,
+        "model.fixture.parse",
+        "private malformed output",
+    );
+    let expected = Failure::from(&error);
+    scope(observer, async {
+        Attempt::start(Transport::Http, None);
+        let mut stream = observe_stream(Box::pin(futures::stream::iter([Err(error)])));
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(error.message, "private malformed output");
+        drop(stream);
+        Ok::<_, ()>(())
+    })
+    .await
+    .unwrap();
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        events[1].kind,
+        Kind::Finished { outcome: Outcome::Failed, failure: Some(failure), .. }
+            if failure == expected
+    ));
+    assert!(!format!("{:?}", events[1]).contains("private"));
 }

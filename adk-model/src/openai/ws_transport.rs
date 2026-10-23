@@ -9,7 +9,7 @@ use crate::retry::{
     RetryConfig, category_for_status_code, execute_with_retry, is_retryable_model_error,
     parse_retry_after, with_retry_after,
 };
-use adk_core::model_observation::{Attempt, Outcome, Transport};
+use adk_core::model_observation::{Attempt, Transport};
 use adk_core::{AdkError, ErrorCategory, ErrorComponent, LlmResponseStream};
 use async_openai::types::responses::CreateResponse;
 use async_stream::try_stream;
@@ -489,7 +489,7 @@ impl WsTransport {
             if !reused {
                 return Err(before(error, WsRefusal::Transient));
             }
-            attempt.finish(Outcome::Failed);
+            attempt.fail(&error);
             attempt = Attempt::start(Transport::WebSocket, None);
             lease.guard.socket = None;
             self.ensure(&mut lease, handshake_headers.clone(), observer.as_ref(), Some(&attempt)).await?;
@@ -504,7 +504,7 @@ impl WsTransport {
         }
         let mut first = self.initial(&mut lease).await?;
         if incremental && missing(&first) {
-            attempt.finish(Outcome::Failed);
+            attempt.fail(&error_event(&first));
             attempt = Attempt::start(Transport::WebSocket, None);
             lease.guard.continuation = None;
             incremental = false;
@@ -518,8 +518,8 @@ impl WsTransport {
             }
             let full = create_event(&body).map_err(|error| before(error, WsRefusal::Definitive))?;
             attempt.prepared_json(&full);
-            if send(&mut lease, &full).await.is_err() {
-                attempt.finish(Outcome::Failed);
+            if let Err(error) = send(&mut lease, &full).await {
+                attempt.fail(&error);
                 attempt = Attempt::start(Transport::WebSocket, None);
                 lease.guard.socket = None;
                 self.ensure(&mut lease, handshake_headers, observer.as_ref(), Some(&attempt)).await?;
@@ -601,8 +601,8 @@ impl WsTransport {
         }));
         Ok(adk_core::model_observation::observe_stream(stream))
         }.await;
-        if result.is_err() {
-            attempt.finish(Outcome::Failed);
+        if let Err(failure) = &result {
+            attempt.fail(&failure.error);
         }
         result
     }

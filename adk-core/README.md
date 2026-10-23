@@ -24,6 +24,12 @@ Core traits and types for ADK-Rust agents, tools, sessions, and events.
 
 The crate contains no model provider client.
 
+`model_observation::scope` observes individual transport attempts across generation and
+stream consumption. `Kind::Finished` includes an optional `Failure` containing only a
+static ADK code, typed component and category, and upstream HTTP status. It excludes
+messages and arbitrary metadata; successful and cancelled attempts carry no failure.
+Providers can call `Attempt::fail` or `operation_with_failure` at their typed error boundary.
+
 ### Provider-owned history
 
 An integration can attach a non-secret `ProviderOrigin` as

@@ -1450,7 +1450,7 @@ async fn execution_markers_distinguish_generated_calls() {
 
 #[tokio::test]
 async fn observations_finish_at_socket_stream_boundaries() {
-    use adk_core::model_observation::{self, Kind, Outcome};
+    use adk_core::model_observation::{self, Failure, Kind, Outcome};
     for cancel in [false, true] {
         let server = Server::start(
             Arc::new(move |_| {
@@ -1471,20 +1471,22 @@ async fn observations_finish_at_socket_stream_boundaries() {
             async {
                 let mut stream = transport.send_request(request("fixture")).await.unwrap();
                 assert!(stream.next().await.unwrap().unwrap().partial);
-                if !cancel {
-                    assert!(stream.next().await.unwrap().is_err());
-                }
+                let failure = if !cancel {
+                    Some(Failure::from(&stream.next().await.unwrap().unwrap_err()))
+                } else {
+                    None
+                };
                 drop(stream);
                 let expected = if cancel { Outcome::Cancelled } else { Outcome::Failed };
                 let captured = events.lock().unwrap();
                 let endings: Vec<_> = captured
                     .iter()
                     .filter_map(|event| match event.kind {
-                        Kind::Finished { outcome, .. } => Some(outcome),
+                        Kind::Finished { outcome, failure, .. } => Some((outcome, failure)),
                         _ => None,
                     })
                     .collect();
-                assert_eq!(endings, [expected]);
+                assert_eq!(endings, [(expected, failure)]);
                 Ok::<_, ()>(())
             },
         )

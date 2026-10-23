@@ -1,6 +1,6 @@
 //! Raw Responses HTTP retries and content-free transport provenance.
-use adk_core::AdkError;
-use adk_core::model_observation::{Attempt, Outcome, Transport};
+use adk_core::model_observation::{Attempt, Failure, Transport};
+use adk_core::{AdkError, ErrorCategory, ErrorComponent};
 use async_openai::{
     error::OpenAIError,
     middleware::{HttpRequestFactory, ReqwestService},
@@ -47,10 +47,12 @@ pub(super) async fn send(
                     Ok(response) => {
                         attempt.headers(response.status().as_u16(), None);
                         if !response.status().is_success() {
-                            attempt.finish(Outcome::Failed);
+                            attempt.finish_failure(crate::request_retry::http::status_failure(
+                                response.status().as_u16(),
+                            ));
                         }
                     }
-                    Err(_) => attempt.finish(Outcome::Failed),
+                    Err(error) => attempt.finish_failure(request_failure(error)),
                 }
                 if let Ok(response) = &mut result
                     && let Some(deadline) = retry_at(response.headers())
@@ -74,6 +76,36 @@ pub(super) async fn send(
         |result| result.as_ref().ok().and_then(response_deadline),
     )
     .await
+}
+
+fn request_failure(error: &OpenAIError) -> Failure {
+    // The raw send precedes SDK error normalization and its retry loop can hide
+    // failures from callers. Inspect the typed source here, never its display.
+    let OpenAIError::Reqwest(error) = error else {
+        return Failure {
+            code: "model.http.request",
+            component: ErrorComponent::Model,
+            category: ErrorCategory::Internal,
+            upstream_status: None,
+        };
+    };
+    let (code, category) = if error.is_timeout() {
+        ("model.http.timeout", ErrorCategory::Timeout)
+    } else if error.is_connect() {
+        ("model.http.connection", ErrorCategory::Unavailable)
+    } else if error.is_builder() || error.is_redirect() {
+        ("model.http.build", ErrorCategory::InvalidInput)
+    } else if error.is_decode() {
+        ("model.http.decode", ErrorCategory::Internal)
+    } else {
+        ("model.http.network", ErrorCategory::Unavailable)
+    };
+    Failure {
+        code,
+        component: ErrorComponent::Model,
+        category,
+        upstream_status: error.status().map(|status| status.as_u16()),
+    }
 }
 
 #[derive(Clone, Copy)]

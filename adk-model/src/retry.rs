@@ -334,7 +334,10 @@ where
     ObserveFut: Future<Output = Result<()>>,
 {
     if !retry_config.enabled {
-        return adk_core::model_observation::operation(operation()).await;
+        return adk_core::model_observation::operation_with_failure(operation(), |error| {
+            adk_core::model_observation::Failure::from(error)
+        })
+        .await;
     }
 
     let mut attempt: u32 = 0;
@@ -344,7 +347,11 @@ where
     let server_delay = server_hint.and_then(|h| h.retry_after);
 
     loop {
-        match adk_core::model_observation::operation(operation()).await {
+        match adk_core::model_observation::operation_with_failure(operation(), |error| {
+            adk_core::model_observation::Failure::from(error)
+        })
+        .await
+        {
             Ok(value) => return Ok(value),
             Err(error) if attempt < retry_config.max_retries && classify_error(&error) => {
                 // Priority: error hint, initial server hint, then bounded backoff.

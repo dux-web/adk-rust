@@ -704,13 +704,19 @@ async fn observations_finish_before_body_retry_backoff() {
     let endings: Vec<_> = events
         .iter()
         .filter_map(|event| match event.kind {
-            Kind::Finished { elapsed, outcome } => Some((event.attempt, elapsed, outcome)),
+            Kind::Finished { elapsed, outcome, failure } => {
+                Some((event.attempt, elapsed, outcome, failure))
+            }
             _ => None,
         })
         .collect();
     assert_eq!(endings.len(), 2);
     assert_eq!((endings[0].0, endings[0].2), (1, Outcome::Failed));
     assert_eq!((endings[1].0, endings[1].2), (2, Outcome::Succeeded));
+    let failure = endings[0].3.expect("failed body must retain its typed cause");
+    assert_eq!(failure.code, "model.openai_responses.request");
+    assert_eq!(failure.category, ErrorCategory::Unavailable);
+    assert_eq!(endings[1].3, None);
     assert!(endings[1].1 >= Duration::from_millis(70));
     let first_end = events
         .iter()
@@ -782,6 +788,197 @@ async fn observations_follow_stream_outcomes() {
             events.iter().filter(|event| matches!(event.kind, Kind::Finished { .. })).count(),
             1
         );
+        for event in events.iter() {
+            if let Kind::Finished { outcome, failure, .. } = &event.kind {
+                if matches!(outcome, Outcome::Succeeded | Outcome::Cancelled) {
+                    assert!(failure.is_none());
+                } else {
+                    assert!(failure.is_some(), "typed provider/stream failures retain their cause");
+                }
+            }
+        }
         server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn observations_retain_raw_recovery_causes() {
+    use adk_core::model_observation::{self, Kind, Outcome};
+    use adk_model::{HttpTimeouts, request_retry::RequestRetryConfig};
+    use std::{io::Write, sync::Mutex, time::Duration};
+    for (mode, code, category, status) in [
+        ("timeout", "model.http.timeout", ErrorCategory::Timeout, None),
+        ("network", "model.http.network", ErrorCategory::Unavailable, None),
+        ("status", "model.http.status", ErrorCategory::Unavailable, Some(503)),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body = completion()["response"].to_string();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            first.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            read_request(&mut first);
+            let stalled = if mode == "timeout" {
+                Some(first)
+            } else {
+                if mode == "status" {
+                    first.write_all(b"HTTP/1.1 503 Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                }
+                drop(first);
+                None
+            };
+            let (mut second, _) = listener.accept().unwrap();
+            second.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            read_request(&mut second);
+            second.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+            drop(stalled);
+        });
+        let model = client(&base, true)
+            .with_timeouts(HttpTimeouts::new(Duration::from_secs(2), Duration::from_millis(500)))
+            .unwrap()
+            .with_request_retry(RequestRetryConfig {
+                max_retries: 1,
+                initial_delay: Duration::ZERO,
+            });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        model_observation::scope(
+            Arc::new(move |event| output.lock().unwrap().push(event)),
+            async { model.generate_content(request(), false).await?.try_collect::<Vec<_>>().await },
+        )
+        .await
+        .unwrap();
+        server.join().unwrap();
+        let events = events.lock().unwrap();
+        let endings: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                Kind::Finished { outcome, failure, .. } => Some((event.attempt, outcome, failure)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(endings.len(), 2, "{mode}");
+        assert_eq!((endings[0].0, endings[0].1), (1, Outcome::Failed));
+        assert_eq!(
+            endings[0].2,
+            Some(adk_core::model_observation::Failure {
+                code,
+                component: adk_core::ErrorComponent::Model,
+                category,
+                upstream_status: status,
+            })
+        );
+        assert_eq!(endings[1], (2, Outcome::Succeeded, None));
+    }
+}
+
+#[tokio::test]
+async fn observations_identify_connection_failures() {
+    use adk_core::model_observation::{self, Kind, Outcome};
+    use adk_model::request_retry::RequestRetryConfig;
+    use std::{io::Write, sync::Mutex, time::Duration};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let base = format!("http://{address}");
+    drop(listener);
+    let (ready, waiting) = std::sync::mpsc::channel();
+    let body = completion()["response"].to_string();
+    let server = std::thread::spawn(move || {
+        // Do not listen until the actual connection refusal was observed.
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        let listener = std::net::TcpListener::bind(address).unwrap();
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        read_request(&mut socket);
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+    });
+    let model = client(&base, true).with_request_retry(RequestRetryConfig {
+        max_retries: 1,
+        initial_delay: Duration::from_secs(1),
+    });
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let output = events.clone();
+    let observer = Arc::new(move |event: model_observation::Event| {
+        if event.attempt == 1 && matches!(event.kind, Kind::Finished { .. }) {
+            ready.send(()).unwrap();
+        }
+        output.lock().unwrap().push(event);
+    });
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        model_observation::scope(observer, async {
+            model.generate_content(request(), false).await?.try_collect::<Vec<_>>().await
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.join().unwrap();
+    let events = events.lock().unwrap();
+    let endings: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event.kind {
+            Kind::Finished { outcome, failure, .. } => Some((event.attempt, outcome, failure)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        endings,
+        [
+            (
+                1,
+                Outcome::Failed,
+                Some(adk_core::model_observation::Failure {
+                    code: "model.http.connection",
+                    component: adk_core::ErrorComponent::Model,
+                    category: ErrorCategory::Unavailable,
+                    upstream_status: None,
+                })
+            ),
+            (2, Outcome::Succeeded, None)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn observations_preserve_parse_failures() {
+    use adk_core::model_observation::{self, Failure, Kind, Outcome};
+    use std::sync::Mutex;
+    for stream in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(if stream {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: {PRIVATE\n\n")
+            } else {
+                ResponseTemplate::new(200).set_body_string("{PRIVATE")
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let model = client(&server.uri(), true);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        let error = model_observation::scope(
+            Arc::new(move |event| output.lock().unwrap().push(event)),
+            async {
+                model.generate_content(request(), stream).await?.try_collect::<Vec<_>>().await
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "model.openai_responses.parse");
+        let events = events.lock().unwrap();
+        let endings: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event.kind {
+                Kind::Finished { outcome, failure, .. } => Some((event.attempt, outcome, failure)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(endings, [(1, Outcome::Failed, Some(Failure::from(&error)))]);
+        assert!(!format!("{endings:?}").contains("PRIVATE"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

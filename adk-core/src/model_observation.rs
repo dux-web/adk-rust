@@ -65,6 +65,9 @@ pub enum Kind {
         elapsed: Duration,
         /// Whether the attempt completed, failed, or was dropped.
         outcome: Outcome,
+        /// Content-free classification from the error owner, when available.
+        /// Successes and cancellations do not carry a failure.
+        failure: Option<Failure>,
     },
 }
 
@@ -88,6 +91,34 @@ pub enum Outcome {
     Cancelled,
 }
 
+/// A content-free projection of a typed failure at an observed boundary.
+///
+/// This deliberately excludes messages, provider codes, arbitrary metadata,
+/// request IDs, URLs, headers, and bodies. A later successful retry does not
+/// replace the classification of an earlier failed attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Failure {
+    /// ADK's static machine-readable code, never provider-controlled text.
+    pub code: &'static str,
+    /// The subsystem that produced the error.
+    pub component: crate::ErrorComponent,
+    /// The typed error category.
+    pub category: crate::ErrorCategory,
+    /// Actual upstream HTTP status, when present on the typed error.
+    pub upstream_status: Option<u16>,
+}
+
+impl From<&crate::AdkError> for Failure {
+    fn from(error: &crate::AdkError) -> Self {
+        Self {
+            code: error.code,
+            component: error.component,
+            category: error.category,
+            upstream_status: error.details.upstream_status_code,
+        }
+    }
+}
+
 struct State {
     observer: Observer,
     pending: Mutex<Pending>,
@@ -109,17 +140,17 @@ impl State {
         let _ = catch_unwind(AssertUnwindSafe(|| (self.observer)(Event { attempt, kind })));
     }
 
-    fn finish(&self, id: u64, outcome: Outcome) {
+    fn finish(&self, id: u64, outcome: Outcome, failure: Option<Failure>) {
         let start = self.pending.lock().unwrap().attempts.remove(&id);
         if let Some(start) = start {
-            self.emit(id, Kind::Finished { elapsed: start.elapsed(), outcome });
+            self.emit(id, Kind::Finished { elapsed: start.elapsed(), outcome, failure });
         }
     }
 
     fn finish_all(&self, outcome: Outcome) {
         let attempts = std::mem::take(&mut self.pending.lock().unwrap().attempts);
         for (id, start) in attempts {
-            self.emit(id, Kind::Finished { elapsed: start.elapsed(), outcome });
+            self.emit(id, Kind::Finished { elapsed: start.elapsed(), outcome, failure: None });
         }
     }
 }
@@ -217,7 +248,19 @@ impl Attempt {
     /// Ends this attempt at its own response boundary. Repeated finishes are ignored.
     pub fn finish(&self, outcome: Outcome) {
         if let Some((state, id, _)) = &self.0 {
-            state.finish(*id, outcome);
+            state.finish(*id, outcome, None);
+        }
+    }
+
+    /// Ends this attempt with only the error's fixed, structured classification.
+    pub fn fail(&self, error: &crate::AdkError) {
+        self.finish_failure(Failure::from(error));
+    }
+
+    /// Records a typed raw transport failure before an SDK may retry or replace it.
+    pub fn finish_failure(&self, failure: Failure) {
+        if let Some((state, id, _)) = &self.0 {
+            state.finish(*id, Outcome::Failed, Some(failure));
         }
     }
 }
@@ -266,6 +309,11 @@ impl AttemptGuard {
     pub fn finish(&self, outcome: Outcome) {
         self.0.finish(outcome);
     }
+
+    /// Records the error owner's content-free classification, at most once.
+    pub fn fail(&self, error: &crate::AdkError) {
+        self.0.fail(error);
+    }
 }
 
 impl Drop for AttemptGuard {
@@ -279,19 +327,19 @@ struct Operation {
     after: u64,
 }
 impl Operation {
-    fn finish(&mut self, outcome: Outcome) {
+    fn finish(&mut self, outcome: Outcome, failure: Option<Failure>) {
         if let Some(state) = self.state.take() {
             let attempts =
                 state.pending.lock().unwrap().attempts.split_off(&self.after.saturating_add(1));
             for (id, start) in attempts {
-                state.emit(id, Kind::Finished { elapsed: start.elapsed(), outcome });
+                state.emit(id, Kind::Finished { elapsed: start.elapsed(), outcome, failure });
             }
         }
     }
 }
 impl Drop for Operation {
     fn drop(&mut self) {
-        self.finish(Outcome::Cancelled);
+        self.finish(Outcome::Cancelled, None);
     }
 }
 
@@ -302,12 +350,31 @@ impl Drop for Operation {
 /// explicit [`AttemptGuard`]. Cancellation finishes this operation's attempts.
 /// Use one scope per logical invocation; do not share it between concurrent calls.
 pub async fn operation<T, E>(future: impl Future<Output = Result<T, E>>) -> Result<T, E> {
+    operation_inner(future, |_| None).await
+}
+
+/// Observes an operation with a content-free classification supplied by its error owner.
+///
+/// Like [`operation`], this finishes failures before retry backoff and preserves
+/// cancellation semantics. The classifier must use typed errors rather than
+/// parsing display text or returning provider-controlled fields.
+pub async fn operation_with_failure<T, E>(
+    future: impl Future<Output = Result<T, E>>,
+    classify: impl FnOnce(&E) -> Failure,
+) -> Result<T, E> {
+    operation_inner(future, |error| Some(classify(error))).await
+}
+
+async fn operation_inner<T, E>(
+    future: impl Future<Output = Result<T, E>>,
+    classify: impl FnOnce(&E) -> Option<Failure>,
+) -> Result<T, E> {
     let state = CURRENT.try_with(Arc::clone).ok();
     let after = state.as_ref().map_or(0, |state| state.pending.lock().unwrap().next);
     let mut guard = Operation { state, after };
     let result = future.await;
-    if result.is_err() {
-        guard.finish(Outcome::Failed);
+    if let Err(error) = &result {
+        guard.finish(Outcome::Failed, classify(error));
     } else {
         guard.state = None;
     }
@@ -341,7 +408,7 @@ impl futures::Stream for ObservedStream {
             self.guard = Attempt::current().guard();
         }
         match &result {
-            std::task::Poll::Ready(Some(Err(_))) => self.guard.finish(Outcome::Failed),
+            std::task::Poll::Ready(Some(Err(error))) => self.guard.fail(error),
             std::task::Poll::Ready(Some(Ok(response))) => {
                 if response.error_code.is_some() || response.error_message.is_some() {
                     self.guard.finish(Outcome::Failed);

@@ -225,6 +225,12 @@ twice. After any provider event acknowledges acceptance, a lost socket or read t
 reported without automatically resending the generation. An explicit provider failure keeps
 its normal error and retry classification.
 
+Call-scoped `adk_core::model_observation` callbacks preserve each failed raw send's
+content-free classification before an automatic retry. `Kind::Finished::failure` contains
+the static ADK error code, typed component and category, and actual upstream status;
+successful retries and completed background submissions carry `None`. Messages, URLs,
+headers, bodies, and provider-controlled metadata are excluded.
+
 Secure WebSocket connections use the platform certificate verifier and the same crypto provider
 selection as the default Responses HTTP client. Certificate rejection is a definitive WebSocket
 refusal; callers can remember it after a successful HTTP fallback.

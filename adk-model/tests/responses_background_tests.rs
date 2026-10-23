@@ -144,7 +144,7 @@ async fn submission_observations_finish_before_stream_drop() {
                 assert!(pending.finish_reason.is_none());
                 assert!(matches!(
                     events.lock().unwrap().last().unwrap().kind,
-                    Kind::Finished { outcome: Outcome::Succeeded, .. }
+                    Kind::Finished { outcome: Outcome::Succeeded, failure: None, .. }
                 ));
                 drop(stream);
                 Ok::<_, AdkError>(())
