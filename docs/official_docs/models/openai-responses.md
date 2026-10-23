@@ -661,6 +661,10 @@ submission the API has already finished is converted like any other response. A 
 request, and any streamed request, still fails with `model.openai_responses.invalid_terminal`
 or `model.openai_responses.unfinished_stream` when it ends without a terminal status.
 
+Call-scoped model observation records a validated pending submission as a successful HTTP
+attempt before yielding its response. Dropping that response stream does not cancel the
+observation or complete the background generation; polling retains its own lifecycle.
+
 ```rust
 use adk_core::{Content, GenerateContentConfig, Llm, LlmRequest};
 use adk_model::openai::OpenAIResponsesClient;

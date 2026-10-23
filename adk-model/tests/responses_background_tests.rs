@@ -3,13 +3,17 @@
 //! Background mode: a `background: true` submission is answered before the generation
 //! finishes, so its `queued` or `in_progress` body is the response the caller polls.
 
-use adk_core::{AdkError, Content, GenerateContentConfig, Llm, LlmRequest, LlmResponse, Part};
+use adk_core::{
+    AdkError, Content, GenerateContentConfig, Llm, LlmRequest, LlmResponse, Part,
+    model_observation::{self, Kind, Outcome},
+};
 use adk_model::{
     openai::{OpenAIResponsesClient, OpenAIResponsesConfig},
     retry::RetryConfig,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -66,12 +70,29 @@ async fn submit(
         .expect(1)
         .mount(&server)
         .await;
-    let result = client(&server)
-        .generate_content(request(background), stream)
-        .await
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let output = events.clone();
+    let result = model_observation::scope(
+        Arc::new(move |event| output.lock().unwrap().push(event)),
+        async {
+            client(&server)
+                .generate_content(request(background), stream)
+                .await?
+                .try_collect::<Vec<_>>()
+                .await
+        },
+    )
+    .await;
+    let endings: Vec<_> = events
+        .lock()
         .unwrap()
-        .try_collect::<Vec<_>>()
-        .await;
+        .iter()
+        .filter_map(|event| match event.kind {
+            Kind::Finished { outcome, .. } => Some((event.attempt, outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(endings, [(1, if result.is_ok() { Outcome::Succeeded } else { Outcome::Failed })]);
     let sent: Value =
         serde_json::from_slice(&server.received_requests().await.unwrap()[0].body).unwrap();
     assert_eq!(sent.get("background").and_then(Value::as_bool), background.then_some(true));
@@ -93,6 +114,55 @@ async fn background_submission_returns_the_pending_response() {
         assert_eq!(openai(pending)["status"], status);
         assert_eq!((pending.error_code.as_deref(), pending.turn_complete), (None, false));
         assert!(pending.content.is_none());
+    }
+}
+
+#[tokio::test]
+async fn submission_observations_finish_before_stream_drop() {
+    for status in ["queued", "in_progress"] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body(
+                "resp_bg",
+                status,
+                json!([]),
+            )))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let model = client(&server);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let output = events.clone();
+        model_observation::scope(
+            Arc::new(move |event| output.lock().unwrap().push(event)),
+            async {
+                let mut stream = model.generate_content(request(true), false).await?;
+                let pending = stream.next().await.unwrap()?;
+                assert_eq!(openai(&pending)["status"], status);
+                assert!(!pending.turn_complete);
+                assert!(pending.finish_reason.is_none());
+                assert!(matches!(
+                    events.lock().unwrap().last().unwrap().kind,
+                    Kind::Finished { outcome: Outcome::Succeeded, .. }
+                ));
+                drop(stream);
+                Ok::<_, AdkError>(())
+            },
+        )
+        .await
+        .unwrap();
+        let endings: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event.kind {
+                Kind::Finished { outcome, .. } => Some((event.attempt, outcome)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(endings, [(1, Outcome::Succeeded)]);
+        server.verify().await;
     }
 }
 

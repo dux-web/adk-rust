@@ -1273,6 +1273,9 @@ impl OpenAIResponsesClient {
                     wire::response(response.clone(), &response, parse::Layer::ResponseBody)?
                 };
                 if wire::is_pending(&projected.status) {
+                    // The HTTP submission is complete while the generation remains pending.
+                    adk_core::model_observation::Attempt::current()
+                        .finish(adk_core::model_observation::Outcome::Succeeded);
                     yield responses_convert::from_pending_projection(&projected);
                 } else {
                     yield responses_convert::from_projection(&projected);

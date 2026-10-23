@@ -231,7 +231,12 @@ impl Attempt {
         AttemptGuard(self.clone())
     }
 
-    fn current() -> Self {
+    /// Returns the latest active attempt in this task's observation scope.
+    ///
+    /// Providers use this handle when a validated request completes before the
+    /// generation, such as a background submission. Unscoped calls return a no-op
+    /// handle. Concurrent invocations must use separate observation scopes.
+    pub fn current() -> Self {
         CURRENT
             .try_with(|state| {
                 state
