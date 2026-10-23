@@ -1404,6 +1404,51 @@ async fn completed_mcp_calls_mark_stream_interruptions() {
 }
 
 #[tokio::test]
+async fn execution_markers_distinguish_generated_calls() {
+    for (event, completed) in [
+        (
+            json!({"type":"response.code_interpreter_call.completed","sequence_number":1,
+                "output_index":0,"item_id":"code-call"}),
+            true,
+        ),
+        (
+            json!({"type":"response.code_interpreter_call.in_progress","sequence_number":1,
+                "output_index":0,"item_id":"code-call"}),
+            false,
+        ),
+        (
+            json!({"type":"response.output_item.done","sequence_number":1,"output_index":0,
+                "item":{"type":"local_shell_call","id":"local","call_id":"call","status":"completed",
+                    "action":{"type":"exec","command":["echo","done"],"env":{}}}}),
+            false,
+        ),
+    ] {
+        let server = Server::start(
+            Arc::new(move |_| vec![Step::Send(event.clone()), Step::Close]),
+            accept_all(),
+        )
+        .await;
+        let transport = WsTransport::connect(&server.config()).await.unwrap();
+        let (responses, error) = collect(&transport, "fixture").await;
+        let error = error.expect("unfinished response must fail");
+        assert_eq!(error.code, "model.openai_responses.unfinished_stream");
+        assert_eq!(
+            error
+                .details
+                .metadata
+                .get("provider_tool_completed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            completed
+        );
+        assert_eq!(error.details.metadata["transport"], "websocket");
+        assert!(!error.retry.should_retry);
+        assert!(responses.iter().all(|response| !response.turn_complete));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn observations_finish_at_socket_stream_boundaries() {
     use adk_core::model_observation::{self, Kind, Outcome};
     for cancel in [false, true] {

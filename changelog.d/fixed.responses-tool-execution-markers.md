@@ -1,0 +1,1 @@
+- Recognize completed hosted tool execution before Responses stream interruption, while keeping generated client tool calls separate from execution completion across HTTP and WebSocket transports.

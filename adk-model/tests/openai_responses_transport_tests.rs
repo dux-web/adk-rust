@@ -613,6 +613,63 @@ async fn completed_mcp_calls_mark_stream_interruptions() {
 }
 
 #[tokio::test]
+async fn execution_markers_distinguish_generated_calls() {
+    for compatible in [false, true] {
+        for (event, completed) in [
+            (
+                json!({"type":"response.code_interpreter_call.completed","sequence_number":1,
+                    "output_index":0,"item_id":"code-call"}),
+                true,
+            ),
+            (
+                json!({"type":"response.code_interpreter_call.in_progress","sequence_number":1,
+                    "output_index":0,"item_id":"code-call"}),
+                false,
+            ),
+            (
+                json!({"type":"response.output_item.done","sequence_number":1,"output_index":0,
+                    "item":{"type":"local_shell_call","id":"local","call_id":"call","status":"completed",
+                        "action":{"type":"exec","command":["echo","done"],"env":{}}}}),
+                false,
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(format!("data: {event}\n\n")),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = client(&server.uri(), compatible)
+                .with_response_recovery(true)
+                .generate_content(request(), true)
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "model.openai_responses.unfinished_stream");
+            assert_eq!(
+                error
+                    .details
+                    .metadata
+                    .get("provider_tool_completed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                completed,
+                "{event}"
+            );
+            assert_eq!(error.details.metadata["transport"], "http");
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
 async fn observations_finish_before_body_retry_backoff() {
     use adk_core::model_observation::{self, Kind, Outcome};
     use std::{io::Write, sync::Mutex, time::Duration};

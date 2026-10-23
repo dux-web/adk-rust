@@ -634,6 +634,11 @@ After any provider event confirms acceptance, a socket delivery failure or read 
 reported without automatically resending the generation. Explicit provider failures retain
 their error and retry classification.
 
+Both transports mark interrupted streams with `provider_tool_completed` after a hosted
+tool's execution-completed event or successful output item. Generated client tool calls,
+including `local_shell`, `computer`, and `apply_patch` instructions, do not establish execution.
+Shell command requests also require execution output before receiving this marker.
+
 System and environment proxy rules, including `NO_PROXY`, match the HTTP client's policy.
 A destination that requires a proxy uses HTTP; a bypassed destination can use WebSocket.
 

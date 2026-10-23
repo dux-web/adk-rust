@@ -172,30 +172,51 @@ pub(super) fn ignore_event(value: &serde_json::Value) -> bool {
 }
 
 pub(super) fn tool_completed(value: &serde_json::Value) -> bool {
-    // The pinned Responses SDK defines this as successful execution, independently
-    // of the later output-item and response terminal events.
-    if value.get("type").and_then(serde_json::Value::as_str) == Some("response.mcp_call.completed")
-    {
-        return serde_json::from_value::<
-            async_openai::types::responses::ResponseMCPCallCompletedEvent,
-        >(value.clone())
-        .is_ok();
-    }
-    value.get("type").and_then(serde_json::Value::as_str) == Some("response.output_item.done")
-        && matches!(
-            value.pointer("/item/type").and_then(serde_json::Value::as_str),
-            Some(
-                "web_search_call"
-                    | "file_search_call"
-                    | "code_interpreter_call"
-                    | "mcp_call"
-                    | "computer_call"
-                    | "local_shell_call"
-                    | "shell_call"
-                    | "apply_patch_call"
-                    | "image_generation_call"
-            )
+    use async_openai::types::responses::{OutputItem, ResponseStreamEvent};
+
+    if !matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some(
+            "response.mcp_call.completed"
+                | "response.code_interpreter_call.completed"
+                | "response.web_search_call.completed"
+                | "response.file_search_call.completed"
+                | "response.image_generation_call.completed"
+                | "response.output_item.done"
         )
+    ) {
+        return false;
+    }
+
+    match serde_json::from_value::<ResponseStreamEvent>(value.clone()) {
+        // Execution can finish before the output item and response terminal events.
+        Ok(
+            ResponseStreamEvent::ResponseMCPCallCompleted(_)
+            | ResponseStreamEvent::ResponseCodeInterpreterCallCompleted(_)
+            | ResponseStreamEvent::ResponseWebSearchCallCompleted(_)
+            | ResponseStreamEvent::ResponseFileSearchCallCompleted(_)
+            | ResponseStreamEvent::ResponseImageGenerationCallCompleted(_),
+        ) => true,
+        Ok(ResponseStreamEvent::ResponseOutputItemDone(event)) => {
+            // Client-owned calls only finish generating instructions. Shell calls
+            // also describe commands; provider-emitted shell outputs prove execution.
+            let completed = value.pointer("/item/status").and_then(serde_json::Value::as_str)
+                == Some("completed");
+            match event.item {
+                OutputItem::McpCall(call) => {
+                    completed
+                        || (call.status.is_none() && call.output.is_some() && call.error.is_none())
+                }
+                OutputItem::WebSearchCall(_)
+                | OutputItem::FileSearchCall(_)
+                | OutputItem::CodeInterpreterCall(_)
+                | OutputItem::ImageGenerationCall(_)
+                | OutputItem::ShellCallOutput(_) => completed,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 pub(super) fn committed(mut error: AdkError, tools: bool) -> AdkError {
@@ -269,6 +290,7 @@ pub(super) fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
     use std::time::Duration;
     #[test]
     fn preserves_server_deadlines() {
@@ -278,5 +300,72 @@ mod tests {
         let deadline = retry_at(&headers).unwrap();
         assert!(deadline >= start + Duration::from_secs(120));
         assert!(deadline < start + Duration::from_secs(121));
+    }
+
+    #[test]
+    fn marks_hosted_execution_events() {
+        for tool in ["mcp", "code_interpreter", "web_search", "file_search", "image_generation"] {
+            let mut event = json!({"type":format!("response.{tool}_call.completed"),
+                "sequence_number":1,"output_index":0,"item_id":"tool-call"});
+            assert!(tool_completed(&event), "{tool}");
+            event["type"] = format!("response.{tool}_call.in_progress").into();
+            assert!(!tool_completed(&event), "{tool}");
+            event["type"] = format!("response.{tool}_call.completed").into();
+            event.as_object_mut().unwrap().remove("item_id");
+            assert!(!tool_completed(&event), "{tool}");
+        }
+    }
+
+    #[test]
+    fn requires_successful_hosted_outputs() {
+        for mut item in [
+            json!({"type":"web_search_call","id":"search","status":"completed"}),
+            json!({"type":"file_search_call","id":"search","queries":[],"status":"completed"}),
+            json!({"type":"code_interpreter_call","id":"code","container_id":"container","status":"completed"}),
+            json!({"type":"mcp_call","id":"mcp","name":"tool","arguments":"{}","server_label":"fixture","status":"completed"}),
+            json!({"type":"image_generation_call","id":"image","status":"completed"}),
+            json!({"type":"shell_call_output","id":"shell-output","call_id":"call","status":"completed",
+                "output":[{"stdout":"done","stderr":"","type":"exit","exit_code":0}]}),
+        ] {
+            let event = |item: &Value| {
+                json!({"type":"response.output_item.done",
+                "sequence_number":1,"output_index":0,"item":item})
+            };
+            assert!(tool_completed(&event(&item)), "{item}");
+            item["status"] = "in_progress".into();
+            assert!(!tool_completed(&event(&item)), "{item}");
+            item["status"] = "failed".into();
+            assert!(!tool_completed(&event(&item)), "{item}");
+            item.as_object_mut().unwrap().remove("status");
+            assert!(!tool_completed(&event(&item)), "{item}");
+        }
+
+        // MCP status is optional; a successful execution result is also definitive.
+        assert!(tool_completed(&json!({"type":"response.output_item.done",
+            "sequence_number":1,"output_index":0,"item":{"type":"mcp_call",
+                "id":"mcp","name":"tool","arguments":"{}","server_label":"fixture","output":"done"}})));
+    }
+
+    #[test]
+    fn excludes_client_generated_calls() {
+        use async_openai::types::responses::ResponseStreamEvent;
+
+        for item in [
+            json!({"type":"local_shell_call","id":"local","call_id":"call","status":"completed",
+                "action":{"type":"exec","command":["echo","done"],"env":{}}}),
+            json!({"type":"computer_call","id":"computer","call_id":"call","status":"completed",
+                "pending_safety_checks":[],"action":{"type":"screenshot"}}),
+            json!({"type":"apply_patch_call","id":"patch","call_id":"call","status":"completed",
+                "operation":{"type":"delete_file","path":"fixture"}}),
+            json!({"type":"shell_call","id":"shell","call_id":"call","status":"completed",
+                "action":{"commands":["echo done"]},"environment":{"type":"local"}}),
+            json!({"type":"shell_call","id":"shell","call_id":"call","status":"completed",
+                "action":{"commands":["echo done"]},"environment":{"type":"container_reference","container_id":"container"}}),
+        ] {
+            let event = json!({"type":"response.output_item.done",
+                "sequence_number":1,"output_index":0,"item":item});
+            assert!(serde_json::from_value::<ResponseStreamEvent>(event.clone()).is_ok());
+            assert!(!tool_completed(&event), "{item}");
+        }
     }
 }
