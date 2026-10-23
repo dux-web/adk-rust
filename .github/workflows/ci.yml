@@ -29,7 +29,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: windows-enforcer-diagnostics
-          cache-save: 'false'
+          cache-save: 'true'
       - name: Run the selected Windows enforcer tests
         env:
           TEST_TARGET: ${{ inputs.test_target }}
