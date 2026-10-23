@@ -23,10 +23,10 @@
 //!
 //! | Aspect | Behaviour |
 //! |--------|-----------|
-//! | Write outside the granted paths | Denied — the restricted-SID access check fails off the granted paths |
+//! | Write outside the granted paths | Denied — the restricted-SID access check fails off the granted paths, except where a path grants write access to `Everyone` or `Users` |
 //! | Write inside a read-write path | Allowed — `RESTRICTED` is granted there and the path keeps the user's own entry |
-//! | Read of a path the policy does not grant and that is not world-readable | Denied by the restricted-SID check |
-//! | World-readable system files (DLLs, `cmd.exe`) | Readable, so the process can start (`Everyone` is a restricting SID) |
+//! | Read of a path the policy does not grant and that grants neither `Everyone` nor `Users` (a user's profile) | Denied by the restricted-SID check |
+//! | System binaries and DLLs (`System32` grants `Users`) | Readable, so the shell can start programs (`Everyone` and `Users` are restricting SIDs) |
 //! | Descendant processes | Killed with the call's Job Object |
 //! | Network | **Not enforced** — Windows offers no per-process network filter without AppContainer |
 //! | Integrity level | Left at the token's default; Low/Untrusted integrity needs the granted paths labelled and is a later rung |
@@ -367,9 +367,10 @@ mod token {
     /// Every group becomes deny-only — `Administrators` and any other group that widens
     /// access — except those the shell needs to start and run: `Everyone`, `Users`,
     /// `Authenticated Users`, `INTERACTIVE`, the logon SID (window station and desktop), and
-    /// integrity labels, which cannot be disabled. The restricting SIDs are `Everyone`, so
-    /// world-readable system files load, `RESTRICTED`, which the policy's paths are granted,
-    /// and the logon SID. The default DACL grants the user, `SYSTEM`, `RESTRICTED` and the
+    /// integrity labels, which cannot be disabled. The restricting SIDs are `Everyone` and
+    /// `Users`, so the shell can open the system binaries it starts (`System32` grants read
+    /// and execute to `Users`, not `Everyone`), `RESTRICTED`, which the policy's paths are
+    /// granted, and the logon SID. The default DACL grants the user, `SYSTEM`, `RESTRICTED` and the
     /// logon SID. Returns `None` when the token has no logon SID.
     pub(super) fn plan(user: &Sid, groups: &[TokenGroup]) -> Option<TokenPlan> {
         let keep = [Sid::everyone(), Sid::users(), Sid::authenticated_users(), Sid::interactive()];
@@ -384,7 +385,7 @@ mod token {
             .collect();
         Some(TokenPlan {
             deny_only,
-            restricting: vec![Sid::everyone(), Sid::restricted(), logon.clone()],
+            restricting: vec![Sid::everyone(), Sid::users(), Sid::restricted(), logon.clone()],
             default_dacl: vec![user.clone(), Sid::system(), Sid::restricted(), logon],
         })
     }
@@ -1018,7 +1019,12 @@ mod tests {
             plan,
             token::TokenPlan {
                 deny_only: vec![token::Sid::administrators(), organisation],
-                restricting: vec![token::Sid::everyone(), token::Sid::restricted(), logon.clone()],
+                restricting: vec![
+                    token::Sid::everyone(),
+                    token::Sid::users(),
+                    token::Sid::restricted(),
+                    logon.clone()
+                ],
                 default_dacl: vec![user, token::Sid::system(), token::Sid::restricted(), logon],
             }
         );
