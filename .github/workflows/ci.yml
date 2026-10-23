@@ -1,4 +1,5 @@
 name: Enforcer diagnostics
+run-name: "${{ inputs.linux_suite }} at ${{ inputs.revision || github.sha }}"
 
 on:
   workflow_dispatch:
@@ -16,6 +17,8 @@ on:
           - none
           - kernel
           - team
+          - review
+          - review-baseline
       changelog_only:
         description: Validate UTF-8 fragments without rebuilding unchanged Rust inputs
         required: false
@@ -158,6 +161,19 @@ jobs:
         with:
           name: devenv
       - run: nix profile install nixpkgs#devenv
+      - name: Reproduce the late UTC review baseline
+        if: inputs.linux_suite == 'review-baseline'
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          path = Path('adk-kernel/tests/proactivity_scenarios.rs')
+          source = path.read_text()
+          before = 'async fn the_daily_review_reports_stale_rules_sleepers_and_freezes_once_a_day() {\n    let start = Utc::now();'
+          after = before.replace('Utc::now()', 'Utc.with_ymd_and_hms(2026, 10, 23, 23, 0, 0).unwrap()')
+          assert source.count(before) == 1
+          path.write_text(source.replace(before, after))
+          PYTHON
+          git diff -- adk-kernel/tests/proactivity_scenarios.rs
       - name: Run the scoped tests
         env:
           SUITE: ${{ inputs.linux_suite }}
@@ -169,6 +185,10 @@ jobs:
             CI=true devenv shell cargo clippy --locked -p adk-kernel --features drivers,sqlite --lib --no-deps -- -D warnings
             CI=true devenv shell cargo nextest run --locked -p adk-kernel --features drivers,sqlite --lib -E 'test(drivers::launch::tests::)' --no-fail-fast
             CI=true ADK_SANDBOX_REQUIRE_ENFORCER=1 devenv shell cargo nextest run --locked -p adk-kernel --features drivers,sqlite --test driver_ledger_property_tests --test driver_park_restart --test driver_sandbox_tests --no-fail-fast
+          elif [[ "$SUITE" == review || "$SUITE" == review-baseline ]]; then
+            CI=true devenv shell cargo fmt --all -- --check
+            CI=true devenv shell cargo clippy --locked -p adk-kernel --test proactivity_scenarios --no-deps -- -D warnings
+            CI=true devenv shell cargo nextest run --locked -p adk-kernel --test proactivity_scenarios --no-fail-fast
           else
             CI=true devenv shell cargo nextest run --locked -p adk-agent --features team-tools --lib -E 'test(team::tests::)' --no-fail-fast
           fi
