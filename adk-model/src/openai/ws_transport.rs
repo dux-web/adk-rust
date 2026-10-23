@@ -9,6 +9,7 @@ use crate::retry::{
     RetryConfig, category_for_status_code, execute_with_retry, is_retryable_model_error,
     parse_retry_after, with_retry_after,
 };
+use adk_core::model_observation::{Attempt, Transport};
 use adk_core::{AdkError, ErrorCategory, ErrorComponent, LlmResponseStream};
 use async_openai::types::responses::CreateResponse;
 use async_stream::try_stream;
@@ -283,7 +284,9 @@ impl WsTransport {
             return Ok(());
         }
         let mut lease = self.lease(self.connection.clone().lock_owned().await);
-        if let Err(failure) = self.ensure(&mut lease, headers.clone(), observer.as_ref()).await {
+        if let Err(failure) =
+            self.ensure(&mut lease, headers.clone(), observer.as_ref(), None).await
+        {
             lease.guard.preconnect_failure = Some((headers, failure.refusal));
             return Err(failure.error);
         }
@@ -313,6 +316,7 @@ impl WsTransport {
         lease: &mut Lease,
         headers: HeaderMap,
         observer: Option<&super::ResponseObserver>,
+        observation: Option<&Attempt>,
     ) -> Result<bool, BeforeEvent> {
         let headers =
             upgrade_headers(headers).map_err(|error| before(error, WsRefusal::Definitive))?;
@@ -321,6 +325,9 @@ impl WsTransport {
             && !lease.guard.expired(&self.options, now)
             && lease.guard.socket.as_mut().is_some_and(idle_and_open);
         if valid {
+            if let Some(attempt) = observation {
+                attempt.connection(true);
+            }
             return Ok(true);
         }
         lease.guard.close();
@@ -356,6 +363,11 @@ impl WsTransport {
                     .await
                     .map_err(|_| timeout())?
                     .map_err(|error| {
+                        if let Some(attempt) = observation
+                            && let tungstenite::Error::Http(response) = &error
+                        {
+                            attempt.headers(response.status().as_u16(), Some(false));
+                        }
                         if let Some(observer) = observer
                             && let tungstenite::Error::Http(response) = &error
                         {
@@ -370,6 +382,10 @@ impl WsTransport {
                 let refusal = refusal(&error);
                 before(error, refusal)
             })?;
+        if let Some(attempt) = observation {
+            attempt.headers(response.status().as_u16(), Some(false));
+            attempt.connection(false);
+        }
         lease.guard.socket = Some(socket);
         lease.guard.headers = headers;
         lease.guard.opened = Instant::now();
@@ -437,6 +453,8 @@ impl WsTransport {
         response_recovery: bool,
     ) -> Result<LlmResponseStream, BeforeEvent> {
         let mut lease = self.lease(self.connection.clone().lock_owned().await);
+        let mut attempt = Attempt::start(Transport::WebSocket, None);
+        let result: Result<LlmResponseStream, BeforeEvent> = async {
         if let Some((attempted, refusal)) = lease.guard.preconnect_failure.take()
             && attempted == headers
         {
@@ -452,7 +470,7 @@ impl WsTransport {
             ));
         }
         let handshake_headers = headers.clone();
-        let mut reused = self.ensure(&mut lease, headers, observer.as_ref()).await?;
+        let mut reused = self.ensure(&mut lease, headers, observer.as_ref(), Some(&attempt)).await?;
         observe_headers(&mut lease, observer.as_ref());
         let mut incremental = false;
         let frame = match lease
@@ -467,6 +485,7 @@ impl WsTransport {
             }
             None => create_event(&body).map_err(|error| before(error, WsRefusal::Definitive))?,
         };
+        attempt.prepared_json(&frame);
         // A failed write can have partially delivered the frame. Do not reconnect
         // and replay it automatically, even when reusing an existing socket.
         send(&mut lease, &frame)
@@ -474,15 +493,20 @@ impl WsTransport {
             .map_err(|error| before(delivery(error), WsRefusal::Transient))?;
         let mut first = self.initial(&mut lease).await?;
         if incremental && missing(&first) {
+            attempt.fail(&error_event(&first));
+            attempt = Attempt::start(Transport::WebSocket, None);
             lease.guard.continuation = None;
             incremental = false;
             if !lease.guard.socket.as_mut().is_some_and(idle_and_open) {
                 lease.guard.socket = None;
-                self.ensure(&mut lease, handshake_headers.clone(), observer.as_ref()).await?;
+                self.ensure(&mut lease, handshake_headers.clone(), observer.as_ref(), Some(&attempt)).await?;
                 observe_headers(&mut lease, observer.as_ref());
                 reused = false;
+            } else {
+                attempt.connection(true);
             }
             let full = create_event(&body).map_err(|error| before(error, WsRefusal::Definitive))?;
+            attempt.prepared_json(&full);
             send(&mut lease, &full)
                 .await
                 .map_err(|error| before(delivery(error), WsRefusal::Transient))?;
@@ -547,14 +571,20 @@ impl WsTransport {
                 }
             }
         };
-        Ok(Box::pin(response_stream.map(move |result| {
+        let stream: LlmResponseStream = Box::pin(response_stream.map(move |result| {
             result.map_err(|error| {
                 super::responses_transport::committed(
                     super::responses_transport::annotate(error, "websocket", "stream"),
                     completed_tools.load(Ordering::Relaxed),
                 )
             })
-        })))
+        }));
+        Ok(adk_core::model_observation::observe_stream(stream))
+        }.await;
+        if let Err(failure) = &result {
+            attempt.fail(&failure.error);
+        }
+        result
     }
 }
 fn observe_headers(lease: &mut Lease, observer: Option<&super::ResponseObserver>) {

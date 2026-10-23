@@ -227,6 +227,14 @@ returned without automatic retry. After any provider event acknowledges acceptan
 reported without automatically resending the generation. An explicit provider failure keeps
 its normal error and retry classification.
 
+Call-scoped `adk_core::model_observation` callbacks report prepared request JSON,
+transport attempt identities, response-header timing, connection reuse, and final outcomes.
+They preserve each failed raw send's classification before an automatic retry.
+`Kind::Finished::failure` contains
+the static ADK error code, typed component and category, and actual upstream status;
+successful retries and completed background submissions carry `None`. The failure
+projection excludes messages, URLs, headers, bodies, and provider-controlled metadata.
+
 Secure WebSocket connections use the platform certificate verifier and the same crypto provider
 selection as the default Responses HTTP client. Certificate rejection is a definitive WebSocket
 refusal; callers can remember it after a successful HTTP fallback.

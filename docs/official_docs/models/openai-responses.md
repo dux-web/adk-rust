@@ -645,6 +645,15 @@ crypto provider selection through `adk_core::ensure_crypto_provider()`, preservi
 caller-installed provider. A certificate rejection is a definitive refusal; capability policy can
 remember it after a successful HTTP fallback.
 
+Call-scoped transport observers receive a `failure` on `model_observation::Kind::Finished`
+when the transport or decoder has a typed cause. This projection contains only the static
+ADK code, error component, category, and upstream HTTP status. Raw HTTP retries report
+timeout, connection, network, request-build, decoding, or HTTP-status failures before the
+next send; response decoding and WebSocket errors retain their static ADK classification.
+A later successful attempt does not replace earlier failures and carries `failure: None`,
+as do cancellations and validated background submissions. No error message, URL, header,
+body, request ID, or arbitrary provider metadata is copied into the failure projection.
+
 `examples/gemini_ws_outcomes` runs each WebSocket case against a scripted local server and,
 when `OPENAI_API_KEY` is set, against the live endpoint:
 
@@ -687,6 +696,10 @@ the API accepts it: the response carries `response_id` and `status` (`queued` or
 submission the API has already finished is converted like any other response. A foreground
 request, and any streamed request, still fails with `model.openai_responses.invalid_terminal`
 or `model.openai_responses.unfinished_stream` when it ends without a terminal status.
+
+Call-scoped model observation records a validated pending submission as a successful HTTP
+attempt before yielding its response. Dropping that response stream does not cancel the
+observation or complete the background generation; polling retains its own lifecycle.
 
 ```rust
 use adk_core::{Content, GenerateContentConfig, Llm, LlmRequest};

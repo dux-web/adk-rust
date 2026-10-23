@@ -135,6 +135,7 @@ pub fn with_priced_usage_tracking(
     provider: impl Into<String>,
     model: impl Into<String>,
 ) -> LlmResponseStream {
+    let stream = adk_core::model_observation::observe_stream(stream);
     let provider = provider.into();
     let model = model.into();
     let tracked = stream.map(move |result| {
