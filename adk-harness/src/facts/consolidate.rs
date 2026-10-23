@@ -6,7 +6,7 @@
 //! | Distillation of the sessions the per-session distiller never reached ([`Harness::distill_sessions`]) | one per session | `Assumed` facts only: verified-quote promotion is off |
 //! | Pass 1 | none | the older of two `Assumed` facts at cosine ≥ `dedup_score` → `Superseded { by: newer }`; an unused, low-confidence `Assumed` fact older than `assumed_ttl` → `Forgotten` (reason `expired`) |
 //! | Pass 2 | one per cluster, at most `max_clusters_per_tick` | a merged `Assumed` fact, source `AgentInferred`, its provenance listing the sources; the sources it names in `supersedes` → `Superseded { by: merged }` |
-//! | Loss cap | — | nothing from either pass when they would change the status of more than `max_loss_fraction` of a scope's live facts |
+//! | Loss cap | — | nothing from either pass when they would lose more than `max(1, ⌊max_loss_fraction × live⌋)` of a scope's live facts: one per pass-1 change, and per merge the facts it supersedes less the one it writes |
 //!
 //! `Known` facts are never superseded, merged or expired, and an `Assumed` fact never
 //! supersedes a `Known` one: it is stored beside it and listed for a person to confirm
@@ -70,8 +70,9 @@ pub struct ConsolidationConfig {
     pub assumed_ttl: Duration,
     /// Most clusters pass 2 sends to the model in one tick.
     pub max_clusters_per_tick: usize,
-    /// The passes apply nothing when they would change the status of more than this share
-    /// of a scope's live facts.
+    /// The passes apply nothing when they would lose more than this share of a scope's
+    /// live facts, rounded down, and at least one fact. A pass-1 supersession or expiry
+    /// loses one fact; a pass-2 merge loses the facts it supersedes less the one it writes.
     pub max_loss_fraction: f32,
     /// Most tokens the tick's model calls spend: distillation and pass 2 together.
     pub max_tokens_per_tick: u64,
@@ -692,15 +693,6 @@ pub(crate) enum PlannedMerge {
     Into { into: String, supersedes: Vec<String> },
 }
 
-#[cfg(feature = "runner")]
-impl PlannedMerge {
-    pub(crate) fn supersedes(&self) -> &[String] {
-        match self {
-            Self::New { supersedes, .. } | Self::Into { supersedes, .. } => supersedes,
-        }
-    }
-}
-
 /// Validates a pass-2 answer against its cluster (spec 3.2 §7.5, K-I22): sources and
 /// superseded facts must be the cluster's (`Assumed`, by construction), a merge supersedes
 /// at least one fact, the text passes the fact checks, and a text equal to a live fact
@@ -748,11 +740,12 @@ pub(crate) fn plan_merge(
     })
 }
 
-/// Whether changing `changes` of a scope's `live` facts stays within `max_loss_fraction`
-/// (spec 3.2 §7.5).
+/// The most live facts the passes may lose in a scope of `live` facts (spec 3.2 §7.5):
+/// `max(1, ⌊max_loss_fraction × live⌋)`. The cap stops mass loss; a scope too small for one
+/// loss in its share may still collapse one duplicate.
 #[cfg(feature = "runner")]
-pub(crate) fn within_loss_cap(live: usize, changes: usize, max_loss_fraction: f32) -> bool {
-    changes as f64 <= f64::from(max_loss_fraction) * live as f64
+pub(crate) fn loss_cap(live: usize, max_loss_fraction: f32) -> usize {
+    ((max_loss_fraction * live as f32).floor() as usize).max(1)
 }
 
 #[cfg(all(test, feature = "runner"))]
@@ -894,7 +887,10 @@ mod tests {
             &live,
         )
         .unwrap();
-        assert_eq!(planned.supersedes(), [a.id.clone(), b.id.clone()], "never the known fact");
+        let PlannedMerge::New { supersedes, .. } = planned else {
+            panic!("a new merged fact: {planned:?}");
+        };
+        assert_eq!(supersedes, [a.id.clone(), b.id.clone()], "never the known fact");
         assert!(plan_merge(&cluster, &answer(vec![]), Some("merged".into()), &live).is_none());
         assert!(plan_merge(&cluster, &answer(vec![&a.id]), None, &live).is_none(), "refused text");
         let same = plan_merge(&cluster, &answer(vec![&a.id, &b.id]), Some(a.text.clone()), &live);
@@ -909,13 +905,11 @@ mod tests {
     }
 
     #[test]
-    fn the_loss_cap_is_a_share_of_live_facts() {
-        assert!(within_loss_cap(4, 1, 0.25));
-        assert!(!within_loss_cap(4, 2, 0.25));
-        assert!(within_loss_cap(0, 0, 0.25));
-        assert!(!within_loss_cap(3, 1, 0.25));
-        assert!(within_loss_cap(100, 25, 0.25));
-        assert!(!within_loss_cap(100, 26, 0.25));
+    fn the_loss_cap_is_a_share_of_live_facts_and_at_least_one() {
+        let caps: Vec<usize> =
+            [0, 2, 3, 4, 7, 8, 10, 100].into_iter().map(|live| loss_cap(live, 0.25)).collect();
+        assert_eq!(caps, vec![1, 1, 1, 1, 1, 2, 2, 25]);
+        assert_eq!((loss_cap(10, 0.7), loss_cap(10, 0.0), loss_cap(10, 1.0)), (7, 1, 10));
     }
 }
 
@@ -930,7 +924,7 @@ mod tick {
 
     use super::{
         ChangeReason, ConsolidationRecord, ConsolidationRequest, FactChange, PlannedMerge,
-        ScopeFacts, SessionDistillation, clusters, pass_one, plan_merge, within_loss_cap,
+        ScopeFacts, SessionDistillation, clusters, loss_cap, pass_one, plan_merge,
     };
     use crate::audit::HarnessAudit;
     use crate::facts::runtime::{FactsRuntime, harness_subject};
@@ -1119,15 +1113,27 @@ mod tick {
                 }
             }
 
-            // The loss cap: all or nothing.
+            // The loss cap: all or nothing, on the live facts the passes lose. A pass-1
+            // supersession or expiry loses one; a merge loses the facts it supersedes less
+            // the one it writes, which keeps their content with provenance.
             for plan in &plans {
                 let live = plan.facts.live.len();
-                let changed = plan.changes.len()
-                    + plan.merges.iter().map(|merge| merge.supersedes().len()).sum::<usize>();
-                if !within_loss_cap(live, changed, config.max_loss_fraction) {
+                let lost = plan.changes.len()
+                    + plan
+                        .merges
+                        .iter()
+                        .map(|merge| match merge {
+                            PlannedMerge::New { supersedes, .. } => {
+                                supersedes.len().saturating_sub(1)
+                            }
+                            PlannedMerge::Into { supersedes, .. } => supersedes.len(),
+                        })
+                        .sum::<usize>();
+                let cap = loss_cap(live, config.max_loss_fraction);
+                if lost > cap {
                     record.refused = Some(format!(
-                        "the passes would change the status of {changed} of the {live} live \
-                         facts of one scope, more than max_loss_fraction {}",
+                        "the passes would lose {lost} of the {live} live facts of one scope, \
+                         more than the {cap} max_loss_fraction {} allows",
                         config.max_loss_fraction
                     ));
                     break;
