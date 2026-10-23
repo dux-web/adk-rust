@@ -30,6 +30,9 @@ team-acp = ["team", "dep:adk-acp"]
 team-a2a = ["team", "dep:adk-server"]
 # Goals started by cron, file-watch and webhook triggers (spec 3.1 §7.11).
 ambient = ["runner", "adk-agent/ambient"]
+# The Agent Kernel glue (spec 3.2 §10 HK1, HK3, §13 Q6): `Harness::kernel`, the partition
+# mode mapping, goal progress and stall parking. Opt-in; adk-cli's `harness` enables it.
+kernel = ["runner", "dep:adk-kernel"]
 # Plan graph and goal engine (spec 3.1 §7.11).
 graph = ["dep:adk-graph", "adk-graph/time-travel", "adk-graph/action"]
 # OS sandbox for the shell (spec 3.1 §7.9).
@@ -53,6 +56,17 @@ memory-graph = ["memory", "dep:adk-memory"]
 hooks = []
 # SQLite backends for the mode, standing-rule and shell-ledger stores.
 sqlite = ["dep:sqlx", "sqlx/sqlite", "adk-graph?/sqlite", "adk-session?/sqlite"]
+# PostgreSQL backends for the mode and standing-rule stores, shared by every replica of a
+# served harness, and the plan checkpointer (spec 3.1 §7.4, §7.5, §7.11, §13 Q2, Q5).
+postgres = ["dep:sqlx", "sqlx/postgres", "dep:adk-session", "adk-session/postgres", "adk-graph?/postgres"]
+# Redis backends for the mode and standing-rule stores, and the plan checkpointer
+# (spec 3.1 §7.4, §7.5, §7.11, §13 Q2, Q5).
+redis = ["dep:fred", "dep:adk-session", "adk-session/redis", "adk-graph?/redis"]
+# Plan checkpointers on MongoDB, Neo4j and Firestore for `checkpointer_from_url`
+# (spec 3.1 §7.11, §13 Q5).
+mongodb = ["adk-graph?/mongodb"]
+neo4j = ["adk-graph?/neo4j"]
+firestore = ["adk-graph?/firestore"]
 # The store envelope of spec 3.1 §7.12: sessions, approvals and the SQLite stores sealed
 # under one keyring from a secret provider, the OS keychain or an environment variable.
 encrypted = ["dep:adk-session", "adk-session/encrypted-session", "dep:keyring"]
@@ -63,7 +77,8 @@ browser = ["dep:adk-browser", "web"]
 computer-use = ["dep:adk-computer-use", "graph"]
 # The payments pack (spec 3.1 §7.16): `adk-auth` for the scope guard its tools run under.
 payments = ["dep:adk-payments", "dep:adk-auth"]
-voice = ["dep:adk-realtime"]
+# The voice surface (spec 3.1 §7.17): the harness as the agent of an `IntegratedRealtimeRunner`.
+voice = ["dep:adk-realtime", "adk-realtime/integration"]
 # The managed form (spec 3.1 §7.18): adk-managed runs on adk-runner and adk-session already.
 managed = ["runner", "dep:adk-managed"]
 # Governed web access: web_fetch, web_search, screening (spec 3.1 §7.20).
@@ -96,10 +111,12 @@ adk-computer-use = { workspace = true, optional = true }
 adk-payments = { workspace = true, optional = true }
 adk-realtime = { workspace = true, optional = true }
 adk-managed = { workspace = true, optional = true }
+adk-kernel = { workspace = true, optional = true }
 async-stream.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 dirs = "7"
+fred = { version = "10", optional = true, features = ["i-scripts"] }
 futures.workspace = true
 regex = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
@@ -127,11 +144,21 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["windows-native"], optional = true }
 
+# Owner-only DACLs on the store files, where Unix uses mode 0600 (spec 3.2 §10 W4).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Threading"] }
+
+# Reads a file's DACL back in the owner-only test.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security_Authorization"] }
+
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"], optional = true }
 
 [dev-dependencies]
 adk-model = { path = "../adk-model", default-features = false }
+# The scripted realtime provider of the voice surface tests (spec 3.1 §7.17).
+adk-realtime = { path = "../adk-realtime", features = ["integration", "scripted"] }
 # SQLite sessions, approvals and ledger, and the durable worker, for the durability tests;
 # `encrypted-session` for the encrypted store conformance suite.
 adk-session = { path = "../adk-session", features = ["sqlite", "encrypted-session"] }

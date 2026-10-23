@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use crate::agent::HarnessAgent;
 use crate::approvals::{
-    RuleOwner, RuleSuggestion, StandingDecision, StandingRule, StandingRuleStore, rule_audit_fields,
+    RuleOwner, RuleSuggestion, StandingDecision, StandingRuleStore, rule_audit_fields,
 };
 use crate::audit::HarnessAudit;
 use crate::goal::{GOAL_STATE_KEY, GOAL_TARGET, GoalSpec, GoalState};
@@ -25,7 +25,6 @@ use crate::goal::{GOAL_STATE_KEY, GOAL_TARGET, GoalSpec, GoalState};
 const DEFAULT_GOAL_QUEUE: &str = "default";
 use crate::instructions::{TrustDecision, WorkspaceTrust};
 use crate::mode::{HarnessMode, MODE_STATE_KEY, ModeChange, ModeSource, write_mode_change};
-use crate::policy::{TableRow, ToolKind};
 use crate::tools::{TODOS_STATE_KEY, TodoList};
 
 /// Status of the response that cancels a held call on a mode loosening (spec 3.1 §7.4).
@@ -231,7 +230,9 @@ impl Harness {
     /// Enqueues goals as durable runs in `store` (spec 3.1 §7.11): [`start_goal`] then
     /// writes the goal state and enqueues a run of target [`GOAL_TARGET`] for a
     /// `DurableWorker` serving [`goal_target`]; a held call parks the run until a decision
-    /// wakes it.
+    /// wakes it. Long-term memory on a harness that requires authenticated identity reads
+    /// the store too: a session that ran in an earlier process is distilled only when its
+    /// latest run was authenticated (I42).
     ///
     /// [`start_goal`]: Self::start_goal
     /// [`goal_target`]: Self::goal_target
@@ -245,6 +246,10 @@ impl Harness {
     /// let worker = adk_server::background::DurableWorker::new(runs).with_agent(target, runner).spawn();
     /// ```
     pub fn with_run_store(mut self, store: Arc<dyn adk_core::DurableRunStore>) -> Self {
+        #[cfg(feature = "memory")]
+        if let Ok(facts) = self.facts_runtime() {
+            *facts.runs.lock().unwrap_or_else(|e| e.into_inner()) = Some(store.clone());
+        }
         self.run_store = Some(store);
         self
     }
@@ -713,41 +718,6 @@ impl Harness {
             ),
         };
         if let Some((suggestion, rule_decision)) = remember {
-            let origin = request
-                .origin
-                .as_ref()
-                .ok_or_else(|| store_error("the pending call records no tool origin"))?;
-            let kind = runtime.policy().registry().classify(
-                &self.agent.info().name,
-                &request.tool_name,
-                Some(origin),
-                &request.args,
-                adk_core::ToolEffect::NonIdempotent,
-                runtime.policy().isolation_status().isolation(),
-                false,
-            );
-            let protected = kind == ToolKind::Edit
-                && request.args.get("path").and_then(Value::as_str).is_none_or(|path| {
-                    crate::approvals::matcher::is_protected_target(runtime.workspace().root(), path)
-                });
-            if !kind.rule_eligible() || TableRow::of(&kind, protected).is_non_waivable() {
-                return Err(store_error("no standing rule applies to this call; decide it once"));
-            }
-            if !suggestion.origin.admits(origin)
-                || !matches!(suggestion.origin, crate::approvals::OriginPin::Exact { .. })
-                || suggestion.tool != request.tool_name
-            {
-                return Err(store_error(
-                    "a remembered rule must pin this call's tool and declaration",
-                ));
-            }
-            if rule_decision == StandingDecision::Allow
-                && !StandingRule::suggestions(&request).contains(&suggestion)
-            {
-                return Err(store_error(
-                    "only a suggested rule can be remembered as an allow rule",
-                ));
-            }
             let owner = RuleOwner {
                 app_name: self.app_name.clone(),
                 user_id: user.to_string(),
@@ -755,9 +725,11 @@ impl Harness {
                 session_id: session.to_string(),
                 created_by: SubjectRef::new(SubjectKind::Human, user.to_string()),
             };
-            let rule = suggestion.into_rule(&owner, rule_decision, Some(fingerprint.to_string()));
+            let rule =
+                self.agent.rule_for_held_call(&request, suggestion, rule_decision, &owner)?;
             if let Some(audit) = self.audit(user, session) {
-                audit.record("harness.rule.created", rule_audit_fields(&rule, &request)).await?;
+                let fields = rule_audit_fields(&rule, request.function_call_id.as_deref());
+                audit.record("harness.rule.created", fields).await?;
             }
             runtime.standing_rules().grant(rule).await?;
         }
@@ -958,6 +930,18 @@ impl Harness {
         (GOAL_TARGET.to_string(), self.runner.clone())
     }
 
+    /// The session service the harness runner uses.
+    #[cfg(feature = "kernel")]
+    pub(crate) fn sessions(&self) -> &Arc<dyn SessionService> {
+        &self.sessions
+    }
+
+    /// The durable run store goals are enqueued on, when one is set.
+    #[cfg(feature = "kernel")]
+    pub(crate) fn run_store(&self) -> Option<&Arc<dyn adk_core::DurableRunStore>> {
+        self.run_store.as_ref()
+    }
+
     /// An ambient goal (spec 3.1 §7.11, feature `ambient`): every event of `source` — a
     /// `CronTrigger`, `FileWatchTrigger` or `WebhookTrigger` — starts `spec` for `user` in
     /// `session`, or in a new session per trigger when `session` is `None`, under the same
@@ -1142,6 +1126,131 @@ impl Harness {
         let facts = self.facts_runtime()?;
         let fact = facts.owned(&self.app_name, user.as_ref(), id).await?;
         facts.correct(&SubjectRef::human(user.to_string()), &fact, &text.into()).await
+    }
+
+    /// Distils those of `user`'s `sessions` the per-session distiller never reached, with
+    /// verified-quote promotion off, so every fact it stores is `Assumed` (spec 3.2 §10 HK2,
+    /// §9.2 K-I12): the public distillation entry a consolidation tick runs.
+    ///
+    /// The store's distillation cursor records how far each session was read, by this
+    /// entry and by the per-session distiller, so no session is distilled twice. Skipped:
+    /// a session read up to its last event, one this process will still distil, one active
+    /// within `distill_idle` of `at`, and one in ReadOnly or Plan mode. On a harness that
+    /// requires authenticated identity, a session that ran in an earlier process is
+    /// distilled only when its latest run in the run store
+    /// ([`with_run_store`](Self::with_run_store)) was authenticated (I42). `budget` bounds the
+    /// model calls of all sessions together; without one, each session's run has the
+    /// harness's budget or two model calls.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let report = harness.distill_sessions(&user, &["s1".into()], chrono::Utc::now(), None).await?;
+    /// assert!(report.stored.len() <= 10);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when long-term memory is off, or the store's error.
+    #[cfg(feature = "memory")]
+    pub async fn distill_sessions(
+        &self,
+        user: &UserId,
+        sessions: &[String],
+        at: chrono::DateTime<chrono::Utc>,
+        budget: Option<adk_core::RunBudget>,
+    ) -> Result<crate::facts::SessionDistillation> {
+        self.facts_runtime()?
+            .distill_sessions(&self.app_name, user.as_ref(), sessions, at, budget)
+            .await
+    }
+
+    /// Runs one consolidation tick over `user`'s facts in this harness's project and the
+    /// user-wide ones (spec 3.2 §7.5, §10 HK2): the sessions in `request` the per-session
+    /// distiller never reached are distilled as [`distill_sessions`](Self::distill_sessions)
+    /// does; pass 1 collapses `Assumed` near-duplicates and expires stale `Assumed` facts
+    /// without a model call; pass 2 merges similar `Assumed` facts on the distiller model.
+    /// `Known` facts are never superseded, merged or expired (K-I22). When the passes would
+    /// change more than `max_loss_fraction` of a scope's live facts, they apply nothing and
+    /// the record says why. The record is kept in the fact store for
+    /// [`undo_consolidation`](Self::undo_consolidation), and one
+    /// `harness.memory.consolidated` audit record lists ids and counts, never text.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let record = harness
+    ///     .consolidate_memory(&user, adk_harness::ConsolidationRequest::new().with_sessions(["s1"]))
+    ///     .await?;
+    /// println!("{} superseded, {} forgotten", record.superseded().count(), record.forgotten().count());
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when long-term memory is off,
+    /// `harness.memory.consolidation_unsupported` for a fact store that keeps no records,
+    /// or the store's or audit trail's error.
+    #[cfg(feature = "memory")]
+    pub async fn consolidate_memory(
+        &self,
+        user: &UserId,
+        request: crate::facts::ConsolidationRequest,
+    ) -> Result<crate::facts::ConsolidationRecord> {
+        self.facts_runtime()?.consolidate(&self.app_name, user.as_ref(), request).await
+    }
+
+    /// `user`'s consolidation records, newest first (spec 3.2 §7.5).
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when long-term memory is off, or the store's error.
+    #[cfg(feature = "memory")]
+    pub async fn consolidations(
+        &self,
+        user: &UserId,
+    ) -> Result<Vec<crate::facts::ConsolidationRecord>> {
+        self.facts_runtime()?.store.consolidations(&self.app_name, user.as_ref()).await
+    }
+
+    /// Reverts `user`'s consolidation tick `tick_id` (an id or a unique prefix) as
+    /// [`undo_consolidation`](crate::undo_consolidation) does, and brings the index in line
+    /// (spec 3.2 §7.5).
+    ///
+    /// # Errors
+    ///
+    /// As [`undo_consolidation`](crate::undo_consolidation), and a configuration error when
+    /// long-term memory is off.
+    #[cfg(feature = "memory")]
+    pub async fn undo_consolidation(
+        &self,
+        user: &UserId,
+        tick_id: &str,
+    ) -> Result<crate::facts::ConsolidationUndo> {
+        let facts = self.facts_runtime()?;
+        let by = SubjectRef::human(user.to_string());
+        let report = crate::facts::undo_consolidation(
+            facts.store.as_ref(),
+            &self.app_name,
+            user.as_ref(),
+            tick_id,
+            &by,
+        )
+        .await?;
+        for id in report.restored.iter().chain(&report.forgotten) {
+            let Some(fact) = facts.store.get(id).await? else {
+                continue;
+            };
+            let indexed = if fact.status.is_live() {
+                facts.index.upsert(&fact).await
+            } else {
+                facts.forget_cached(id);
+                facts.index.remove(&fact).await
+            };
+            if let Err(error) = indexed {
+                tracing::warn!(error = %error, "could not update the fact index after an undo");
+            }
+        }
+        Ok(report)
     }
 }
 

@@ -82,7 +82,7 @@ pub struct HarnessArgs {
     #[arg(long)]
     pub trust: bool,
 
-    /// Add a pack: browser, computer-use or payments
+    /// Add a pack: browser, computer-use, payments or voice
     #[arg(long = "pack", value_parser = parse_pack, value_name = "PACK")]
     pub packs: Vec<Pack>,
 
@@ -93,6 +93,11 @@ pub struct HarnessArgs {
     /// Turn long-term memory off: nothing is recalled or learned (spec 3.1 §7.15.2)
     #[arg(long)]
     pub no_memory: bool,
+
+    /// Turn the kernel's consolidation tick off: `adk-rust up` neither distils missed
+    /// sessions nor tidies assumed facts (spec 3.2 §7.5)
+    #[arg(long)]
+    pub no_consolidation: bool,
 
     /// Declare web_fetch (on by default in this binary; spec 3.1 §7.20)
     #[arg(long, conflicts_with = "no_web")]
@@ -105,6 +110,12 @@ pub struct HarnessArgs {
     /// Host fetched without approval: exact, or *.example.com (repeatable)
     #[arg(long = "allow-domain", value_name = "HOST")]
     pub allow_domains: Vec<String>,
+
+    /// Where web search runs: provider (the model provider's built-in search, the
+    /// default), off, searxng (SEARXNG_URL or `[web] searxng_url`) or deepseek
+    /// (DEEPSEEK_API_KEY); spec 3.1 §7.20
+    #[arg(long, value_parser = parse_search, value_name = "SEARCH")]
+    pub search: Option<SearchArg>,
     /// Reasoning effort of this session's model clients: low, medium or high
     /// (default: the `[effort]` policy, medium in ask; spec 3.1 §7.23)
     #[arg(long, value_parser = parse_effort, value_name = "LEVEL")]
@@ -118,6 +129,12 @@ pub struct HarnessArgs {
     /// Run no hooks, not even the workspace's (spec 3.1 §7.22)
     #[arg(long = "no-hooks")]
     pub no_hooks: bool,
+
+    /// Where plans and goal graphs are checkpointed: sqlite://, postgres://, redis://,
+    /// mongodb://, neo4j:// or firestore:// (default: `[plan] checkpointer` in the user
+    /// config, else the store the sessions are in; spec 3.1 §7.11)
+    #[arg(long, value_name = "URL", conflicts_with = "ephemeral")]
+    pub checkpointer: Option<String>,
 }
 
 /// A `--member` flag value (spec 3.1 §8.1, §7.10).
@@ -216,6 +233,68 @@ impl MemberArg {
     }
 }
 
+/// Where web search runs: `--search` and `[web] search` (spec 3.1 §7.20, §8.1).
+///
+/// A configured search provider replaces the model provider's built-in search with the
+/// governed `web_search` tool: policy, screening and a per-call record.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_cli::harness::SearchArg;
+///
+/// assert_eq!("provider".parse::<SearchArg>(), Ok(SearchArg::Provider));
+/// assert_eq!("searxng".parse::<SearchArg>(), Ok(SearchArg::Searxng));
+/// assert_eq!(SearchArg::default(), SearchArg::Provider);
+/// assert!("bing".parse::<SearchArg>().is_err());
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchArg {
+    /// The built-in search of the provider the model's client serves (Gemini, Anthropic,
+    /// OpenAI Responses, DeepSeek Responses); none for a provider without one.
+    #[default]
+    Provider,
+    /// No web search.
+    Off,
+    /// The governed `web_search` through a SearXNG instance: `[web] searxng_url` in the
+    /// user config, else `SEARXNG_URL`.
+    Searxng,
+    /// The governed `web_search` through DeepSeek's Search API, keyed from
+    /// `DEEPSEEK_API_KEY`.
+    DeepSeek,
+}
+
+impl std::str::FromStr for SearchArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "provider" => Ok(Self::Provider),
+            "off" | "none" => Ok(Self::Off),
+            "searxng" => Ok(Self::Searxng),
+            "deepseek" => Ok(Self::DeepSeek),
+            other => {
+                Err(format!("unknown search '{other}'; use provider, off, searxng or deepseek"))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SearchArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Provider => "provider",
+            Self::Off => "off",
+            Self::Searxng => "searxng",
+            Self::DeepSeek => "deepseek",
+        })
+    }
+}
+
+fn parse_search(value: &str) -> std::result::Result<SearchArg, String> {
+    value.parse()
+}
+
 fn parse_mode(value: &str) -> std::result::Result<HarnessMode, String> {
     match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "read-only" | "readonly" => Ok(HarnessMode::ReadOnly),
@@ -235,7 +314,10 @@ fn parse_pack(value: &str) -> std::result::Result<Pack, String> {
         "browser" => Ok(Pack::Browser),
         "computer-use" => Ok(Pack::ComputerUse),
         "payments" => Ok(Pack::Payments),
-        other => Err(format!("unknown pack '{other}'; use browser, computer-use or payments")),
+        "voice" => Ok(Pack::Voice),
+        other => {
+            Err(format!("unknown pack '{other}'; use browser, computer-use, payments or voice"))
+        }
     }
 }
 
@@ -255,18 +337,67 @@ struct ConfigFile {
     trust: Option<bool>,
     packs: Option<Vec<String>>,
     members: Option<Vec<String>>,
-    web: Option<bool>,
+    /// `web = true|false`, or a `[web]` table (spec 3.1 §7.20).
+    web: Option<WebKey>,
     allow_domains: Option<Vec<String>>,
     /// `[effort]`: the reasoning effort per mode and role (spec 3.1 §7.23).
     effort: Option<EffortPolicy>,
     /// `[store]`: where the store key is kept (spec 3.1 §7.12); the user config only.
     store: Option<StoreTable>,
+    /// `[plan]`: where plans are checkpointed (spec 3.1 §7.11); the user config only.
+    plan: Option<PlanTable>,
     /// `[[hooks]]` tables (spec 3.1 §7.22): the user config's are read by
     /// `HookSet::load_file`, the workspace's by the harness at build, so they are neither
     /// applied here nor reported as unknown.
     #[serde(default)]
     #[allow(dead_code)]
     hooks: Vec<toml::Value>,
+    /// `[ultracode]` (spec 3.1 §7.10): read by `adk-rust ultracode` through
+    /// `UltracodeLimits::resolve`, so it is neither applied here nor reported as unknown.
+    #[serde(default)]
+    #[allow(dead_code)]
+    ultracode: Option<toml::Value>,
+    /// `[kernel]` (spec 3.2 §8.2): read by `adk-rust up` through `KernelSettings::resolve`,
+    /// so it is neither applied here nor reported as unknown.
+    #[serde(default)]
+    #[allow(dead_code)]
+    kernel: Option<toml::Value>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+/// `web` in `harness.toml`: whether web tools are declared, or the `[web]` table.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum WebKey {
+    Enabled(bool),
+    Table(WebTable),
+}
+
+impl WebKey {
+    fn enabled(&self) -> Option<bool> {
+        match self {
+            Self::Enabled(enabled) => Some(*enabled),
+            Self::Table(_) => None,
+        }
+    }
+
+    fn table(&self) -> Option<&WebTable> {
+        match self {
+            Self::Enabled(_) => None,
+            Self::Table(table) => Some(table),
+        }
+    }
+}
+
+/// The `[web]` table: where web search runs (spec 3.1 §7.20).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WebTable {
+    /// `provider`, `off`, `searxng` or `deepseek`.
+    search: Option<String>,
+    /// The SearXNG instance `search = "searxng"` queries.
+    searxng_url: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -276,6 +407,13 @@ struct ConfigFile {
 #[serde(default)]
 struct StoreTable {
     key: Option<String>,
+}
+
+/// The `[plan]` table.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct PlanTable {
+    checkpointer: Option<String>,
 }
 
 /// The `[deploy]` table is read by deployment tooling (spec 3.1 §8.5), not by the CLI.
@@ -343,8 +481,15 @@ pub struct ResolvedHarnessArgs {
     pub web: bool,
     /// `--allow-domain`: hosts fetched without approval.
     pub allow_domains: Vec<String>,
+    /// `--search` / `[web] search`: where web search runs (spec 3.1 §7.20).
+    pub search: SearchArg,
+    /// `[web] searxng_url` of the user config.
+    pub searxng_url: Option<String>,
     /// Long-term memory: on unless `--no-memory` or `--ephemeral`.
     pub memory: bool,
+    /// The kernel's consolidation tick: allowed unless `--no-consolidation`, and only with
+    /// long-term memory (spec 3.2 §7.5).
+    pub consolidation: bool,
     /// The reasoning effort per mode and role (spec 3.1 §7.23): `--effort` sets every
     /// level, else the `[effort]` tables, else the defaults.
     pub effort: EffortPolicy,
@@ -355,6 +500,10 @@ pub struct ResolvedHarnessArgs {
     pub store_key: Option<String>,
     /// Whether hooks run: off with `--no-hooks` (spec 3.1 §7.22, §8.1).
     pub hooks: bool,
+    /// Where plans and goal graphs are checkpointed, from `--checkpointer` or the user
+    /// config's `[plan] checkpointer`; `None` checkpoints them beside the sessions
+    /// (spec 3.1 §7.11, §13 Q5).
+    pub checkpointer: Option<String>,
     /// The `[[hooks]]` of the user config, source `User` (spec 3.1 §7.22); the workspace's
     /// are read at build and run under its trust.
     pub user_hooks: HookSet,
@@ -421,9 +570,12 @@ impl HarnessArgs {
         let mut members = Vec::new();
         let mut web = true;
         let mut allow_domains: Vec<String> = Vec::new();
+        let mut search = SearchArg::default();
+        let mut searxng_url = None;
         let mut effort = EffortPolicy::default();
         let mut effort_explicit = false;
         let mut store_key = None;
+        let mut checkpointer = None;
         if let Some(user) = &user {
             let origin = user_config.map_or_else(String::new, |path| path.display().to_string());
             if let Some(value) = &user.mode {
@@ -441,8 +593,18 @@ impl HarnessArgs {
             for member in user.members.iter().flatten() {
                 members.push(parse_member(member).map_err(|error| config_error(&origin, &error))?);
             }
-            if let Some(value) = user.web {
+            if let Some(value) = user.web.as_ref().and_then(WebKey::enabled) {
                 web = value;
+            }
+            if let Some(table) = user.web.as_ref().and_then(WebKey::table) {
+                if let Some(value) = &table.search {
+                    search =
+                        value.parse().map_err(|error: String| config_error(&origin, &error))?;
+                }
+                searxng_url = table.searxng_url.clone();
+                for key in table.unknown.keys() {
+                    notes.push(format!("{origin}: unknown key `web.{key}` ignored"));
+                }
             }
             allow_domains.extend(user.allow_domains.iter().flatten().cloned());
             if let Some(policy) = user.effort {
@@ -450,6 +612,7 @@ impl HarnessArgs {
                 effort_explicit = true;
             }
             store_key = user.store.as_ref().and_then(|store| store.key.clone());
+            checkpointer = user.plan.as_ref().and_then(|plan| plan.checkpointer.clone());
             for key in user.unknown.keys().filter(|key| *key != DEPLOY_TABLE) {
                 notes.push(format!("{origin}: unknown key `{key}` ignored"));
             }
@@ -476,13 +639,45 @@ impl HarnessArgs {
             if project.fail_if_unavailable == Some(true) {
                 fail_if_unavailable = true;
             }
-            if project.web == Some(false) {
+            if project.web.as_ref().and_then(WebKey::enabled) == Some(false) {
                 web = false;
+            }
+            // A workspace may turn search off; it may not choose where queries go.
+            if let Some(table) = project.web.as_ref().and_then(WebKey::table) {
+                if let Some(value) = &table.search {
+                    let requested: SearchArg =
+                        value.parse().map_err(|error: String| config_error(origin, &error))?;
+                    if requested == SearchArg::Off {
+                        search = SearchArg::Off;
+                    } else if requested != search {
+                        notes.push(loosening_note(
+                            "web.search",
+                            "it would choose where the agent's queries go",
+                        ));
+                    }
+                }
+                if table.searxng_url.is_some() {
+                    notes.push(loosening_note(
+                        "web.searxng_url",
+                        "it would choose where the agent's queries go",
+                    ));
+                }
+                for key in table.unknown.keys() {
+                    notes.push(format!("{origin}: unknown key `web.{key}` ignored"));
+                }
             }
             // Effort costs money, not permissions: a project may set it; flags win.
             if let Some(policy) = project.effort {
                 effort = policy;
                 effort_explicit = true;
+            }
+            // A checkpointer location is not a permission, but a workspace file naming one
+            // would send plan state to a server the repository chose.
+            if project.plan.as_ref().is_some_and(|plan| plan.checkpointer.is_some()) {
+                notes.push(format!(
+                    "{origin}: `plan.checkpointer` ignored — where plans are written is yours to \
+                     choose; set [plan] checkpointer in your user config or pass --checkpointer"
+                ));
             }
             if project.store.is_some() {
                 notes.push(format!(
@@ -528,12 +723,18 @@ impl HarnessArgs {
             web = true;
         }
         allow_domains.extend(self.allow_domains.iter().cloned());
+        if let Some(flag) = self.search {
+            search = flag;
+        }
         if let Some(level) = self.effort {
             effort = EffortPolicy::uniform(level);
             effort_explicit = true;
         }
         if let Some(source) = &self.store_key {
             store_key = Some(source.clone());
+        }
+        if let Some(url) = &self.checkpointer {
+            checkpointer = Some(url.clone());
         }
         if fail_if_unavailable && !sandbox {
             return Err(AdkError::config(
@@ -553,12 +754,16 @@ impl HarnessArgs {
             packs,
             members,
             memory: !self.no_memory && !self.ephemeral,
+            consolidation: !self.no_memory && !self.ephemeral && !self.no_consolidation,
             web,
             allow_domains,
+            search,
+            searxng_url,
             effort,
             effort_explicit,
             store_key,
             hooks: !self.no_hooks,
+            checkpointer,
             user_hooks,
             notes,
         })
@@ -575,7 +780,7 @@ fn config_error(origin: &str, error: &str) -> AdkError {
     AdkError::config(format!("{origin}: {error}"))
 }
 
-fn loosening_note(key: &str, why: &str) -> String {
+pub(crate) fn loosening_note(key: &str, why: &str) -> String {
     format!(
         "{PROJECT_CONFIG_FILE}: `{key}` ignored — {why}, and workspace files may only tighten. \
          Set it in your user config or pass the flag"
@@ -613,12 +818,16 @@ mod tests {
                 packs: vec![],
                 members: vec![],
                 memory: true,
+                consolidation: true,
                 web: true,
                 allow_domains: vec![],
+                search: SearchArg::Provider,
+                searxng_url: None,
                 effort: EffortPolicy::default(),
                 effort_explicit: false,
                 store_key: None,
                 hooks: true,
+                checkpointer: None,
                 user_hooks: HookSet::default(),
                 notes: vec![],
             }
@@ -686,6 +895,31 @@ mod tests {
     }
 
     #[test]
+    fn the_checkpointer_comes_from_the_flag_then_the_user_config_never_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        write(&user, "[plan]\ncheckpointer = \"postgres://plans@db/harness\"\n");
+        write(
+            &dir.path().join(PROJECT_CONFIG_FILE),
+            "[plan]\ncheckpointer = \"redis://attacker.example:6379\"\n",
+        );
+        let resolved = args_in(dir.path()).resolve(HarnessMode::Ask, Some(&user)).unwrap();
+        assert_eq!(resolved.checkpointer.as_deref(), Some("postgres://plans@db/harness"));
+        assert!(
+            resolved.notes.iter().any(|note| note.contains("`plan.checkpointer` ignored")),
+            "{:?}",
+            resolved.notes
+        );
+        let flagged =
+            HarnessArgs { checkpointer: Some("sqlite:///plans.db".into()), ..args_in(dir.path()) }
+                .resolve(HarnessMode::Ask, Some(&user))
+                .unwrap();
+        assert_eq!(flagged.checkpointer.as_deref(), Some("sqlite:///plans.db"));
+        let workspace_only = args_in(dir.path()).resolve(HarnessMode::Ask, None).unwrap();
+        assert_eq!(workspace_only.checkpointer, None);
+    }
+
+    #[test]
     fn flags_beat_the_project_file_which_beats_the_user_file() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("user.toml");
@@ -728,6 +962,23 @@ mod tests {
     }
 
     #[test]
+    fn ultracode_table_is_not_an_unknown_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        write(&user, "[ultracode]\nmax_rounds = 3\n");
+        write(
+            &dir.path().join(PROJECT_CONFIG_FILE),
+            "[ultracode]\narchitecture = \"graph\"\nmax_model_calls = 200\n",
+        );
+        let resolved = args_in(dir.path()).resolve(HarnessMode::Ask, Some(&user)).unwrap();
+        assert!(
+            !resolved.notes.iter().any(|note| note.contains("ultracode")),
+            "[ultracode] is read by `adk-rust ultracode`: {:?}",
+            resolved.notes
+        );
+    }
+
+    #[test]
     fn home_and_root_need_an_explicit_dir() {
         let root = HarnessArgs::default();
         let cwd = std::env::current_dir().unwrap();
@@ -751,6 +1002,47 @@ mod tests {
             .resolve(HarnessMode::Ask, None)
             .unwrap_err();
         assert!(error.to_string().contains("--sandbox"), "{error}");
+    }
+
+    #[test]
+    fn search_defaults_to_the_provider_and_the_flag_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("user.toml");
+        write(&user, "[web]\nsearch = \"searxng\"\nsearxng_url = \"http://localhost:8888\"\n");
+        let resolved = args_in(dir.path()).resolve(HarnessMode::Ask, None).unwrap();
+        assert_eq!((resolved.search, resolved.searxng_url), (SearchArg::Provider, None));
+        let resolved = args_in(dir.path()).resolve(HarnessMode::Ask, Some(&user)).unwrap();
+        assert_eq!(resolved.search, SearchArg::Searxng);
+        assert_eq!(resolved.searxng_url.as_deref(), Some("http://localhost:8888"));
+        assert!(resolved.web, "a [web] table leaves web on");
+        assert!(resolved.notes.is_empty(), "{:?}", resolved.notes);
+        let resolved = HarnessArgs { search: Some(SearchArg::Off), ..args_in(dir.path()) }
+            .resolve(HarnessMode::Ask, Some(&user))
+            .unwrap();
+        assert_eq!(resolved.search, SearchArg::Off);
+        // `web = false` keeps its meaning beside the table form.
+        write(&user, "web = false\n");
+        assert!(!args_in(dir.path()).resolve(HarnessMode::Ask, Some(&user)).unwrap().web);
+        write(&user, "[web]\nsearch = \"bing\"\n");
+        let error = args_in(dir.path()).resolve(HarnessMode::Ask, Some(&user)).unwrap_err();
+        assert!(error.to_string().contains("unknown search 'bing'"), "{error}");
+    }
+
+    #[test]
+    fn a_project_may_turn_search_off_but_never_choose_where_queries_go() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join(PROJECT_CONFIG_FILE),
+            "[web]\nsearch = \"deepseek\"\nsearxng_url = \"http://collector.example\"\n",
+        );
+        let resolved = args_in(dir.path()).resolve(HarnessMode::Ask, None).unwrap();
+        assert_eq!((resolved.search, resolved.searxng_url), (SearchArg::Provider, None));
+        assert_eq!(resolved.notes.len(), 2, "{:?}", resolved.notes);
+        assert!(resolved.notes.iter().all(|note| note.contains("where the agent's queries go")));
+        write(&dir.path().join(PROJECT_CONFIG_FILE), "[web]\nsearch = \"off\"\n");
+        let resolved = args_in(dir.path()).resolve(HarnessMode::Ask, None).unwrap();
+        assert_eq!(resolved.search, SearchArg::Off);
+        assert!(resolved.notes.is_empty(), "{:?}", resolved.notes);
     }
 
     #[test]

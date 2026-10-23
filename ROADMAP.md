@@ -80,7 +80,7 @@ Autonomous agents that do vertically integrated tasks well, demonstrating:
 | Anthropic Managed Agents | 🚧 | `adk-anthropic` managed-agents feature |
 | Gemini Interactions API | 🚧 | `adk-gemini` interactions feature — server-side history, step timeline |
 | Action nodes | ✅ | `adk-action` — 14 deterministic node types for graph workflows |
-| Sandbox execution | ✅ | `adk-sandbox` — process/WASM backends, OS-level profiles (Seatbelt, bubblewrap, AppContainer) |
+| Sandbox execution | ✅ | `adk-sandbox` — process/WASM backends, OS-level profiles (Seatbelt, bubblewrap, Windows restricted token) |
 | Audio ONNX models | ✅ | `adk-audio` — Whisper, Moonshine, Kokoro, Chatterbox, Qwen3-TTS |
 
 ---
@@ -120,17 +120,13 @@ Gaps that remain open after the fixes in #848–#877: from the October 2026 revi
 | Barge-in neither truncates played audio nor clears provider buffers | Track played milliseconds per item; on interruption send `conversation.item.truncate` (WebSocket) and `output_audio_buffer.clear` (WebRTC), and call `clear_buffer` (LiveKit) | October 2026 review |
 | Event iteration continues, or hangs, after a session closes | A closing flag that makes `next_event` and `receive_raw` return `None`; drop the WebRTC sender on close; bound Gemini's close | October 2026 review |
 | Provider options leak into the OpenAI session config, and transcription options are limited | Strip `language_code`, `thinking_level` and `resumeToken` before merging `extra`; merge `extra` recursively; add language and prompt to `TranscriptionConfig` | October 2026 review |
-| No content guardrails on the model's own text or transcript events | Run output guardrails on realtime text and transcripts, as `LlmAgent` does for final text | #857 |
 | A runner built without `tool_governance` has no payload switch, and error messages logged under `record_payloads` are not length-capped | Give realtime runners their own `record_payloads` and apply `trace_payload_max_bytes` | #857 |
-| Gemini Live never captures the session resumption handle (it reads `resumptionToken`; the wire field is `sessionResumptionUpdate.newHandle`), so every reconnect starts a blank session | Read `newHandle` when `resumable` is true and keep the latest | parity review |
-| Realtime runs do not persist user turns, and on Gemini persist no turns at all | Persist input transcripts and typed text as user events; open a Gemini turn on the first delta and close it at `turnComplete`/`generationComplete` | parity review |
 | `RealtimeAgent` saves every audio delta (about 48 KB of rows per second of speech) and no transcript | Keep audio deltas out of the session, or mark them partial; emit one transcript event per response | parity review |
-| Realtime usage is not reported, so realtime spend is unmetered | Translate Gemini `usageMetadata` and OpenAI `response.done` usage and meter it | parity review |
 | Gemini Live `GoAway` is dropped, so the connection ends without warning | Surface `GoAway{timeLeft}` and offer a resume helper that uses the resumption handle | parity review |
 | `RealtimeAgent` does not replay session history on connect, so memory is lost after a transfer or a new invocation | Send the session's text history as `clientContent` turns on connect | parity review |
-| Gemini Live `interrupted` and `turnCompleteReason` are dropped | Map `interrupted` to an interruption event and carry the reason on `ResponseDone` | parity review |
+| Gemini Live `turnCompleteReason` is dropped | Carry the reason on `ResponseDone` | parity review |
 | Gemini Live setup ignores generic config fields such as output caps and tool choice | Map `max_response_output_tokens` and `tool_choice`; add safety and thinking fields | parity review |
-| No `audioStreamEnd`, and the input sample rate is hard-coded to 16 kHz | Add `audio_stream_end`; take the rate from `AudioChunk.format` | parity review |
+| The Gemini Live input sample rate is hard-coded to 16 kHz | Take the rate from `AudioChunk.format` | parity review |
 | Transparent session resumption is not modelled | Add a `transparent` flag | parity review |
 
 ### Gemini and Interactions
@@ -160,7 +156,7 @@ Gaps that remain open after the fixes in #848–#877: from the October 2026 revi
 
 | Gap | Fix | Origin |
 |-----|-----|--------|
-| `CodeActAgent`, realtime runners and graph tool nodes ignore an `AgentTool` delegate's hold | Surface the delegate's `ToolConfirmationRequest` and resume it, as `LlmAgent` does | #852 |
+| `CodeActAgent` and graph tool nodes ignore an `AgentTool` delegate's hold | Surface the delegate's `ToolConfirmationRequest` and resume it, as `LlmAgent` and the realtime runners do | #852 |
 | A delegate that holds several calls in one turn surfaces them one at a time; an `AgentTool` that itself requires confirmation is asked again when it resumes | Surface every held call of the turn; carry the caller's approval across the resume | #852 |
 | A call-ID decision passed without its fingerprint matches on the call ID alone | Bind call-ID decisions to the held request's fingerprint inside the approval check | #853 |
 | When one `ParallelAgent` branch fails while another holds a call, the failed branch is not re-run on resume | Record failed branches in the workflow position and re-run them | #860 |
@@ -186,6 +182,21 @@ Gaps that remain open after the fixes in #848–#877: from the October 2026 revi
 | The computer-use graph has no deny path | Accept an explicit denial on resume and route it to the `blocked` result | October 2026 review |
 | On Neo4j, a paused client keeps its transaction's locks indefinitely | A per-transaction timeout once the driver supports one; until then the server's `db.transaction.timeout` bounds it | #865 |
 | No run-level switch keeps a run out of the caller's trace | A `RunConfig` switch; the `NoSubscriber` recipe in the telemetry docs covers it today | #859 |
+
+### HarnessAgent follow-ups
+
+Items spec 3.1 lists after its delivery phases ([§12](docs/design/spec-3.1-harness-agent.md#12-phased-delivery) phase 6) and the open points its implementation recorded.
+
+| Gap | Fix | Origin |
+|-----|-----|--------|
+| `adk_agent::coding` carries no deprecation attribute although `adk_harness::coding` replaces it | `#[deprecated]` on `adk_agent::coding`, pointing at the harness preset and the migration guide | spec 3.1 §12 phase 6 |
+| An IDE's "allow always" over ACP is answered once and forgotten | Map the ACP permission option to a standing rule for that user and tool | spec 3.1 §12 phase 6 |
+| An approved plan graph cannot be viewed outside the harness | Export the plan graph as Mermaid and DOT | spec 3.1 §12 phase 6 |
+| Long-term facts are only superseded or forgotten one at a time | Consolidation: merge duplicate facts and expire stale `assumed` ones on the distiller model | spec 3.1 §12 phase 6 |
+| `adk-harness` ships at the Beta tier | Stable review of its public API once 3.0.0 has field use | spec 3.1 §12 phase 6 |
+| An MCP elicitation parked in the approvals inbox cannot survive a restart, because the MCP call is still in flight | Resumable MCP calls under the agent kernel, so the parked elicitation is a durable checkpoint | spec 3.1 §7.21 |
+| A fetched PDF reaches the model as a text stub | Deliver it as an inline document part through the multimodal read path | spec 3.1 §7.20, §10 D6 |
+| A symlink swapped in between the harness's protected-path decision and the tool's own open is followed when it points inside the workspace | Decide and open on the same descriptor, so the decision covers the file that is opened | spec 3.1 §10 D4 |
 
 ### Build, CI and supply chain
 

@@ -71,6 +71,7 @@ impl Provider {
 
     /// Whether the provider runs on this machine, so nothing leaves it but the model
     /// endpoint (spec 3.1 §8.1, H10).
+    #[cfg(feature = "harness")]
     pub const fn is_local(self) -> bool {
         matches!(self, Self::Model(ModelProvider::Ollama) | Self::MistralRs)
     }
@@ -125,6 +126,37 @@ pub struct Cli {
     #[cfg(feature = "harness")]
     #[command(flatten)]
     pub harness: adk_cli::harness::HarnessArgs,
+
+    /// The voice surface (`--voice`), which also runs without a subcommand.
+    #[cfg(feature = "voice")]
+    #[command(flatten)]
+    pub voice: VoiceArgs,
+}
+
+/// `adk-rust --voice`: the harness over a realtime session (spec 3.1 §8.1, §7.17, H5).
+#[cfg(feature = "voice")]
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct VoiceArgs {
+    /// Talk to the harness: voice in and out, spoken approvals, the same policy. TEXT is
+    /// the first turn. Needs --provider gemini or openai.
+    #[arg(long, value_name = "TEXT", num_args = 0..=1, default_missing_value = "")]
+    pub voice: Option<String>,
+
+    /// Without a microphone: a mono PCM16 WAV (16 kHz for Gemini, 24 kHz for OpenAI) sent as
+    /// the answer to the first held call; the run ends after that call's response (exit 3
+    /// while a call is still held).
+    #[arg(long, value_name = "WAV", requires = "voice")]
+    pub voice_input: Option<std::path::PathBuf>,
+
+    /// Write the model's audio to this WAV file instead of playing it.
+    #[arg(long, value_name = "WAV", requires = "voice")]
+    pub voice_output: Option<std::path::PathBuf>,
+
+    /// A scripted realtime provider instead of a live one: a JSON array of scripted steps,
+    /// inline or in the named file (end-to-end tests).
+    #[cfg(feature = "scripted-model")]
+    #[arg(long, value_name = "JSON", hide = true, requires = "voice")]
+    pub voice_script: Option<String>,
 }
 
 /// Model and rendering options shared by every agent command.
@@ -217,6 +249,11 @@ pub enum Commands {
         #[cfg(feature = "harness")]
         #[arg(long)]
         auth_token: Option<String>,
+        /// Keep sessions, approvals, runs, modes, standing rules and plans in one store every
+        /// replica shares: postgres://… or redis://… (default: harness.db; spec 3.1 §8.2)
+        #[cfg(feature = "harness")]
+        #[arg(long, value_name = "URL", conflicts_with = "ephemeral")]
+        store: Option<String>,
         #[cfg(feature = "harness")]
         #[command(flatten)]
         harness: adk_cli::harness::HarnessArgs,
@@ -289,11 +326,13 @@ pub enum Commands {
         resume: bool,
     },
 
-    /// Ultracode: fan out to parallel specialist reviewers and iterate.
+    /// Ultracode: implement, then review with specialist reviewers and iterate.
     ///
-    /// Implements the task in your mode, then runs correctness/edge-case/style reviewers
-    /// in read-only mode in parallel, synthesizes their verdicts, and revises until they
-    /// approve. Example: `adk-rust ultracode "add a /health endpoint"`
+    /// Implements the task in your mode, then routes the review once, on the change: parallel
+    /// independent reviewers (graph) or one board whose reviewers read each other
+    /// (blackboard), all read-only. It synthesizes their verdicts and revises until they
+    /// approve, within a model-call budget. Example: `adk-rust ultracode "add a /health
+    /// endpoint"`
     Ultracode {
         /// The task to implement and review.
         task: String,
@@ -308,9 +347,195 @@ pub enum Commands {
         #[arg(short, long, default_value = ".")]
         dir: String,
 
-        /// Maximum number of review→revise rounds.
-        #[arg(long, default_value_t = 2)]
-        max_rounds: i64,
+        /// Maximum number of review→revise rounds (default 2; at most 5 with the harness)
+        #[arg(long, value_name = "N")]
+        max_rounds: Option<i64>,
+
+        /// Review architecture: auto (routed on the change), graph (parallel reviewers) or
+        /// blackboard (one board); default auto
+        #[cfg(feature = "harness")]
+        #[arg(long, value_enum, value_name = "ARCH")]
+        architecture: Option<adk_cli::harness::ultracode::ArchitectureChoice>,
+
+        /// How auto chooses: model (one closed-schema call, the heuristic when it fails) or
+        /// heuristic; default model
+        #[cfg(feature = "harness")]
+        #[arg(long, value_enum, value_name = "MODE")]
+        router: Option<adk_cli::harness::ultracode::RouterMode>,
+
+        /// Most model calls of the whole run (default 400, at most 2000)
+        #[cfg(feature = "harness")]
+        #[arg(long, value_name = "N")]
+        max_model_calls: Option<u64>,
+
+        /// Write the run's audit records, their chain verification and the router's raw
+        /// answer to FILE
+        #[cfg(feature = "harness")]
+        #[arg(long, value_name = "FILE")]
+        receipt: Option<std::path::PathBuf>,
+    },
+
+    /// Run the harness as the agent kernel, in the foreground: a worker per queue, wake
+    /// sources, the process table, and a control plane on a local socket and HTTP.
+    ///
+    /// Example: `adk-rust up --mode ask`, then `adk-rust ps` or `adk-rust attach` from
+    /// another terminal (spec 3.2 §8.1).
+    #[cfg(feature = "harness")]
+    Up(Box<UpArgs>),
+
+    /// Open the REPL on the running kernel: each turn runs as a process the kernel owns,
+    /// held calls are answered here or from any other surface, and closing the terminal
+    /// changes nothing.
+    #[cfg(feature = "harness")]
+    Attach {
+        /// Continue this session (default: a new one)
+        #[arg(long)]
+        session: Option<String>,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// The running kernel's processes, each with its age, spend, calls and goal progress
+    #[cfg(feature = "harness")]
+    Ps {
+        /// Only processes in this partition
+        #[arg(long)]
+        partition: Option<String>,
+        /// Only processes in this state: queued, running, waiting, completed, failed or
+        /// cancelled
+        #[arg(long, value_parser = parse_run_state)]
+        state: Option<adk_core::RunState>,
+        /// At most this many processes
+        #[arg(long)]
+        limit: Option<usize>,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// `ps` ordered by burn rate, refreshing until Ctrl-C
+    #[cfg(feature = "harness")]
+    Top {
+        /// Only processes in this partition
+        #[arg(long)]
+        partition: Option<String>,
+        /// Seconds between refreshes
+        #[arg(long, value_name = "SECS", default_value_t = 2)]
+        interval: u64,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// Kill a process: it stops at its next checkpoint and holds no lease
+    #[cfg(feature = "harness")]
+    Kill {
+        /// Process id, or a unique prefix of it
+        pid: String,
+        /// Recorded on the run and in the audit record
+        #[arg(long)]
+        reason: Option<String>,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// Suspend a process at its next model-call boundary
+    #[cfg(feature = "harness")]
+    Suspend {
+        /// Process id, or a unique prefix of it
+        pid: String,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// Resume a suspended or sleeping process; one a freeze parked resumes on unfreeze
+    #[cfg(feature = "harness")]
+    Resume {
+        /// Process id, or a unique prefix of it
+        pid: String,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// Freeze execution on every replica: running processes park and nothing starts
+    #[cfg(feature = "harness")]
+    Freeze {
+        /// Why; shown with every refusal while frozen
+        #[arg(long)]
+        reason: Option<String>,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// Lift the freeze: the processes it parked resume
+    #[cfg(feature = "harness")]
+    Unfreeze {
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// The kernel's event bus: process changes, wakes, holds, decisions, governance
+    #[cfg(feature = "harness")]
+    Events {
+        /// Keep streaming new events until Ctrl-C
+        #[arg(long)]
+        follow: bool,
+        /// Only events after this cursor (default: what the kernel still holds)
+        #[arg(long, value_name = "CURSOR")]
+        after: Option<u64>,
+        /// One JSON record per line
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// Move a queued or sleeping process to another queue: interactive, background or
+    /// maintenance. The moved process gets a new pid.
+    #[cfg(feature = "harness")]
+    Nice {
+        /// Process id, or a unique prefix of it
+        pid: String,
+        /// The queue: interactive, background, maintenance or a named one
+        #[arg(value_parser = parse_queue)]
+        queue: adk_kernel::QueueClass,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// The kernel's agenda: follow-ups proposed for later, and what became of them
+    ///
+    /// Example: `adk-rust agenda`, then `adk-rust agenda approve 3f2a` (spec 3.2 §8.1).
+    #[cfg(feature = "harness")]
+    Agenda {
+        #[command(subcommand)]
+        command: Option<AgendaCommand>,
+        #[command(flatten)]
+        kernel: KernelTarget,
+    },
+
+    /// Create a sleeping process that runs a task when a file changes, a cron schedule
+    /// fires, or a webhook delivers
+    ///
+    /// Example: `adk-rust wake --file Cargo.lock -- "audit the new dependencies"`.
+    #[cfg(feature = "harness")]
+    Wake {
+        /// Wake when a file matching this pattern changes, relative to the current
+        /// directory: Cargo.lock, src/*.rs
+        #[arg(long, value_name = "GLOB")]
+        file: Option<String>,
+        /// Wake each time this cron expression (UTC) fires, until killed
+        #[arg(long, value_name = "EXPR")]
+        cron: Option<String>,
+        /// Wake when this webhook delivers to an ingress on the kernel's store
+        #[arg(long, value_name = "NAME")]
+        webhook: Option<String>,
+        /// Run the task in this session (default: a new one)
+        #[arg(long)]
+        session: Option<String>,
+        /// The task, after `--`
+        #[arg(last = true, required = true, value_name = "TASK")]
+        task: Vec<String>,
+        #[command(flatten)]
+        kernel: KernelTarget,
     },
 
     /// Harness sessions kept in harness.db
@@ -325,6 +550,10 @@ pub enum Commands {
     Rules {
         #[command(subcommand)]
         command: RulesCommands,
+        /// The rules of served replicas sharing this store, postgres://… or redis://…,
+        /// instead of harness.db (spec 3.1 §13 Q2)
+        #[arg(long, value_name = "URL", global = true)]
+        store: Option<String>,
     },
 
     /// Long-term memory: the facts the harness learned about you and your projects
@@ -410,6 +639,117 @@ pub struct ChatArgs {
     /// Keep the conversation in memory only; nothing is written to disk
     #[arg(long)]
     pub ephemeral: bool,
+}
+
+/// `adk-rust up` (spec 3.2 §8.1).
+#[cfg(feature = "harness")]
+#[derive(clap::Args, Debug, Clone)]
+pub struct UpArgs {
+    /// Install the kernel as a launchd agent, systemd user unit or Windows service; not in
+    /// this build — run `adk-rust up` in the foreground or under your own supervisor
+    #[arg(long, conflicts_with = "uninstall")]
+    pub install: bool,
+    /// Remove the installed service; not in this build
+    #[arg(long)]
+    pub uninstall: bool,
+    /// The kernel home: its socket and harness.db (default: `[kernel] home` in the user
+    /// config, else the config directory's adk-rust)
+    #[arg(long, value_name = "DIR")]
+    pub home: Option<std::path::PathBuf>,
+    /// Where the HTTP control plane and the served harness listen (default: `[kernel] bind`,
+    /// else 127.0.0.1:8080); anything but loopback needs --auth-token
+    #[arg(long, value_name = "HOST:PORT")]
+    pub bind: Option<std::net::SocketAddr>,
+    /// Bearer token callers must present (default: $ADK_SERVE_TOKEN); required beyond
+    /// loopback
+    #[arg(long)]
+    pub auth_token: Option<String>,
+    /// Keep every store, the kernel's included, in one backend replicas share:
+    /// postgres://… or redis://… (default: harness.db)
+    #[arg(long, value_name = "URL", conflicts_with = "ephemeral")]
+    pub store: Option<String>,
+    #[command(flatten)]
+    pub harness: adk_cli::harness::HarnessArgs,
+}
+
+/// Which running kernel a control command reaches (spec 3.2 §7.11): the local socket of a
+/// home, or an HTTP control plane.
+#[cfg(feature = "harness")]
+#[derive(clap::Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct KernelTarget {
+    /// The home of the kernel to reach, on its socket (default: the config directory's
+    /// adk-rust)
+    #[arg(long, value_name = "DIR")]
+    pub home: Option<std::path::PathBuf>,
+    /// A kernel's HTTP control plane instead of the local socket, such as
+    /// http://127.0.0.1:8080
+    #[arg(long, value_name = "URL")]
+    pub server: Option<String>,
+    /// Bearer token for --server (default: $ADK_SERVE_TOKEN)
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
+/// `adk-rust agenda` subcommands (spec 3.2 §8.1).
+#[cfg(feature = "harness")]
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum AgendaCommand {
+    /// The items, oldest first (the default)
+    List {
+        /// Only items of this partition
+        #[arg(long)]
+        partition: Option<String>,
+        /// Only items in this state: proposed, approved, scheduled, running, done,
+        /// rejected or expired
+        #[arg(long)]
+        state: Option<adk_kernel::AgendaStateKind>,
+        /// At most this many items
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Approve a proposed item; it runs once admitted
+    Approve {
+        /// Item id, or a unique prefix of it
+        id: String,
+    },
+    /// Reject a proposed or approved item
+    Reject {
+        /// Item id, or a unique prefix of it
+        id: String,
+        /// Why; recorded on the event and in the audit record
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Run an item at a time: approves a proposed item first
+    Schedule {
+        /// Item id, or a unique prefix of it
+        id: String,
+        /// When: an RFC 3339 time, HH:MM (local), or +30m, +2h, +1d
+        #[arg(long, value_name = "TIME", conflicts_with = "cron")]
+        at: Option<String>,
+        /// At the next time this cron expression (UTC) fires
+        #[arg(long, value_name = "EXPR")]
+        cron: Option<String>,
+    },
+}
+
+/// Parses a queue class: `interactive`, `background`, `maintenance` or a named queue.
+#[cfg(feature = "harness")]
+fn parse_queue(value: &str) -> Result<adk_kernel::QueueClass, String> {
+    value.parse().map_err(|error: adk_kernel::KernelError| error.to_string())
+}
+
+/// Parses a run state as the run store names it: `waiting`, `running`, ….
+#[cfg(feature = "harness")]
+fn parse_run_state(value: &str) -> Result<adk_core::RunState, String> {
+    serde_json::from_value(serde_json::Value::String(value.trim().to_ascii_lowercase())).map_err(
+        |_| {
+            format!(
+                "unknown state '{value}'; use queued, running, waiting, completed, failed or \
+                 cancelled"
+            )
+        },
+    )
 }
 
 /// What `adk-rust serve` serves (spec 3.1 §8.2).
@@ -498,6 +838,19 @@ pub enum MemoryCommands {
         /// Every project, and superseded and forgotten facts too
         #[arg(long)]
         all: bool,
+        /// Only facts of this source: consolidation (written by the kernel's consolidation
+        /// tick, with its ticks), user_stated, user_confirmed, agent_inferred, tool_observed
+        /// or imported
+        #[arg(long, value_parser = [
+            "consolidation", "user_stated", "user_confirmed", "agent_inferred", "tool_observed", "imported",
+        ])]
+        source: Option<String>,
+    },
+    /// Revert a consolidation tick's status changes: what it superseded or forgot is assumed
+    /// again, and what it wrote is forgotten (spec 3.2 §7.5)
+    Undo {
+        /// Tick id, or a unique prefix of it, as `memory list --source consolidation` shows
+        tick: String,
     },
     /// Show one fact with its provenance
     Show {
@@ -1142,6 +1495,56 @@ mod tests {
         assert_eq!(compiled, order, "menu order follows ModelProvider::all");
     }
 
+    #[cfg(feature = "harness")]
+    #[test]
+    fn ultracode_flags_parse() {
+        use adk_cli::harness::ultracode::{ArchitectureChoice, RouterMode};
+
+        let parsed = parse(&[
+            "adk-rust",
+            "ultracode",
+            "fix it",
+            "--architecture",
+            "blackboard",
+            "--router",
+            "heuristic",
+            "--max-model-calls",
+            "300",
+            "--max-rounds",
+            "3",
+            "--receipt",
+            "out/receipt.json",
+        ]);
+        let Some(Commands::Ultracode {
+            task,
+            max_rounds,
+            architecture,
+            router,
+            max_model_calls,
+            receipt,
+            ..
+        }) = parsed.command
+        else {
+            panic!("not ultracode");
+        };
+        assert_eq!(task, "fix it");
+        assert_eq!(
+            (max_rounds, architecture, router, max_model_calls),
+            (Some(3), Some(ArchitectureChoice::Blackboard), Some(RouterMode::Heuristic), Some(300))
+        );
+        assert_eq!(receipt.as_deref(), Some(std::path::Path::new("out/receipt.json")));
+        let Some(Commands::Ultracode { max_rounds, architecture, .. }) =
+            parse(&["adk-rust", "ultracode", "fix it"]).command
+        else {
+            panic!("not ultracode");
+        };
+        assert_eq!((max_rounds, architecture), (None, None));
+        assert!(
+            Cli::try_parse_from(["adk-rust", "ultracode", "x", "--architecture", "council"])
+                .is_err()
+        );
+    }
+
     #[cfg(feature = "scripted-model")]
     #[test]
     fn test_hooks_parse_but_stay_hidden() {
@@ -1150,5 +1553,31 @@ mod tests {
         assert!(cli.options.approval_fixture);
         let help = <Cli as clap::CommandFactory>::command().render_long_help().to_string();
         assert!(!help.contains("model-script") && !help.contains("approval-fixture"), "{help}");
+    }
+
+    #[cfg(all(feature = "harness", feature = "persist"))]
+    #[test]
+    fn memory_lists_consolidation_ticks_undoes_one_and_up_turns_the_tick_off() {
+        let memory = |args: &[&str]| match parse(args).command {
+            Some(Commands::Memory { command }) => command,
+            _ => panic!("{args:?} is not a memory command"),
+        };
+        assert_eq!(
+            memory(&["adk-rust", "memory", "list", "--source", "consolidation"]),
+            MemoryCommands::List { dir: None, all: false, source: Some("consolidation".into()) }
+        );
+        assert_eq!(
+            memory(&["adk-rust", "memory", "undo", "01J9"]),
+            MemoryCommands::Undo { tick: "01J9".into() }
+        );
+        assert!(
+            Cli::try_parse_from(["adk-rust", "memory", "list", "--source", "dream"]).is_err(),
+            "an unknown source should not parse"
+        );
+        let Some(Commands::Up(up)) = parse(&["adk-rust", "up", "--no-consolidation"]).command
+        else {
+            panic!("up should parse");
+        };
+        assert!(up.harness.no_consolidation && !up.harness.no_memory);
     }
 }

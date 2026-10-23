@@ -148,7 +148,33 @@ pub async fn memory(command: MemoryCommands) -> Result<()> {
     };
     let by = adk_core::principal::SubjectRef::human(user.clone());
     match command {
-        MemoryCommands::List { dir, all } => {
+        MemoryCommands::List { source: Some(source), .. } if source == "consolidation" => {
+            // The ticks, newest first, then the facts they wrote (spec 3.2 §7.5).
+            let ticks = store.consolidations(APP_NAME, &user).await?;
+            if ticks.is_empty() {
+                println!(
+                    "No consolidation tick has run. `adk-rust up` runs one in ask and auto mode \
+                     once there is new material."
+                );
+            }
+            for tick in &ticks {
+                println!("{}", tick_line(tick));
+            }
+            let mut facts: Vec<MemoryFact> = store
+                .list(mine())
+                .await?
+                .into_iter()
+                .filter(|fact| fact.provenance.tick.is_some())
+                .collect();
+            facts.sort_by_key(|fact| !fact.status.is_live());
+            if !facts.is_empty() {
+                println!();
+            }
+            for fact in &facts {
+                println!("{}", fact_line(fact));
+            }
+        }
+        MemoryCommands::List { dir, all, source } => {
             let filter = if all {
                 mine()
             } else {
@@ -163,6 +189,9 @@ pub async fn memory(command: MemoryCommands) -> Result<()> {
                 }
             };
             let mut facts = store.list(filter).await?;
+            if let Some(source) = &source {
+                facts.retain(|fact| fact.provenance.source.as_str() == source);
+            }
             facts.sort_by_key(|fact| fact.status != FactStatus::Known);
             if facts.is_empty() {
                 println!(
@@ -173,6 +202,18 @@ pub async fn memory(command: MemoryCommands) -> Result<()> {
             for fact in &facts {
                 println!("{}", fact_line(fact));
             }
+        }
+        MemoryCommands::Undo { tick } => {
+            let undone =
+                adk_harness::undo_consolidation(store.as_ref(), APP_NAME, &user, tick.trim(), &by)
+                    .await?;
+            println!(
+                "undid tick {}: {} fact(s) assumed again, {} it wrote forgotten, {} kept (changed since)",
+                undone.tick_id,
+                undone.restored.len(),
+                undone.forgotten.len(),
+                undone.kept.len()
+            );
         }
         MemoryCommands::Show { id } => {
             let fact = find(store.list(mine()).await?, &id)?;
@@ -202,9 +243,14 @@ pub async fn memory(command: MemoryCommands) -> Result<()> {
                     options.write(true).create(true).truncate(true);
                     #[cfg(unix)]
                     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+                    #[cfg(not(windows))]
+                    let created = options.open(&path);
+                    // A DACL granting the owner alone access stands in for mode 0600
+                    // (spec 3.2 §10 W4).
+                    #[cfg(windows)]
+                    let created = crate::owner_only::create_or_truncate(&path);
                     std::io::Write::write_all(
-                        &mut options
-                            .open(&path)
+                        &mut created
                             .with_context(|| format!("failed to create {}", path.display()))?,
                         text.as_bytes(),
                     )?;
@@ -252,6 +298,29 @@ pub async fn memory(command: MemoryCommands) -> Result<()> {
     Ok(())
 }
 
+/// One consolidation tick as `memory list --source consolidation` shows it: ids and counts.
+fn tick_line(tick: &adk_harness::ConsolidationRecord) -> String {
+    let mut line = format!(
+        "tick {} {} · {} superseded · {} forgotten · {} merged · {} distilled",
+        tick.tick_id,
+        tick.at.format("%Y-%m-%d %H:%M"),
+        tick.superseded().count(),
+        tick.forgotten().count(),
+        tick.merged.len(),
+        tick.distilled.len()
+    );
+    if let Some(refused) = &tick.refused {
+        line.push_str(&format!(" · refused: {}", one_line(refused, 120)));
+    }
+    if tick.finished_at.is_none() {
+        line.push_str(" · unfinished");
+    }
+    if tick.undone_at.is_some() {
+        line.push_str(" · undone");
+    }
+    line
+}
+
 /// One line describing `fact`: id, status, kind, date, source and session, then its text.
 fn fact_line(fact: &adk_harness::MemoryFact) -> String {
     let scope = if fact.scope.project.is_some() { "project" } else { "all projects" };
@@ -268,11 +337,30 @@ fn fact_line(fact: &adk_harness::MemoryFact) -> String {
     )
 }
 
-/// `adk-rust rules …`.
-pub async fn rules(command: RulesCommands) -> Result<()> {
-    let db = crate::sessions::open_default_db().await?;
-    let user = crate::setup::os_user();
-    let store: Arc<dyn StandingRuleStore> = db.rules.clone();
+/// The surface `rules add` and `rules rm` are audited with (spec 3.1 §9.3).
+const RULES_SURFACE: &str = "cli";
+
+/// `adk-rust rules …`, on `harness.db` or, with `--store`, on the store served replicas
+/// share (spec 3.1 §13 Q2).
+pub async fn rules(command: RulesCommands, shared: Option<String>) -> Result<()> {
+    let store: Arc<dyn StandingRuleStore> = match &shared {
+        Some(url) => crate::shared_store::open_rules(url).await?,
+        None => crate::sessions::open_default_db().await?.rules.clone(),
+    };
+    rules_in(command, store, &crate::setup::os_user(), None).await
+}
+
+/// `rules` on `store` for `user`. A grant or revocation goes through the harness, which
+/// records `harness.rule.created` or `harness.rule.revoked` with `surface: cli` in `audit`
+/// (the harness's own log when `None`) before the store write, as the REST routes record
+/// theirs with `surface: rest` (spec 3.1 §7.5, §9.2 I4, §9.3).
+async fn rules_in(
+    command: RulesCommands,
+    store: Arc<dyn StandingRuleStore>,
+    user: &str,
+    audit: Option<Arc<dyn adk_core::audit_log::AuditRecorder>>,
+) -> Result<()> {
+    let user = user.to_string();
     let mut listed = store.list(APP_NAME, &user).await?;
     listed.sort_by_key(|rule| rule.created_at);
     match command {
@@ -294,7 +382,10 @@ pub async fn rules(command: RulesCommands) -> Result<()> {
             let Some(found) = found else {
                 bail!("no rule {rule}; `adk-rust rules list` shows yours");
             };
-            store.revoke(APP_NAME, &found.id).await?;
+            rules_harness(store, audit)?
+                .revoke_rule(APP_NAME, &user, &found.id, RULES_SURFACE)
+                .await?
+                .with_context(|| format!("rule {} was revoked meanwhile", found.id))?;
             println!("revoked: {}", safe(&found.label));
         }
         RulesCommands::Add {
@@ -322,11 +413,30 @@ pub async fn rules(command: RulesCommands) -> Result<()> {
                     source,
                 },
             )?;
-            let granted = store.grant(rule).await?;
+            let granted =
+                rules_harness(store, audit)?.grant_rule(rule, RULES_SURFACE, None).await?;
             println!("{}", safe(&describe(listed.len() + 1, &granted)));
         }
     }
     Ok(())
+}
+
+/// The harness `rules add` and `rules rm` grant and revoke through: `store` and `audit`.
+fn rules_harness(
+    store: Arc<dyn StandingRuleStore>,
+    audit: Option<Arc<dyn adk_core::audit_log::AuditRecorder>>,
+) -> Result<HarnessAgent> {
+    let workspace = std::env::current_dir().context("no current directory")?;
+    let model =
+        Arc::new(adk_model::ScriptedLlm::new("rules", Vec::<adk_model::ScriptedResponse>::new()));
+    let mut builder = HarnessAgent::builder(APP_NAME)
+        .model(model)
+        .workspace(adk_devtools::Workspace::new(&workspace))
+        .standing_rules(store);
+    if let Some(audit) = audit {
+        builder = builder.audit_log(audit);
+    }
+    Ok(builder.build()?)
 }
 
 fn describe(n: usize, rule: &StandingRule) -> String {
@@ -721,6 +831,91 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rule.origin, OriginPin::AnyDeclaration { source: "mcp:github".into() });
+    }
+
+    fn add_bash() -> RulesCommands {
+        RulesCommands::Add {
+            tool: "bash".into(),
+            prefix: Some("cargo test".into()),
+            path_within: None,
+            deny: None,
+            session: None,
+            hours: None,
+            sandbox: false,
+            operator: false,
+            source: None,
+        }
+    }
+
+    fn rule_records(records: &[adk_core::audit_log::AuditRecord], action: &str) -> Vec<Value> {
+        records
+            .iter()
+            .filter(|record| record.action == action)
+            .map(|record| serde_json::to_value(&record.ext).unwrap())
+            .collect()
+    }
+
+    /// `rules add` and `rules rm` record `harness.rule.created` and `harness.rule.revoked`
+    /// with `surface: cli`, as the REST routes record theirs (spec 3.1 §9.3).
+    #[tokio::test]
+    async fn rules_add_and_rm_are_audited_with_the_cli_surface() {
+        let store: Arc<dyn StandingRuleStore> =
+            Arc::new(adk_harness::InMemoryStandingRuleStore::new());
+        let log = Arc::new(adk_harness::EphemeralAuditLog::new().unwrap());
+
+        rules_in(add_bash(), store.clone(), "ana", Some(log.clone())).await.unwrap();
+        let id = store.list(APP_NAME, "ana").await.unwrap()[0].id.clone();
+        rules_in(RulesCommands::Rm { rule: id.clone() }, store.clone(), "ana", Some(log.clone()))
+            .await
+            .unwrap();
+        assert!(store.list(APP_NAME, "ana").await.unwrap().is_empty());
+
+        let records = log.records().await.unwrap();
+        let created = rule_records(&records, "harness.rule.created");
+        let revoked = rule_records(&records, "harness.rule.revoked");
+        assert_eq!((created.len(), revoked.len()), (1, 1), "{records:?}");
+        for ext in [&created[0], &revoked[0]] {
+            assert_eq!(ext["ruleId"], id.as_str());
+            assert_eq!(ext["surface"], "cli");
+            assert_eq!(ext["subject"], "ana");
+            assert_eq!(ext["by"], "ana");
+        }
+        assert!(log.verify().await.unwrap());
+    }
+
+    /// The record precedes the store write: a grant or a revocation whose record cannot be
+    /// written changes nothing.
+    #[tokio::test]
+    async fn a_rule_change_whose_record_fails_is_not_made() {
+        struct Offline;
+        #[async_trait::async_trait]
+        impl adk_core::audit_log::AuditRecorder for Offline {
+            fn digest(&self, _value: &Value) -> String {
+                "sha256:0".into()
+            }
+            async fn record(
+                &self,
+                _draft: adk_core::audit_log::AuditRecordDraft,
+            ) -> adk_core::Result<()> {
+                Err(adk_core::AdkError::internal(
+                    adk_core::ErrorComponent::Server,
+                    "audit.offline",
+                    "the audit store is offline",
+                ))
+            }
+        }
+        let store: Arc<dyn StandingRuleStore> =
+            Arc::new(adk_harness::InMemoryStandingRuleStore::new());
+
+        assert!(rules_in(add_bash(), store.clone(), "ana", Some(Arc::new(Offline))).await.is_err());
+        assert!(store.list(APP_NAME, "ana").await.unwrap().is_empty(), "nothing was granted");
+
+        let log = Arc::new(adk_harness::EphemeralAuditLog::new().unwrap());
+        rules_in(add_bash(), store.clone(), "ana", Some(log)).await.unwrap();
+        let id = store.list(APP_NAME, "ana").await.unwrap()[0].id.clone();
+        let rm = RulesCommands::Rm { rule: id };
+        assert!(rules_in(rm, store.clone(), "ana", Some(Arc::new(Offline))).await.is_err());
+        assert_eq!(store.list(APP_NAME, "ana").await.unwrap().len(), 1, "nothing was revoked");
     }
 
     #[test]

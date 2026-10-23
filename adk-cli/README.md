@@ -13,8 +13,10 @@ Command-line launcher for Rust Agent Development Kit (ADK-Rust) agents.
 - **`adk-rust` binary** — the governed **harness** (spec 3.1) in your terminal and behind the
   server: a coding agent that edits files in the workspace and runs commands after you
   approve them (`adk-rust`, `code`, `goal`, `ultracode`, `serve`), with remembered approvals
-  (`rules`), held calls (`approvals`) and sessions (`sessions`) in one SQLite file; plus a
-  plain chat agent (6 providers), skills, graph checkpoints, signed audit logs, and deploy
+  (`rules`), held calls (`approvals`) and sessions (`sessions`) in one SQLite file; the
+  harness as the always-on **agent kernel** (spec 3.2: `up`, `attach`, `ps`, `top`, `kill`,
+  `suspend`, `resume`, `freeze`, `unfreeze`, `events`); plus a plain chat agent
+  (6 providers), skills, graph checkpoints, signed audit logs, and deploy
 - **`Launcher` library** — embed a REPL and web server into any custom agent binary;
   `HarnessLauncher` does the same for a `HarnessAgent`
 
@@ -43,12 +45,19 @@ adk-rust ultracode "add input validation"
 # The harness behind the HTTP server, in plan mode, with the approval inbox
 adk-rust serve --port 3000
 
+# The harness as the agent kernel: its turns, goals and schedules run as durable processes,
+# and every terminal attaches to the same running state
+adk-rust up --mode ask
+adk-rust ps                      # from another terminal
+adk-rust attach                  # a REPL whose turns the kernel runs
+
 # The plain chat agent
 adk-rust chat
 ```
 
-See [The harness in your terminal](../docs/official_docs/harness/cli.md) and
-[Serving the harness](../docs/official_docs/harness/serving.md).
+See [The harness in your terminal](../docs/official_docs/harness/cli.md),
+[Serving the harness](../docs/official_docs/harness/serving.md) and
+[Kernel commands](../docs/official_docs/kernel/cli.md).
 
 ## Feature Flags
 
@@ -57,7 +66,7 @@ See [The harness in your terminal](../docs/official_docs/harness/cli.md) and
 | `gemini`, `openai`, `anthropic` | yes | The Gemini, OpenAI and Anthropic providers |
 | `audit` | yes | `adk-rust audit verify` and `audit keygen` (through `adk-auth`'s `signed-audit`) |
 | `persist` | yes | Sessions, held calls, durable runs, modes and standing rules in SQLite at `adk-rust/harness.db` (through `adk-session`'s and `adk-harness`'s `sqlite`) |
-| `harness` | yes | The harness: `adk-rust` REPL, `code`, `goal`, `ultracode` and `serve` on `adk-harness`, `sessions`, `rules`, `approvals`, and the `adk_cli::harness` module |
+| `harness` | yes | The harness: `adk-rust` REPL, `code`, `goal`, `ultracode` and `serve` on `adk-harness`, `sessions`, `rules`, `approvals`, and the `adk_cli::harness` module; the agent kernel's `up`, `attach`, `ps`, `top`, `kill`, `suspend`, `resume`, `freeze`, `unfreeze` and `events` on `adk-kernel` |
 | `deepseek`, `groq`, `ollama` | no | The other providers |
 | `all-providers` | no | Every provider |
 | `audit-sql` | no | `adk-rust audit export` from SQLite or PostgreSQL audit stores |
@@ -108,10 +117,19 @@ adk-rust chat         Interactive REPL with the plain chat agent
 adk-rust serve        Serve the harness (plan mode, approval inbox); `--agent chat` serves chat
 adk-rust code         One harness turn on a task; exit 3 when calls are held
 adk-rust goal         Harness turns until a success-condition command exits 0
-adk-rust ultracode    Implement, then review with parallel read-only reviewers
+adk-rust ultracode    Implement, then route the review to parallel reviewers or a review board
 adk-rust sessions     Harness sessions (list/show/rm)
 adk-rust rules        Standing rules (list/add/rm)
 adk-rust approvals    Held calls (list/approve/deny), locally or with --server
+adk-rust up           The harness as the agent kernel, in the foreground
+adk-rust attach       A REPL on the running kernel; `adk-rust` attaches when one runs
+adk-rust ps / top     The kernel's processes; `top` by burn rate, refreshing
+adk-rust kill / suspend / resume PID   Act on a process
+adk-rust nice PID QUEUE                Move a queued or sleeping process to another queue
+adk-rust agenda       Follow-ups proposed for later (list/approve/reject/schedule)
+adk-rust wake         A sleeping process woken by a file change, a cron time or a webhook
+adk-rust freeze / unfreeze             The kill switch, on every replica
+adk-rust events       The kernel's event bus (`--follow`)
 adk-rust skills       Skill tooling (list/validate/match)
 adk-rust graph        Graph checkpoint inspection (steps/replay/fork/resume)
 adk-rust audit        Signed audit log tools (verify/keygen; export with `audit-sql`)
@@ -149,6 +167,27 @@ Settings also come from `.adk/harness.toml` in the workspace (which can only tig
 Tab completes slash commands and `@server:uri` mentions. See
 [The harness in your terminal](../docs/official_docs/harness/cli.md).
 
+### `adk-rust ultracode` options
+
+`ultracode` implements in your mode, then routes the review once, on the change: parallel
+independent reviewers (`graph`) or one round-robin board whose reviewers read each other
+(`blackboard`), read-only and shell-less in both (spec 3.1 §7.10). A security-sensitive or
+protected path routes to the board with a `security` seat; otherwise one closed-schema call
+at the session's `members` effort chooses, with a deterministic heuristic when it fails. A revise that
+makes the change sensitive adds the `security` seat to the stages after it.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--architecture` | `auto` | `auto`, `graph` or `blackboard` |
+| `--router` | `model` | How `auto` chooses: `model` or `heuristic` |
+| `--max-rounds` | 2 | Review stages, at most 5 |
+| `--max-model-calls` | 400 | The run's model calls, at most 2,000 |
+| `--receipt FILE` | none | The run's `harness.ultracode.*` records, the audit-log verification and the router's raw answer |
+
+The `[ultracode]` table in either config file sets the same limits and the per-step
+budgets; `.adk/harness.toml` can only lower them. See
+[Ultracode](../docs/official_docs/harness/cli.md#ultracode).
+
 ### `adk-rust chat` options
 
 | Flag | Description |
@@ -158,7 +197,8 @@ Tab completes slash commands and `@server:uri` mentions. See
 | `--ephemeral` | Keep the conversation in memory only; nothing is written to disk |
 
 With the `persist` feature, conversations are kept in `adk-rust/harness.db` in the platform
-config directory, created readable by its owner only, under the OS user name. The banner
+config directory, created readable by its owner only (mode 0600 on Unix, an owner-only DACL on
+Windows), under the OS user name. The banner
 shows the session id.
 
 ### `adk-rust serve` options
@@ -170,12 +210,26 @@ shows the session id.
 | `--agent` | `harness` | `harness`, or `chat` for the plain agent as before |
 | `--auth-token` | `$ADK_SERVE_TOKEN` | Bearer token callers present; without one only loopback peers are admitted |
 
-The harness is served in plan mode with `/api/approvals` and `/api/runs`; see
-[Serving the harness](../docs/official_docs/harness/serving.md).
+The harness is served in plan mode with `/api/approvals`, `/api/runs` and its standing
+rules at `/api/rules`; see [Serving the harness](../docs/official_docs/harness/serving.md).
 
 The server answers only loopback names and IP addresses, and allows no cross-origin browser
 access. The binary has no flag for more hosts or origins; a custom binary lists them with
 `Launcher::with_security_config`.
+
+### `adk-rust up` options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--home` | `[kernel] home`, else the config directory's `adk-rust` | Kernel home: `kernel.sock`, `harness.db`, the replica id and its audit signing key |
+| `--bind` | `[kernel] bind`, else `127.0.0.1:8080` | HTTP control plane and served harness; beyond loopback needs `--auth-token` |
+| `--auth-token` | `$ADK_SERVE_TOKEN` | Bearer token HTTP callers present |
+| `--store` | `harness.db` | `postgres://…` or `redis://…`: every store, the kernel's included, shared by replicas |
+
+The harness flags (`--mode`, `--dir`, `--sandbox`, …) apply as for `serve`. The other kernel
+commands reach the kernel on its socket, or over HTTP with `--server URL [--token T]`; see
+[Kernel commands](../docs/official_docs/kernel/cli.md) and
+[The kernel control plane](../docs/official_docs/kernel/control-plane.md).
 
 ### `adk-rust audit` subcommands
 

@@ -173,6 +173,14 @@ pub struct Launcher {
     console_commands: Vec<Arc<dyn ConsoleCommand>>,
     approval_service: Option<Arc<dyn ApprovalService>>,
     background_runs: Option<BackgroundState>,
+    /// Routes mounted under `/api` behind the auth middleware, such as a served harness's
+    /// standing-rule routes.
+    api_routes: Vec<Router>,
+    /// The kill switch the server shares and the delegate its admin freeze calls: a
+    /// resident harness's kernel (spec 3.2 §7.2, §10 S4).
+    #[cfg(feature = "harness")]
+    kernel_governance:
+        Option<(adk_core::GovernanceControl, Arc<dyn adk_server::rest::FreezeDelegate>)>,
     thinking_mode: ThinkingDisplayMode,
     bind_address: IpAddr,
 }
@@ -203,6 +211,9 @@ impl Launcher {
             console_commands: Vec::new(),
             approval_service: None,
             background_runs: None,
+            api_routes: Vec::new(),
+            #[cfg(feature = "harness")]
+            kernel_governance: None,
             thinking_mode: ThinkingDisplayMode::Auto,
             bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
         }
@@ -488,6 +499,26 @@ impl Launcher {
     /// ```
     pub fn with_background_runs(mut self, state: BackgroundState) -> Self {
         self.background_runs = Some(state);
+        self
+    }
+
+    /// Mounts `routes` under `/api` behind the auth middleware in serve mode
+    /// (spec 3.1 §8.2: the served harness's standing rules).
+    #[cfg(feature = "harness")]
+    pub(crate) fn with_api_routes(mut self, routes: Router) -> Self {
+        self.api_routes.push(routes);
+        self
+    }
+
+    /// Shares `control` with the server and serves the admin governance endpoints, whose
+    /// freeze `delegate` handles (spec 3.2 §10 S4: a kernel parks running processes).
+    #[cfg(feature = "harness")]
+    pub(crate) fn with_kernel_governance(
+        mut self,
+        control: adk_core::GovernanceControl,
+        delegate: Arc<dyn adk_server::rest::FreezeDelegate>,
+    ) -> Self {
+        self.kernel_governance = Some((control, delegate));
         self
     }
 
@@ -777,9 +808,21 @@ impl Launcher {
         let a2a_base_url = self.a2a_base_url.clone();
         let approval_service = self.approval_service.clone();
         let background_runs = self.background_runs.clone();
-        let config = self.into_server_config(span_exporter);
+        let api_routes = self.api_routes.clone();
+        #[cfg(feature = "harness")]
+        let kernel_governance = self.kernel_governance.clone();
+        #[cfg_attr(not(feature = "harness"), allow(unused_mut))]
+        let mut config = self.into_server_config(span_exporter);
+        #[cfg(feature = "harness")]
+        if let Some((control, _)) = &kernel_governance {
+            config = config.with_governance(control.clone());
+        }
 
         let mut builder = ServerBuilder::new(config);
+        #[cfg(feature = "harness")]
+        if let Some((_, delegate)) = kernel_governance {
+            builder = builder.with_freeze_delegate(delegate);
+        }
         if let Some(base_url) = a2a_base_url {
             builder = builder.with_a2a(base_url);
         }
@@ -794,6 +837,9 @@ impl Launcher {
         }
         if let Some(state) = background_runs {
             builder = builder.with_background_runs(state);
+        }
+        for routes in api_routes {
+            builder = builder.add_api_routes(routes);
         }
         Ok(builder.build())
     }

@@ -226,15 +226,17 @@ jobs:
         cache-save: 'false'
 
     # protoc for lancedb's build script, libdbus for adk-cli's keyring dependency,
-    # cmake and the ALSA/udev headers for the audio and realtime pairs. One apt run
-    # per shard replaces the per-pair protoc action that hit the GitHub API rate
-    # limit under fan-out.
+    # and the ALSA/udev headers for the audio and realtime pairs. cmake comes from
+    # the runner image, whose /usr/local/bin precedes apt's /usr/bin on PATH. One
+    # apt run per shard replaces the per-pair protoc action that hit the GitHub API
+    # rate limit under fan-out.
     - name: Install system dependencies
-      # A stalled apt mirror once held jobs for the full six-hour limit; bound the step and let apt retry.
+      # A stalled apt mirror once held jobs for the full six-hour limit; the action bounds and
+      # retries each apt attempt, and the step timeout bounds the whole install.
       timeout-minutes: 10
-      run: |
-        sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=300 update
-        sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=300 install -y cmake protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev
+      uses: ./.github/actions/apt-install
+      with:
+        packages: protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev
 
     - name: Install cargo-nextest
       uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
@@ -249,6 +251,8 @@ jobs:
   # other PR-tier job runs them. The pgvector image is postgres:17 plus the extension,
   # which the pgvector and memory suites need. Service containers cannot mount files,
   # so the TLS server is started by a step. scripts/test-postgres.sh lists the suites.
+  # The Redis service serves the harness's shared mode and rule stores, whose replicas
+  # are the same suites' Redis leg, and the kernel's process store.
   postgres:
     needs: [fmt, scope]
     if: needs.scope.outputs.docs_only != 'true'
@@ -263,9 +267,16 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       DATABASE_URL_TLS: postgres://postgres:postgres@localhost:5433/postgres
+      REDIS_URL: redis://localhost:6379
       NEXTEST_PROFILE: ci
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -289,6 +300,27 @@ jobs:
       env:
         PG_TLS_ROOT_CERT: ${{ runner.temp }}/pg-tls/ca.crt
       run: bash scripts/test-postgres.sh
+
+    # The feature set matches the adk-harness suite of scripts/test-postgres.sh, so the
+    # build is reused.
+    - name: Run the harness's Redis store suites
+      if: ${{ !cancelled() }}
+      run: >-
+        cargo nextest run --profile ci -p adk-harness
+        --features memory,postgres,redis
+        --run-ignored only --no-fail-fast
+        --test shared_store_redis_tests
+
+    # The feature set matches the adk-kernel suite of scripts/test-postgres.sh, so the
+    # build is reused.
+    - name: Run the kernel's Redis store suites
+      if: ${{ !cancelled() }}
+      run: >-
+        cargo nextest run --profile ci -p adk-kernel
+        --features postgres,redis
+        --run-ignored only --no-fail-fast
+        --test process_store_redis
+        --test agenda_store_redis
 
   # ── Docs: documentation coverage for Stable-tier crates ──────
   docs:
@@ -315,9 +347,12 @@ jobs:
     # adk-cli's keyring dependency links libdbus on Linux even when rustdoc is
     # only documenting the workspace's default feature sets.
     - name: Install documentation system dependencies
-      # A stalled apt mirror once held jobs for the full six-hour limit; bound the step and let apt retry.
+      # A stalled apt mirror once held jobs for the full six-hour limit; the action bounds and
+      # retries each apt attempt, and the step timeout bounds the whole install.
       timeout-minutes: 10
-      run: sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=300 update && sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=300 install -y libdbus-1-dev
+      uses: ./.github/actions/apt-install
+      with:
+        packages: libdbus-1-dev
 
     - name: Check documentation coverage
       env:
@@ -377,11 +412,12 @@ jobs:
         cache-save: 'false'
 
     - name: Install system dependencies
-      # A stalled apt mirror once held jobs for the full six-hour limit; bound the step and let apt retry.
+      # A stalled apt mirror once held jobs for the full six-hour limit; the action bounds and
+      # retries each apt attempt, and the step timeout bounds the whole install.
       timeout-minutes: 10
-      run: |
-        sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=300 update
-        sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=300 install -y cmake protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev
+      uses: ./.github/actions/apt-install
+      with:
+        packages: protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev
 
     - name: Compile standalone examples (shard ${{ matrix.shard }} of 4)
       run: bash scripts/check-examples-compile.sh ${{ matrix.shard }} 4
@@ -406,11 +442,12 @@ jobs:
         cache-save: 'false'
 
     - name: Install system dependencies
-      # A stalled apt mirror once held jobs for the full six-hour limit; bound the step and let apt retry.
+      # A stalled apt mirror once held jobs for the full six-hour limit; the action bounds and
+      # retries each apt attempt, and the step timeout bounds the whole install.
       timeout-minutes: 10
-      run: |
-        sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=300 update
-        sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o DPkg::Lock::Timeout=300 install -y cmake protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev
+      uses: ./.github/actions/apt-install
+      with:
+        packages: protobuf-compiler libdbus-1-dev libasound2-dev libudev-dev
 
     - name: Check cargo-adk templates
       run: |
@@ -510,15 +547,35 @@ jobs:
     - name: Run sandbox Rust compilation portability smoke
       run: cargo test -p adk-sandbox --test process_enforcement_tests a_working_program_still_runs -- --exact
 
+    # The restricted-token enforcer (spec 3.2 §10 W5) can only be exercised on Windows.
+    - name: Run the Windows restricted-token enforcer tests
+      timeout-minutes: 15
+      run: |
+        cargo test -p adk-sandbox --features sandbox-windows --lib sandbox::windows
+        cargo test -p adk-sandbox --features sandbox-windows --test windows_enforcer_tests
+
     # adk-code spawns rustc from a cleared environment and adk-devtools resolves
     # workspace paths; both carry Windows-only behaviour that the compile-only build
     # cannot exercise and that the merge tier otherwise reports only after landing.
+    # adk-devtools' suite includes the Job Object and handle-verified open tests
+    # (spec 3.2 §10 W1, W6).
     # adk-managed's durable round trips drive two runtime replicas over one set of
     # SQLite files, whose rollback journals make every write slow on Windows.
+    # PowerShell fails a step on its last command's exit code only, so each earlier
+    # command's is checked.
     - name: Run the Windows-sensitive crate tests
       run: |
-        cargo test -p adk-code -p adk-devtools
+        cargo test -p adk-code -p adk-devtools --no-fail-fast
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         cargo test -p adk-managed --test durable_round_trip_tests
+
+    # The owner-only DACLs that stand in for mode 0600 (spec 3.2 §10 W4): the harness
+    # store files and the CLI's session store.
+    - name: Run the Windows owner-only file tests
+      run: |
+        cargo test -p adk-harness --lib fsutil::tests
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        cargo test -p adk-cli --bin adk-rust sessions::tests
 
     - name: Build summary
       if: always()

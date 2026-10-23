@@ -4,6 +4,7 @@ mod elicitation;
 mod http;
 mod input;
 pub mod manager;
+mod parked;
 mod reconnect;
 mod resource_notifications;
 mod schema_limits;
@@ -17,7 +18,10 @@ pub use elicitation::{
     ElicitationScopeGuard, ElicitationScopes,
 };
 pub use http::McpHttpClientBuilder;
-pub use manager::{McpServerConfig, McpServerManager, RestartPolicy, ServerStatus};
+pub use manager::{
+    McpServerConfig, McpServerManager, RestartPolicy, ServerStatus, ServerStatusTransition,
+};
+pub use parked::{McpCallOutcome, ParkedCallKind, ParkedMcpCall};
 pub use reconnect::{
     ConnectionFactory, ConnectionRefresher, RefreshConfig, RetryResult, SimpleClient,
     should_refresh_connection,

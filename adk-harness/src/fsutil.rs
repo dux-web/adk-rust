@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use adk_core::{AdkError, ErrorCategory, ErrorComponent, Result};
 use sha2::{Digest, Sha256};
 
+#[cfg(windows)]
+pub(crate) mod owner_only;
+
 /// `~/.adk`, the root of the per-user harness files.
 pub(crate) fn adk_home() -> Result<PathBuf> {
     dirs::home_dir().map(|home| home.join(".adk")).ok_or_else(|| {
@@ -48,7 +51,8 @@ pub(crate) async fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 /// Writes `bytes` to a private temporary sibling of `path` and renames it into place, so
-/// a reader never sees a partial file. The file is `0600` on Unix.
+/// a reader never sees a partial file. The file is `0600` on Unix, and on Windows it has a
+/// DACL that grants its owner alone access (spec 3.2 §10 W4).
 pub(crate) async fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(|| AdkError::config("store path has no parent"))?;
     tokio::fs::create_dir_all(parent).await.map_err(|error| io_error(parent, "create", &error))?;
@@ -60,7 +64,16 @@ pub(crate) async fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()
     options.mode(0o600);
     let result = async {
         use tokio::io::AsyncWriteExt as _;
+        #[cfg(not(windows))]
         let mut file = options.open(&temp).await?;
+        #[cfg(windows)]
+        let mut file = {
+            let temp = temp.clone();
+            tokio::task::spawn_blocking(move || owner_only::create_new(&temp))
+                .await
+                .map_err(std::io::Error::other)?
+                .map(tokio::fs::File::from_std)?
+        };
         file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
@@ -75,7 +88,7 @@ pub(crate) async fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()
 }
 
 /// Maps a database error to a retryable store error.
-#[cfg(feature = "sqlite")]
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn db_error(error: sqlx::Error) -> AdkError {
     AdkError::new(
         ErrorComponent::Agent,
@@ -83,6 +96,131 @@ pub(crate) fn db_error(error: sqlx::Error) -> AdkError {
         "harness.store.database",
         format!("harness store database error: {error}"),
     )
+}
+
+/// Runs a PostgreSQL store's migrations under a session-level advisory lock keyed by
+/// `registry_table`, so replicas starting together migrate one at a time (spec 3.1 §13 Q2).
+///
+/// The lock is held on a connection opened outside `pool`, so a one-connection pool can
+/// still run the statements; closing that connection releases the lock.
+#[cfg(feature = "postgres")]
+pub(crate) fn migrate_postgres(
+    pool: &sqlx::PgPool,
+    registry_table: &'static str,
+    steps: &'static [(i64, &'static str, &'static str)],
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+    use sqlx::Connection as _;
+
+    // Boxed so the future is checked for `Send` here, with concrete lifetimes.
+    let pool = pool.clone();
+    Box::pin(async move {
+        let key = registry_table
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            })
+            .cast_signed();
+        let mut lock =
+            sqlx::PgConnection::connect_with(&pool.connect_options()).await.map_err(db_error)?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(key)
+            .execute(&mut lock)
+            .await
+            .map_err(db_error)?;
+        let result = adk_session::migration::pg_runner::run_sql_migrations(
+            &pool,
+            registry_table,
+            steps,
+            || async { Ok(false) },
+        )
+        .await;
+        let _ = lock.close().await;
+        result
+    })
+}
+
+/// The key namespace of the Redis stores unless one is set.
+#[cfg(feature = "redis")]
+pub(crate) const REDIS_NAMESPACE: &str = "adk:harness";
+
+/// Connects to the Redis server at `url`.
+#[cfg(feature = "redis")]
+pub(crate) async fn redis_connect(url: &str) -> Result<fred::prelude::Client> {
+    use fred::prelude::ClientLike as _;
+    let config = fred::prelude::Config::from_url(url)
+        .map_err(|error| redis_error("parse the Redis URL", &error))?;
+    let client = fred::prelude::Builder::from_config(config)
+        .build()
+        .map_err(|error| redis_error("build the Redis client", &error))?;
+    client.init().await.map_err(|error| redis_error("connect to Redis", &error))?;
+    Ok(client)
+}
+
+/// Maps a Redis error to a retryable store error.
+#[cfg(feature = "redis")]
+pub(crate) fn redis_error(action: &str, error: &dyn std::fmt::Display) -> AdkError {
+    AdkError::new(
+        ErrorComponent::Agent,
+        ErrorCategory::Unavailable,
+        "harness.store.database",
+        format!("harness store could not {action}: {error}"),
+    )
+}
+
+/// Percent-encodes the characters that delimit Redis key segments and hash tags, so an
+/// identifier cannot spill into the next segment or move a key's hash slot.
+#[cfg(feature = "redis")]
+pub(crate) fn redis_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for c in segment.chars() {
+        match c {
+            '%' => encoded.push_str("%25"),
+            ':' => encoded.push_str("%3A"),
+            '{' => encoded.push_str("%7B"),
+            '}' => encoded.push_str("%7D"),
+            other => encoded.push(other),
+        }
+    }
+    encoded
+}
+
+/// A key namespace with its hash-tag braces encoded; colons stay, as separators.
+#[cfg(feature = "redis")]
+pub(crate) fn redis_namespace(namespace: &str) -> String {
+    namespace.replace('{', "%7B").replace('}', "%7D")
+}
+
+/// `url` with the password of its userinfo replaced by `***`, for banners, logs and
+/// errors (spec 3.1 §13 Q5).
+///
+/// # Example
+///
+/// ```rust
+/// use adk_harness::redact_store_url;
+///
+/// assert_eq!(
+///     redact_store_url("postgres://app:s3cret@db:5432/harness"),
+///     "postgres://app:***@db:5432/harness"
+/// );
+/// assert_eq!(redact_store_url("redis://localhost:6379"), "redis://localhost:6379");
+/// ```
+pub fn redact_store_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rsplit_once('@') {
+        Some((userinfo, host)) => {
+            let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
+            if userinfo.contains(':') {
+                format!("{scheme}://{user}:***@{host}{tail}")
+            } else {
+                format!("{scheme}://{user}@{host}{tail}")
+            }
+        }
+        None => url.to_string(),
+    }
 }
 
 /// Maps a serialization failure of a store record.
@@ -109,7 +247,10 @@ pub(crate) fn write_atomic_private_sync(path: &Path, bytes: &[u8]) -> Result<()>
         options.mode(0o600);
     }
     let result = (|| {
+        #[cfg(not(windows))]
         let mut file = options.open(&temp)?;
+        #[cfg(windows)]
+        let mut file = owner_only::create_new(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -120,4 +261,32 @@ pub(crate) fn write_atomic_private_sync(path: &Path, bytes: &[u8]) -> Result<()>
         return Err(io_error(path, "write", &error));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every harness file store writes through these two helpers.
+    #[tokio::test]
+    async fn a_store_file_is_readable_by_its_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sync, async_) = (dir.path().join("sync.json"), dir.path().join("async.json"));
+
+        write_atomic_private_sync(&sync, b"{}").unwrap();
+        write_atomic_private(&async_, b"{}").await.unwrap();
+
+        for path in [&sync, &async_] {
+            assert_eq!(std::fs::read(path).unwrap(), b"{}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(path).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{}", path.display());
+            }
+            #[cfg(windows)]
+            assert!(owner_only::is_owner_only(path).unwrap(), "{}", path.display());
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2, "no temporary file is left");
+    }
 }

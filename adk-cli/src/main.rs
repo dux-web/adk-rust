@@ -5,10 +5,14 @@ mod deploy;
 mod graph;
 #[cfg(feature = "harness")]
 mod harness_cli;
+#[cfg(feature = "harness")]
+mod kernel_cli;
 #[cfg(not(feature = "harness"))]
 mod legacy;
 #[cfg(all(feature = "harness", feature = "persist"))]
 mod manage;
+#[cfg(all(windows, any(feature = "audit", feature = "persist")))]
+mod owner_only;
 #[cfg(feature = "vertex-agent-registry")]
 mod registry;
 #[cfg(feature = "scripted-model")]
@@ -16,14 +20,18 @@ mod scripted;
 #[cfg(feature = "persist")]
 mod sessions;
 mod setup;
+#[cfg(feature = "harness")]
+mod shared_store;
 mod skills;
 #[cfg(all(feature = "harness", feature = "persist", feature = "encrypted"))]
 mod store;
 mod ultra;
+#[cfg(feature = "voice")]
+mod voice_cli;
 
 use adk_agent::LlmAgentBuilder;
 use adk_cli::{Launcher, launcher::ThinkingDisplayMode};
-use adk_core::{Effort, Llm};
+use adk_core::Llm;
 use adk_model::ModelProvider;
 use adk_tool::GoogleSearchTool;
 use anyhow::Result;
@@ -33,15 +41,37 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let parsed = Cli::parse();
+    #[cfg(feature = "voice")]
+    let voice = parsed.voice.clone();
     #[cfg(feature = "harness")]
-    let Cli { command, options, harness } = Cli::parse();
+    let Cli { command, options, harness, .. } = parsed;
     #[cfg(not(feature = "harness"))]
-    let Cli { command, options } = Cli::parse();
+    let Cli { command, options } = parsed;
 
     match command {
         #[cfg(feature = "harness")]
         None => {
+            #[cfg(feature = "voice")]
+            let in_process = voice.voice.is_some();
+            #[cfg(not(feature = "voice"))]
+            let in_process = false;
+            // A running kernel owns the sessions, so the REPL attaches to it; --ephemeral,
+            // --continue and --voice keep the in-process REPL (spec 3.2 §7.11).
+            if !in_process
+                && !harness.ephemeral
+                && !harness.continue_session
+                && let Some(client) = kernel_cli::local().await?
+            {
+                return kernel_cli::repl(client, harness.session.clone()).await;
+            }
             let model = resolve_model(&options).await?;
+            #[cfg(feature = "voice")]
+            if voice.voice.is_some() {
+                return exit_with(
+                    harness_cli::voice(model, options.instruction.clone(), harness, voice).await?,
+                );
+            }
             harness_cli::repl(model, options.instruction.clone(), harness).await
         }
         #[cfg(not(feature = "harness"))]
@@ -53,12 +83,13 @@ async fn main() -> Result<()> {
             host,
             agent: cli::ServeAgent::Harness,
             auth_token,
+            store,
             harness,
         }) => {
             let model = resolve_model(&options).await?;
             let auth_token = auth_token.or_else(|| std::env::var("ADK_SERVE_TOKEN").ok());
-            harness_cli::serve(model, options.instruction.clone(), harness, port, host, auth_token)
-                .await
+            let instruction = options.instruction.clone();
+            harness_cli::serve(model, instruction, harness, port, host, auth_token, store).await
         }
         #[cfg(feature = "harness")]
         Some(Commands::Serve { port, host, agent: cli::ServeAgent::Chat, .. }) => {
@@ -103,17 +134,26 @@ async fn main() -> Result<()> {
             .await
         }
         #[cfg(feature = "harness")]
-        Some(Commands::Ultracode { task, harness, max_rounds }) => {
+        Some(Commands::Ultracode {
+            task,
+            harness,
+            max_rounds,
+            architecture,
+            router,
+            max_model_calls,
+            receipt,
+        }) => {
             let model = resolve_model(&options).await?;
+            let ultra = harness_cli::UltracodeArgs {
+                task,
+                max_rounds,
+                architecture,
+                router,
+                max_model_calls,
+                receipt,
+            };
             exit_with(
-                harness_cli::ultracode(
-                    model,
-                    options.instruction.clone(),
-                    harness,
-                    task,
-                    max_rounds,
-                )
-                .await?,
+                harness_cli::ultracode(model, options.instruction.clone(), harness, ultra).await?,
             )
         }
         #[cfg(not(feature = "harness"))]
@@ -124,12 +164,74 @@ async fn main() -> Result<()> {
                 root: std::path::PathBuf::from(&dir),
                 instruction: options.instruction,
             });
-            ultra::run_with(agents, &model.id, &dir, task, max_rounds).await
+            ultra::run_with(agents, &model.id, &dir, task, max_rounds.unwrap_or(2)).await.map(drop)
+        }
+        #[cfg(feature = "harness")]
+        Some(Commands::Up(mut up)) => {
+            let model = resolve_model(&options).await?;
+            up.auth_token = up.auth_token.or_else(|| std::env::var("ADK_SERVE_TOKEN").ok());
+            harness_cli::up(model, options.instruction.clone(), *up).await
+        }
+        #[cfg(feature = "harness")]
+        Some(Commands::Attach { session, kernel }) => kernel_cli::attach(&kernel, session).await,
+        #[cfg(feature = "harness")]
+        Some(Commands::Ps { partition, state, limit, kernel }) => {
+            kernel_cli::ps(&kernel, partition, state, limit).await
+        }
+        #[cfg(feature = "harness")]
+        Some(Commands::Top { partition, interval, kernel }) => {
+            kernel_cli::top(&kernel, partition, interval).await
+        }
+        #[cfg(feature = "harness")]
+        Some(Commands::Kill { pid, reason, kernel }) => {
+            kernel_cli::act(&kernel, &pid, kernel_cli::Action::Kill(reason)).await
+        }
+        #[cfg(feature = "harness")]
+        Some(Commands::Suspend { pid, kernel }) => {
+            kernel_cli::act(&kernel, &pid, kernel_cli::Action::Suspend).await
+        }
+        #[cfg(feature = "harness")]
+        Some(Commands::Resume { pid, kernel }) => {
+            kernel_cli::act(&kernel, &pid, kernel_cli::Action::Resume).await
+        }
+        #[cfg(feature = "harness")]
+        Some(Commands::Freeze { reason, kernel }) => {
+            kernel_cli::freeze(&kernel, reason.as_deref()).await
+        }
+        #[cfg(feature = "harness")]
+        Some(Commands::Unfreeze { kernel }) => kernel_cli::unfreeze(&kernel).await,
+        #[cfg(feature = "harness")]
+        Some(Commands::Events { follow, after, json, kernel }) => {
+            kernel_cli::events(&kernel, follow, after, json).await
+        }
+        #[cfg(feature = "harness")]
+        Some(Commands::Nice { pid, queue, kernel }) => kernel_cli::nice(&kernel, &pid, queue).await,
+        #[cfg(feature = "harness")]
+        Some(Commands::Agenda { command, kernel }) => match command {
+            None => kernel_cli::agenda_list(&kernel, None, None, None).await,
+            Some(cli::AgendaCommand::List { partition, state, limit }) => {
+                kernel_cli::agenda_list(&kernel, partition, state, limit).await
+            }
+            Some(cli::AgendaCommand::Approve { id }) => {
+                kernel_cli::agenda_act(&kernel, &id, kernel_cli::AgendaAction::Approve).await
+            }
+            Some(cli::AgendaCommand::Reject { id, reason }) => {
+                kernel_cli::agenda_act(&kernel, &id, kernel_cli::AgendaAction::Reject(reason)).await
+            }
+            Some(cli::AgendaCommand::Schedule { id, at, cron }) => {
+                let wake = kernel_cli::schedule_wake(at.as_deref(), cron.as_deref())?;
+                kernel_cli::agenda_act(&kernel, &id, kernel_cli::AgendaAction::Schedule(wake)).await
+            }
+        },
+        #[cfg(feature = "harness")]
+        Some(Commands::Wake { file, cron, webhook, session, task, kernel }) => {
+            let on = kernel_cli::wake_on(file.as_deref(), cron.as_deref(), webhook.as_deref())?;
+            kernel_cli::wake(&kernel, on, &task.join(" "), session).await
         }
         #[cfg(all(feature = "harness", feature = "persist"))]
         Some(Commands::Sessions { command }) => manage::sessions(command).await,
         #[cfg(all(feature = "harness", feature = "persist"))]
-        Some(Commands::Rules { command }) => manage::rules(command).await,
+        Some(Commands::Rules { command, store }) => manage::rules(command, store).await,
         #[cfg(all(feature = "harness", feature = "persist"))]
         Some(Commands::Memory { command }) => manage::memory(command).await,
         #[cfg(all(feature = "harness", feature = "persist", feature = "encrypted"))]
@@ -169,8 +271,8 @@ async fn serve_chat(options: &AgentOptions, port: u16, host: std::net::IpAddr) -
         .map_err(Into::into)
 }
 
-/// A client built for one effort level (spec 3.1 §7.23): the model, and the same model as
-/// a `CacheCapable` when it caches its context explicitly (Gemini).
+/// A model client, and the same model as a `CacheCapable` when it caches its context
+/// explicitly (Gemini).
 #[derive(Clone)]
 pub(crate) struct BuiltModel {
     pub(crate) llm: Arc<dyn Llm>,
@@ -190,34 +292,17 @@ pub(crate) struct ResolvedModel {
     /// The provider key, for the long-term memory embedder (spec 3.1 §7.15.2).
     #[cfg_attr(not(feature = "harness"), allow(dead_code))]
     api_key: Option<String>,
-    #[cfg_attr(not(feature = "harness"), allow(dead_code))]
-    thinking_budget: Option<u32>,
     /// The model as a `CacheCapable`, when it caches its context explicitly.
     #[cfg_attr(not(feature = "harness"), allow(dead_code))]
     cache_capable: Option<Arc<dyn adk_core::CacheCapable>>,
 }
 
 impl ResolvedModel {
-    /// The same model built at `effort` (spec 3.1 §7.23): a fresh client for Gemini,
-    /// OpenAI and Anthropic, whose effort is read when the client is built; the model as
-    /// it is for providers with no effort control (Ollama, mistral.rs, scripted).
+    /// The model's client; the harness sets each request's effort, so one client serves
+    /// every mode and role (spec 3.1 §7.23).
     #[cfg(feature = "harness")]
-    pub(crate) async fn at_effort(&self, effort: Effort) -> Result<BuiltModel> {
-        match self.provider {
-            Some(provider) if supports_effort(provider) => {
-                create_model(
-                    provider,
-                    &self.id,
-                    self.api_key.as_deref(),
-                    self.thinking_budget,
-                    Some(effort),
-                )
-                .await
-            }
-            _ => {
-                Ok(BuiltModel { llm: self.llm.clone(), cache_capable: self.cache_capable.clone() })
-            }
-        }
+    pub(crate) fn built(&self) -> BuiltModel {
+        BuiltModel { llm: self.llm.clone(), cache_capable: self.cache_capable.clone() }
     }
 
     /// The provider, for the long-term memory embedder and the local posture.
@@ -225,15 +310,6 @@ impl ResolvedModel {
     pub(crate) fn provider(&self) -> Option<Provider> {
         self.provider
     }
-}
-
-/// Whether `provider` reads an effort level when its client is built (spec 3.1 §7.23).
-#[cfg(feature = "harness")]
-fn supports_effort(provider: Provider) -> bool {
-    matches!(
-        provider,
-        Provider::Model(ModelProvider::Gemini | ModelProvider::Openai | ModelProvider::Anthropic)
-    )
 }
 
 /// Resolves the model from the flags, saved config, secure storage, or first-run setup
@@ -247,7 +323,6 @@ async fn resolve_model(options: &AgentOptions) -> Result<ResolvedModel> {
             provider: None,
             instruction: options.instruction.clone().unwrap_or_else(setup::default_instruction),
             api_key: None,
-            thinking_budget: None,
             cache_capable: None,
         });
     }
@@ -262,7 +337,6 @@ async fn resolve_model(options: &AgentOptions) -> Result<ResolvedModel> {
         &resolved.model,
         resolved.api_key.as_deref(),
         options.thinking_budget,
-        None,
     )
     .await?;
     Ok(ResolvedModel {
@@ -271,7 +345,6 @@ async fn resolve_model(options: &AgentOptions) -> Result<ResolvedModel> {
         provider: Some(resolved.provider),
         instruction: resolved.instruction,
         api_key: resolved.api_key,
-        thinking_budget: options.thinking_budget,
         cache_capable: built.cache_capable,
     })
 }
@@ -345,15 +418,13 @@ async fn build_agent(options: &AgentOptions) -> Result<adk_agent::LlmAgent> {
     builder.build().map_err(Into::into)
 }
 
-/// Builds the client of `provider` for `model`, at `effort` where the provider reads one
-/// (spec 3.1 §7.23): Gemini `thinking_level`, OpenAI `reasoning_effort`, Anthropic
-/// `output_config.effort` with adaptive thinking; Ollama and mistral.rs have none.
+/// Builds the client of `provider` for `model`. The harness sets each request's effort
+/// (spec 3.1 §7.23), which the client maps to its own control.
 async fn create_model(
     provider: Provider,
     model: &str,
     api_key: Option<&str>,
     thinking_budget: Option<u32>,
-    effort: Option<Effort>,
 ) -> Result<BuiltModel> {
     let plain = |llm: Arc<dyn Llm>| BuiltModel { llm, cache_capable: None };
     match provider {
@@ -361,14 +432,8 @@ async fn create_model(
         Provider::Model(ModelProvider::Gemini) => {
             reject_unsupported_thinking_budget(provider, thinking_budget)?;
             let key = api_key.ok_or_else(|| anyhow::anyhow!("Gemini requires an API key"))?;
-            let mut m = adk_model::GeminiModel::new(key, model)?;
-            if let Some(effort) = effort {
-                m = m.with_thinking_config(
-                    adk_model::gemini::ThinkingConfig::new().with_thinking_level(effort.into()),
-                );
-            }
-            let m = Arc::new(m);
-            Ok(BuiltModel { llm: m.clone(), cache_capable: Some(m) })
+            let m = Arc::new(adk_model::GeminiModel::new(key, model)?);
+            Ok(BuiltModel { cache_capable: Some(m.clone()), ..plain(m) })
         }
         #[cfg(not(feature = "gemini"))]
         Provider::Model(ModelProvider::Gemini) => Err(setup::not_compiled(provider)),
@@ -376,10 +441,22 @@ async fn create_model(
         Provider::Model(ModelProvider::Openai) => {
             reject_unsupported_thinking_budget(provider, thinking_budget)?;
             let key = api_key.ok_or_else(|| anyhow::anyhow!("OpenAI requires an API key"))?;
-            let mut config = adk_model::OpenAIConfig::new(key, model);
-            if let Some(effort) = effort {
-                config = config.with_reasoning_effort(effort.into());
+            // The Responses API serves OpenAI's provider search and the Responses-only
+            // features (spec 3.1 §7.20); older models stay on Chat Completions.
+            if openai_responses_model(model) {
+                let config = adk_model::openai::OpenAIResponsesConfig::new(key, model);
+                // Chat Completions does not store responses by default; keep that.
+                let store_off: adk_model::openai::RequestAdapter = Arc::new(|body, _headers| {
+                    if let Some(body) = body.as_object_mut() {
+                        body.entry("store").or_insert(serde_json::Value::Bool(false));
+                    }
+                    Ok(())
+                });
+                let client = adk_model::openai::OpenAIResponsesClient::new(config)?
+                    .with_request_adapter(store_off);
+                return Ok(plain(Arc::new(client)));
             }
+            let config = adk_model::OpenAIConfig::new(key, model);
             Ok(plain(Arc::new(adk_model::OpenAIClient::new(config)?)))
         }
         #[cfg(not(feature = "openai"))]
@@ -388,22 +465,12 @@ async fn create_model(
         Provider::Model(ModelProvider::Anthropic) => {
             let key = api_key.ok_or_else(|| anyhow::anyhow!("Anthropic requires an API key"))?;
             let mut config = adk_model::anthropic::AnthropicConfig::new(key, model);
-            match (thinking_budget, effort) {
-                (Some(0), _) => {
+            match thinking_budget {
+                Some(0) => {
                     return Err(anyhow::anyhow!("--thinking-budget must be greater than 0"));
                 }
-                (Some(budget), effort) => {
-                    config = config.with_thinking(budget);
-                    if let Some(effort) = effort {
-                        config = config.with_effort(effort.into());
-                    }
-                }
-                (None, Some(effort)) => {
-                    config = config
-                        .with_thinking_mode(adk_model::anthropic::ThinkingMode::Adaptive)
-                        .with_effort(effort.into());
-                }
-                (None, None) => {}
+                Some(budget) => config = config.with_thinking(budget),
+                None => {}
             }
             Ok(plain(Arc::new(adk_model::AnthropicClient::new(config)?)))
         }
@@ -451,6 +518,24 @@ async fn create_model(
     }
 }
 
+/// Whether the CLI runs `model` on the OpenAI Responses API: GPT-5.6 and every later GPT
+/// generation, the models whose tool calls `OpenAIClient` already sends there because Chat
+/// Completions rejects them with reasoning on.
+#[cfg(feature = "openai")]
+fn openai_responses_model(model: &str) -> bool {
+    let model = model.strip_prefix("ft:").unwrap_or(model);
+    let Some(version) = model.strip_prefix("gpt-") else {
+        return false;
+    };
+    let end = version.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(version.len());
+    let mut numbers = version[..end].split('.').map(str::parse::<u32>);
+    match (numbers.next(), numbers.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= (5, 6),
+        (Some(Ok(major)), None) => major >= 6,
+        _ => false,
+    }
+}
+
 fn reject_unsupported_thinking_budget(
     provider: Provider,
     thinking_budget: Option<u32>,
@@ -467,5 +552,29 @@ fn map_thinking_mode(mode: ThinkingMode) -> ThinkingDisplayMode {
         ThinkingMode::Auto => ThinkingDisplayMode::Auto,
         ThinkingMode::Show => ThinkingDisplayMode::Show,
         ThinkingMode::Hide => ThinkingDisplayMode::Hide,
+    }
+}
+
+#[cfg(all(test, feature = "openai"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn openai_models_on_the_responses_api_serve_the_provider_search() {
+        let openai = Provider::Model(ModelProvider::Openai);
+        for model in ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "ft:gpt-5.6-terra:acme::x1"] {
+            let built = create_model(openai, model, Some("sk-test"), None).await.unwrap();
+            let search = built.llm.native_web_search().expect(model);
+            assert_eq!(
+                (search.provider, search.tool),
+                ("openai", adk_core::NativeWebSearchTool::OpenAiWebSearch),
+                "{model}"
+            );
+        }
+        // Older models stay on Chat Completions, which serves no provider search.
+        for model in ["gpt-5.5", "gpt-5", "gpt-4.1", "o4-mini"] {
+            let built = create_model(openai, model, Some("sk-test"), None).await.unwrap();
+            assert!(built.llm.native_web_search().is_none(), "{model}");
+        }
     }
 }

@@ -884,7 +884,11 @@ fn set_max_reasoning_effort(
                 "max reasoning requires a Responses reasoning object".to_string(),
             )
         })?;
-    reasoning.insert("effort".to_string(), serde_json::Value::String("max".to_string()));
+    // `max` travels as `xhigh` through the SDK's types; a request that chose its own level
+    // (spec 3.1 §7.23) keeps it.
+    if reasoning.get("effort").and_then(serde_json::Value::as_str) == Some("xhigh") {
+        reasoning.insert("effort".to_string(), serde_json::Value::String("max".to_string()));
+    }
     Ok(())
 }
 
@@ -956,6 +960,28 @@ impl Llm for OpenAIResponsesClient {
 
     fn name(&self) -> &str {
         &self.model
+    }
+
+    // OpenAI runs `web_search` with `filters.allowed_domains`; DeepSeek's Responses endpoint
+    // runs it for `deepseek-v4-pro` only, with no documented options
+    // (https://api-docs.deepseek.com/guides/responses_api); no other endpoint is assumed to
+    // (spec 3.1 §7.20).
+    fn native_web_search(&self) -> Option<adk_core::NativeWebSearch> {
+        match crate::provider::url_host(&self.base_url).as_deref() {
+            Some("api.openai.com") => Some(adk_core::NativeWebSearch::new(
+                "openai",
+                adk_core::NativeWebSearchTool::OpenAiWebSearch,
+                true,
+            )),
+            Some("api.deepseek.com") if self.model.starts_with("deepseek-v4-pro") => {
+                Some(adk_core::NativeWebSearch::new(
+                    "deepseek",
+                    adk_core::NativeWebSearchTool::DeepSeekWebSearch,
+                    false,
+                ))
+            }
+            _ => None,
+        }
     }
 
     #[tracing::instrument(

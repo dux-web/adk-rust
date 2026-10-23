@@ -32,6 +32,7 @@ agent tool — and the harness refuses to run without it.
 | Goals | `Harness::start_goal` iterates until the operator's `until` command passes (`LoopAgent` or a checkpointed graph); goal state in a `GoalStore`; durable goals as `harness.goal` runs for a `DurableWorker`; ambient goals on cron, file-watch and webhook triggers |
 | Durability | A completed call never runs twice after a crash (the turn after one answers it from the action ledger), held approvals survive process loss, resumed runs follow the current mode |
 | Long-term facts | `MemoryFact`s with provenance in a `FactStore` (in-memory, file, SQLite), found by a `FactIndex` (`LocalFactIndex` by embedding or shared words, `MemoryServiceIndex` over any `adk-memory` backend) and recalled into a `<memory-facts>` block on each user turn; written by `memory_remember` (assumed only), by distilling a session on a cheaper model, and by a person; `Known` only from the user's own quoted words or a person's confirmation; redacted before storage; `Harness::{facts, accept_fact, forget_fact, correct_fact}` |
+| Fact consolidation | The spec 3.2 consolidation tick's work on facts: `Harness::consolidate_memory` distils the sessions the per-session distiller never reached (assumed only), supersedes `Assumed` near-duplicates and expires stale `Assumed` facts without a model call, merges similar `Assumed` facts with provenance, never touches a `Known` fact, stops at a loss cap, and keeps a record `Harness::undo_consolidation` reverts |
 
 ## Mode table
 
@@ -106,6 +107,37 @@ only under the workspace's content-keyed trust. Every run is a `harness.hook.ran
 effective set, and `on_hold` and `on_stop` notes are shown at the console. See
 `docs/official_docs/harness/hooks.md`.
 
+## Kernel (feature `kernel`)
+
+`Harness::kernel` returns an `adk_kernel::KernelBuilder` with the harness's runner registered
+as the app's target (`adk-rust` in the CLI) and as `harness.goal`, and with the harness's
+sessions, approval service, kill switch, audit trail, spend ledger and, when it has one, run
+store (spec 3.2 §10 HK1). The caller adds the process store, the `KernelConfig` and the
+control plane, then builds and starts the kernel.
+
+| Harness part | What the kernel gets |
+|---|---|
+| Approvals | A decision through the harness's approval service wakes the process asleep on `Wake::Approval` for that call |
+| Process view | A `ProgressSource`: a goal's iteration of max, duration and last check, the loop guard's verdict, and the session's model calls, tool calls and cost for spend attribution |
+| Goals | The goal thread keeps the last `2 × GOAL_STALL_WINDOW` checkpoints. Under a kernel, a goal whose check repeats its last `GOAL_STALL_WINDOW` (3) results, or whose iteration made no tool call (`Graph` engine), records `harness.goal.stalled` and parks `Waiting` before its next model call instead of spending its iteration cap |
+
+```rust,ignore
+use std::sync::Arc;
+
+use adk_kernel::{InMemoryProcessStore, KernelConfig};
+
+async fn host(harness: &adk_harness::Harness) -> Result<(), Box<dyn std::error::Error>> {
+    let kernel = harness
+        .kernel()
+        .config(KernelConfig::default())
+        .process_store(Arc::new(InMemoryProcessStore::new()))
+        .build()?;
+    kernel.start().await?;
+    kernel.shutdown_on_signal().await?;
+    Ok(())
+}
+```
+
 ## Features
 
 | Feature | Default | Pulls in |
@@ -113,32 +145,37 @@ effective set, and `on_hold` and `on_stop` notes are shown at the console. See
 | `runner` | on | `adk-runner`, `adk-session` (`Harness`) |
 | `skills` | on | `adk-skill/progressive-disclosure` |
 | `team` | on | `adk-tool`, `adk-agent/team-tools` |
-| `graph` | on | `adk-graph` |
+| `graph` | on | `adk-graph`: the plan graph and the `Graph` goal engine, checkpointed in the store `plan_checkpoint_store(url)` names (`checkpointer_from_url`), in memory without one |
 | `sandbox` | on | `adk-sandbox/sandbox-native` |
 | `observe` | on | `adk-telemetry`, `adk-eval` |
 | `auth` | on | `adk-auth` |
 | `memory` | on | working notes and long-term facts (`adk-memory`, `adk-guardrail`) |
 | `memory-embeddings` | off | `RagEmbedder`: `adk-rag`'s OpenAI and Gemini embedders for long-term facts |
-| `web` | off | `web_fetch`, `web_search`, screening and `ProviderWebTools` (`reqwest`, `adk-guardrail`); on in `adk-rust` |
+| `web` | off | `web_fetch`; web search through the model provider's built-in search by default, or the governed `web_search` over a `SearchProvider` (`SearxngSearch`, `DeepSeekSearch`); screening and `ProviderWebTools` (`reqwest`, `adk-guardrail`); on in `adk-rust` |
 | `mcp` | off | MCP elicitation, sampling and resource bridges (`adk-tool/mcp`, `adk-tool/mcp-sampling`); on in `adk-rust` |
 | `web-fixture` | off | a loopback HTTP server stands in for the web in tests; never on in `adk-rust` |
 | `hooks` | off | `toml`; `[[hooks]]` from `.adk/harness.toml`, the user config and the builder, run through the shell's launcher (spec 3.1 §7.22) |
 | `memory-embeddings-local` | off | `RagEmbedder::onnx`: `adk-rag`'s in-process ONNX embedder (`BAAI/bge-small-en-v1.5`), no network and no key; `ort` downloads the onnxruntime binary at build time |
 | `encrypted` | off | The store envelope of spec 3.1 §7.12: `StoreKeyring`, `StoreKeySource` (secret provider, OS keychain, environment), sessions, approvals and the SQLite stores sealed at rest, key rotation |
-| `sqlite` | off | SQLite mode, rule, shell-ledger and goal stores |
+| `sqlite` | off | SQLite mode, rule, shell-ledger and goal stores, and `sqlite://` plan checkpoints |
+| `postgres`, `redis` | off | `PostgresModeStore`, `PostgresStandingRuleStore`, `RedisModeStore`, `RedisStandingRuleStore`: the mode and rule stores every replica of a served harness shares (spec 3.1 §13 Q2), `postgres://` and `redis://` plan checkpoints, and `adk-session`'s stores on the same backend |
+| `mongodb`, `neo4j`, `firestore` | off | `mongodb://`, `neo4j://` and `firestore://` plan checkpoints (spec 3.1 §13 Q5) |
 | `ambient` | off | `adk-agent/ambient`: goals started by triggers |
+| `kernel` | off | `adk-kernel`: `Harness::kernel`, the harness as a kernel's resident agent, and goal stall parking (spec 3.2 §10 HK1, HK3) |
 | `docker` | off | `adk-sandbox/workspace-docker`: the container shell (`ShellIsolation::Container`, `ContainerBashTool`) |
 | `skills-registry`, `team-acp`, `team-a2a`, `memory-graph` | off | registry skills, ACP and A2A members, graph memory |
 | `payments` | off | the payments pack (spec 3.1 §7.16): `adk-payments` tools as class `Payment` under a `PaymentMandate`, `harness.payment` with the journal receipt |
 | `managed` | off | the managed form (spec 3.1 §7.18): `HarnessDef`, `HarnessResolver` on the managed runtime, `Pack::Managed` |
 | `browser` | off | the browser pack (spec 3.1 §7.24): `adk-browser`'s tools as `Read`, `Web` and `External` classes under the web rules, `BrowserPack`, `harness.browser.*` |
 | `computer-use` | off | the computer-use pack (spec 3.1 §7.24): `computer_use_observe`, `computer_use_preview` and the never-waivable `computer_use_execute` through `adk-computer-use`'s reference graph, `ComputerUsePack` |
-| `voice` | off | the voice pack |
+| `voice` | off | the voice surface (spec 3.1 §7.17): `VoiceSurface` runs a harness marked `Pack::Voice` over `adk-realtime`'s `IntegratedRealtimeRunner`, with spoken or inbox approvals and `harness.voice.*` audit records |
 
 ## Status
 
 Beta (spec 3.1 phases 1 and 3). The payments pack (§7.16) is implemented
-([guide](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/harness/payments.md));
+([guide](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/harness/payments.md)),
+and so is the voice surface (§7.17,
+[guide](https://github.com/zavora-ai/adk-rust/blob/main/docs/official_docs/harness/voice.md));
 the managed form (§7.18, feature `managed`) is Experimental, as `adk-managed` is:
 `packs::managed::HarnessDef` declares a harness as a managed agent definition and
 `HarnessResolver` builds it on the managed runtime

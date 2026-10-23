@@ -54,6 +54,7 @@
 
 use crate::config::{RealtimeConfig, ToolDefinition, VadConfig, VadMode};
 use crate::events::{ServerEvent, ToolResponse};
+use crate::metering::{RealtimePricing, RealtimeUsage, ResponseMeter};
 use adk_core::{
     AdkError, AfterAgentCallback, AfterToolCallback, Agent, AgentInteractionMode,
     BeforeAgentCallback, BeforeToolCallback, CallbackContext, Content, Event, EventActions,
@@ -89,7 +90,8 @@ pub struct RealtimeAgent {
     // Voice-specific settings
     voice: Option<String>,
     vad_config: Option<VadConfig>,
-    modalities: Vec<String>,
+    modalities: Option<Vec<String>>,
+    transcription: bool,
 
     // Tools (same as LlmAgent)
     tools: Vec<Arc<dyn Tool>>,
@@ -108,6 +110,12 @@ pub struct RealtimeAgent {
     on_transcript: Option<TranscriptCallback>,
     on_speech_started: Option<SpeechCallback>,
     on_speech_stopped: Option<SpeechCallback>,
+
+    /// Output guardrails on the model's text and transcripts.
+    #[cfg(feature = "guardrails")]
+    output_guardrails: Option<Arc<adk_guardrail::GuardrailSet>>,
+    /// Prices each response's usage for the spend ledger.
+    pricing: Option<RealtimePricing>,
 
     // Video avatar configuration
     #[cfg(feature = "video-avatar")]
@@ -162,7 +170,8 @@ pub struct RealtimeAgentBuilder {
     global_instruction_provider: Option<Arc<GlobalInstructionProvider>>,
     voice: Option<String>,
     vad_config: Option<VadConfig>,
-    modalities: Vec<String>,
+    modalities: Option<Vec<String>>,
+    transcription: bool,
     tools: Vec<Arc<dyn Tool>>,
     toolsets: Vec<Arc<dyn Toolset>>,
     sub_agents: Vec<Arc<dyn Agent>>,
@@ -173,6 +182,9 @@ pub struct RealtimeAgentBuilder {
     tool_timeout: std::time::Duration,
     tool_result_screen: Option<Arc<dyn adk_core::ToolResultScreen>>,
     expose_tool_error_messages: bool,
+    #[cfg(feature = "guardrails")]
+    output_guardrails: Option<adk_guardrail::GuardrailSet>,
+    pricing: Option<RealtimePricing>,
     on_audio: Option<AudioCallback>,
     on_transcript: Option<TranscriptCallback>,
     on_speech_started: Option<SpeechCallback>,
@@ -198,7 +210,8 @@ impl RealtimeAgentBuilder {
             global_instruction_provider: None,
             voice: None,
             vad_config: None,
-            modalities: vec!["text".to_string(), "audio".to_string()],
+            modalities: None,
+            transcription: false,
             tools: Vec::new(),
             toolsets: Vec::new(),
             sub_agents: Vec::new(),
@@ -209,6 +222,9 @@ impl RealtimeAgentBuilder {
             tool_timeout: crate::runner::DEFAULT_REALTIME_TOOL_TIMEOUT,
             tool_result_screen: None,
             expose_tool_error_messages: false,
+            #[cfg(feature = "guardrails")]
+            output_guardrails: None,
+            pricing: None,
             on_audio: None,
             on_transcript: None,
             on_speech_started: None,
@@ -281,9 +297,33 @@ impl RealtimeAgentBuilder {
         self
     }
 
-    /// Set output modalities (e.g., ["text", "audio"]).
+    /// Set output modalities, such as `["audio"]` or `["text"]`.
+    ///
+    /// Unset, the provider's default applies: audio, with a transcript, on the OpenAI Realtime
+    /// API and on Gemini Live. A provider refuses a combination it does not support — Gemini
+    /// Live accepts one response modality per session, and `gemini-3.1-flash-live-preview`
+    /// only `audio` — and the run then ends with the provider's reason as its error.
     pub fn modalities(mut self, modalities: Vec<String>) -> Self {
-        self.modalities = modalities;
+        self.modalities = Some(modalities);
+        self
+    }
+
+    /// Transcribe the user's speech, as [`RealtimeConfig::with_transcription`] does, so each
+    /// spoken turn is saved to the session as a user event. On Gemini Live this also
+    /// transcribes the model's speech, so its spoken replies are saved as text.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_realtime::RealtimeAgent;
+    /// use adk_realtime::model::BoxedModel;
+    ///
+    /// fn voice_agent(model: BoxedModel) -> adk_core::Result<RealtimeAgent> {
+    ///     RealtimeAgent::builder("voice").model(model).transcription().build()
+    /// }
+    /// ```
+    pub fn transcription(mut self) -> Self {
+        self.transcription = true;
         self
     }
 
@@ -391,6 +431,35 @@ impl RealtimeAgentBuilder {
         self
     }
 
+    /// Screens the model's completed text and transcripts with `guardrails` before the
+    /// final event reaches the client or the session, as `LlmAgent` screens final text. A
+    /// transform rewrites the text; a block interrupts the response, ends the run with the
+    /// guardrail's error, and closes the session.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_guardrail::{GuardrailSet, PiiRedactor};
+    ///
+    /// let agent = RealtimeAgent::builder("voice")
+    ///     .model(model)
+    ///     .output_guardrails(GuardrailSet::new().with(PiiRedactor::new()))
+    ///     .build()?;
+    /// ```
+    #[cfg(feature = "guardrails")]
+    pub fn output_guardrails(mut self, guardrails: adk_guardrail::GuardrailSet) -> Self {
+        self.output_guardrails = Some(guardrails);
+        self
+    }
+
+    /// Prices each response's reported usage, so the run's spend ledger is charged the
+    /// usage's price rather than the run's per-call estimate, and the usage event the agent
+    /// yields at each response's end carries a cost.
+    pub fn realtime_pricing(mut self, pricing: RealtimePricing) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
+
     /// Set callback for audio output events.
     pub fn on_audio(mut self, callback: AudioCallback) -> Self {
         self.on_audio = Some(callback);
@@ -479,6 +548,7 @@ impl RealtimeAgentBuilder {
             voice: self.voice,
             vad_config: self.vad_config,
             modalities: self.modalities,
+            transcription: self.transcription,
             tools: self.tools,
             toolsets: self.toolsets,
             sub_agents: self.sub_agents,
@@ -491,6 +561,9 @@ impl RealtimeAgentBuilder {
                 screen: self.tool_result_screen,
                 expose_error_messages: self.expose_tool_error_messages,
             },
+            #[cfg(feature = "guardrails")]
+            output_guardrails: self.output_guardrails.map(Arc::new),
+            pricing: self.pricing,
             on_audio: self.on_audio,
             on_transcript: self.on_transcript,
             on_speech_started: self.on_speech_started,
@@ -588,7 +661,10 @@ impl RealtimeAgent {
         // Voice settings
         config.voice = self.voice.clone();
         config.turn_detection = self.vad_config.clone();
-        config.modalities = Some(self.modalities.clone());
+        config.modalities = self.modalities.clone();
+        if self.transcription {
+            config = config.with_transcription();
+        }
 
         // Convert ADK tools to realtime tool definitions
         let tool_defs: Vec<ToolDefinition> = resolved_tools
@@ -679,6 +755,9 @@ impl Agent for RealtimeAgent {
         let before_tool_callbacks = self.before_tool_callbacks.clone();
         let after_tool_callbacks = self.after_tool_callbacks.clone();
         let tool_results = self.tool_results.clone();
+        #[cfg(feature = "guardrails")]
+        let output_guardrails = self.output_guardrails.clone();
+        let pricing = self.pricing;
         let tools = self.tools.clone();
         let toolsets = self.toolsets.clone();
 
@@ -727,6 +806,15 @@ impl Agent for RealtimeAgent {
 
         // Build config with resolved tools
         let config = self.build_config(&ctx, &resolved_tools).await?;
+
+        // Every response is metered in the run's spend ledger, as a model call is.
+        let meter = ResponseMeter::for_run(
+            ctx.run_config(),
+            ctx.app_name(),
+            &agent_name,
+            model.model_id(),
+            pricing,
+        );
 
         let s = stream! {
             // ===== BEFORE AGENT CALLBACKS =====
@@ -837,6 +925,89 @@ impl Agent for RealtimeAgent {
                 }
             };
 
+            // ===== RESUME HELD CALLS =====
+            // A call held in an earlier run resumes once it has a decision, as `LlmAgent`
+            // resumes its held calls at the start of a run. The provider session is new,
+            // so the result is carried to the model as text rather than as the output of a
+            // call this session never issued.
+            {
+                let held_calls = ctx.session().held_tool_calls(&agent_name, ctx.branch());
+                if !held_calls.is_empty() {
+                    let gate = adk_core::ToolGate::for_context(ctx.as_ref());
+                    for held in held_calls {
+                        let Some(function_call_id) = held.request.function_call_id.clone() else {
+                            continue;
+                        };
+                        match adk_core::confirmation_decision_available(&gate, &held.request).await {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(error) => {
+                                yield Err(error);
+                                let _ = session.close().await;
+                                return;
+                            }
+                        }
+                        let Some(tool) = resolved_tools.iter().find(|t| t.name() == held.name).cloned() else {
+                            continue;
+                        };
+                        let outcome = match dispatch_tool(
+                            &ctx,
+                            &tool,
+                            &function_call_id,
+                            &held.args.to_string(),
+                            &DispatchHooks {
+                                before_tool_callbacks: before_tool_callbacks.as_ref(),
+                                after_tool_callbacks: after_tool_callbacks.as_ref(),
+                                policy: &tool_results,
+                            },
+                            Some(held.request.clone()),
+                        )
+                        .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                yield Err(error);
+                                let _ = session.close().await;
+                                return;
+                            }
+                        };
+                        if outcome.held.is_some() {
+                            // The decision was not live after all: the call stays held.
+                            continue;
+                        }
+                        let mut tool_event = Event::new(&invocation_id);
+                        tool_event.author = agent_name.clone();
+                        tool_event.actions = outcome.actions.clone();
+                        tool_event.llm_response.content = Some(Content {
+                            role: "function".to_string(),
+                            parts: vec![Part::FunctionResponse {
+                                function_response: adk_core::FunctionResponseData::new(held.name.clone(), outcome.result.clone()),
+                                id: Some(function_call_id.clone()),
+                                annotations: None,
+                            }],
+                        });
+                        yield Ok(tool_event);
+                        let rendered = outcome.result.to_string();
+                        let rendered = if rendered.chars().count() > 2_000 {
+                            format!("{}…", rendered.chars().take(2_000).collect::<String>())
+                        } else {
+                            rendered
+                        };
+                        if let Err(e) = session
+                            .send_text(&format!(
+                                "The call to {} you made earlier was decided and has now run. Its result: {rendered}",
+                                held.name
+                            ))
+                            .await
+                        {
+                            yield Err(AdkError::model(format!("Failed to send resumed result: {e}")));
+                            let _ = session.close().await;
+                            return;
+                        }
+                    }
+                }
+            }
+
             // ===== SEND INITIAL USER CONTENT =====
             // If user provided text input, send it to start the conversation
             let user_content = ctx.user_content();
@@ -856,13 +1027,63 @@ impl Agent for RealtimeAgent {
 
             // ===== PROCESS REALTIME EVENTS =====
             let mut audio_buffers = std::collections::HashMap::<String, Vec<u8>>::new();
+            let mut pending_text = std::collections::HashMap::<String, String>::new();
+            let mut pending_transcript = std::collections::HashMap::<String, String>::new();
             let mut oversized_audio = std::collections::HashSet::<String>::new();
+            // The user's input transcripts streamed so far, by item, not yet saved.
+            let mut user_transcripts = Vec::<(String, String)>::new();
+            // The item a reply streamed without one (Gemini Live) is saved under, so each
+            // reply's final event has its own id.
+            let mut reply_item: Option<String> = None;
+            // Why the provider closed the session, when its close code reports a failure.
+            let mut failed_close: Option<crate::session::DisconnectReason> = None;
             loop {
                 let event = session.next_event().await;
 
                 match event {
                     Some(Ok(server_event)) => {
+                        // A transcript streamed without an item id (Gemini Live) is never
+                        // completed by the provider: it ends where the model's turn starts or
+                        // ends, so it is saved ahead of the model's reply to it.
+                        if matches!(
+                            server_event,
+                            ServerEvent::ResponseCreated { .. }
+                                | ServerEvent::AudioDelta { .. }
+                                | ServerEvent::TextDelta { .. }
+                                | ServerEvent::TranscriptDelta { .. }
+                                | ServerEvent::FunctionCallDone { .. }
+                                | ServerEvent::ResponseDone { .. }
+                        ) && let Some(index) =
+                            user_transcripts.iter().position(|(item_id, _)| item_id.is_empty())
+                        {
+                            let (_, text) = user_transcripts.remove(index);
+                            if !text.trim().is_empty() {
+                                yield Ok(user_turn(&invocation_id, text));
+                            }
+                        }
                         match server_event {
+                            ServerEvent::InputTranscriptDelta { item_id, delta, .. } => {
+                                match user_transcripts.iter_mut().find(|(id, _)| *id == item_id) {
+                                    Some((_, text)) => text.push_str(&delta),
+                                    None => user_transcripts.push((item_id, delta)),
+                                }
+                            }
+
+                            ServerEvent::InputTranscriptCompleted { item_id, transcript, .. } => {
+                                let streamed = user_transcripts
+                                    .iter()
+                                    .position(|(id, _)| *id == item_id)
+                                    .map(|index| user_transcripts.remove(index).1);
+                                let text = if transcript.trim().is_empty() {
+                                    streamed.unwrap_or_default()
+                                } else {
+                                    transcript
+                                };
+                                if !text.trim().is_empty() {
+                                    yield Ok(user_turn(&invocation_id, text));
+                                }
+                            }
+
                             ServerEvent::AudioDelta { delta, item_id, .. } => {
                                 // Route audio through avatar provider if active
                                 #[cfg(feature = "video-avatar")]
@@ -945,6 +1166,8 @@ impl Agent for RealtimeAgent {
                             }
 
                             ServerEvent::TextDelta { delta, item_id, .. } => {
+                                let item_id = reply_item_id(item_id, &mut reply_item);
+                                pending_text.entry(item_id.clone()).or_default().push_str(&delta);
                                 let mut text_event = Event::with_id(
                                     format!("{invocation_id}:realtime-text:{item_id}"),
                                     &invocation_id,
@@ -958,7 +1181,34 @@ impl Agent for RealtimeAgent {
                                 yield Ok(text_event);
                             }
 
+                            ServerEvent::ResponseCreated { .. } => {
+                                if let Some(meter) = &meter
+                                    && let Err(e) = meter.begin_response().await
+                                {
+                                    yield Err(AdkError::model(e.to_string()));
+                                    let _ = session.close().await;
+                                    return;
+                                }
+                            }
+
                             ServerEvent::TextDone { text, item_id, .. } => {
+                                let item_id = reply_item_id(item_id, &mut reply_item);
+                                pending_text.remove(&item_id);
+                                let text = match screen_output(
+                                    #[cfg(feature = "guardrails")]
+                                    output_guardrails.as_deref(),
+                                    text,
+                                )
+                                .await
+                                {
+                                    Ok(text) => text,
+                                    Err(error) => {
+                                        let _ = session.interrupt().await;
+                                        yield Err(error);
+                                        let _ = session.close().await;
+                                        return;
+                                    }
+                                };
                                 let mut text_event = Event::with_id(
                                     format!("{invocation_id}:realtime-text:{item_id}"),
                                     &invocation_id,
@@ -975,6 +1225,8 @@ impl Agent for RealtimeAgent {
                                 if let Some(ref cb) = on_transcript {
                                     cb(&delta, &item_id).await;
                                 }
+                                let item_id = reply_item_id(item_id, &mut reply_item);
+                                pending_transcript.entry(item_id.clone()).or_default().push_str(&delta);
                                 let mut transcript_event = Event::with_id(
                                     format!("{invocation_id}:realtime-transcript:{item_id}"),
                                     &invocation_id,
@@ -993,6 +1245,23 @@ impl Agent for RealtimeAgent {
                             }
 
                             ServerEvent::TranscriptDone { transcript, item_id, .. } => {
+                                let item_id = reply_item_id(item_id, &mut reply_item);
+                                pending_transcript.remove(&item_id);
+                                let transcript = match screen_output(
+                                    #[cfg(feature = "guardrails")]
+                                    output_guardrails.as_deref(),
+                                    transcript,
+                                )
+                                .await
+                                {
+                                    Ok(transcript) => transcript,
+                                    Err(error) => {
+                                        let _ = session.interrupt().await;
+                                        yield Err(error);
+                                        let _ = session.close().await;
+                                        return;
+                                    }
+                                };
                                 let mut transcript_event = Event::with_id(
                                     format!("{invocation_id}:realtime-transcript:{item_id}"),
                                     &invocation_id,
@@ -1070,9 +1339,12 @@ impl Agent for RealtimeAgent {
                                         tool,
                                         &call_id,
                                         &arguments,
-                                        before_tool_callbacks.as_ref(),
-                                        after_tool_callbacks.as_ref(),
-                                        &tool_results,
+                                        &DispatchHooks {
+                                            before_tool_callbacks: before_tool_callbacks.as_ref(),
+                                            after_tool_callbacks: after_tool_callbacks.as_ref(),
+                                            policy: &tool_results,
+                                        },
+                                        None,
                                     )
                                     .await
                                     {
@@ -1133,8 +1405,69 @@ impl Agent for RealtimeAgent {
                                 }
                             }
 
-                            ServerEvent::ResponseDone { .. } => {
-                                // Response complete, continue listening
+                            ServerEvent::ResponseDone { response, .. } => {
+                                // A provider that sends no `TextDone`/`TranscriptDone`
+                                // (Gemini Live) closes its turn here: its text is final now,
+                                // so the final events are yielded, screened, from the deltas.
+                                for (kind, finals) in [("text", &mut pending_text), ("transcript", &mut pending_transcript)] {
+                                    for (item_id, text) in finals.drain() {
+                                        let text = match screen_output(
+                                            #[cfg(feature = "guardrails")]
+                                            output_guardrails.as_deref(),
+                                            text,
+                                        )
+                                        .await
+                                        {
+                                            Ok(text) => text,
+                                            Err(error) => {
+                                                let _ = session.interrupt().await;
+                                                yield Err(error);
+                                                let _ = session.close().await;
+                                                return;
+                                            }
+                                        };
+                                        let mut final_event = Event::with_id(
+                                            format!("{invocation_id}:realtime-{kind}:{item_id}"),
+                                            &invocation_id,
+                                        );
+                                        final_event.author = agent_name.clone();
+                                        if kind == "transcript" {
+                                            final_event.provider_metadata.insert(
+                                                "adk.realtime.transcript".to_string(),
+                                                "output".to_string(),
+                                            );
+                                        }
+                                        final_event.llm_response.content = Some(Content {
+                                            role: "model".to_string(),
+                                            parts: vec![Part::Text { text }],
+                                        });
+                                        yield Ok(final_event);
+                                    }
+                                }
+                                reply_item = None;
+
+                                // The response's usage, metered in the run's spend ledger and
+                                // reported on an event so cost per run is visible.
+                                let usage = match &meter {
+                                    Some(meter) => match meter.end_response(&response).await {
+                                        Ok(usage) => usage,
+                                        Err(e) => {
+                                            yield Err(AdkError::model(e.to_string()));
+                                            let _ = session.close().await;
+                                            return;
+                                        }
+                                    },
+                                    None => RealtimeUsage::from_response(&response).map(|usage| {
+                                        usage.to_usage_metadata(pricing.map(|pricing| pricing.cost_usd(&usage)))
+                                    }),
+                                };
+                                if let Some(usage) = usage {
+                                    let mut usage_event = Event::new(&invocation_id);
+                                    usage_event.author = agent_name.clone();
+                                    usage_event.llm_response.usage_metadata = Some(usage);
+                                    usage_event.llm_response.turn_complete = true;
+                                    yield Ok(usage_event);
+                                }
                             }
 
                             ServerEvent::Error { error, .. } => {
@@ -1156,10 +1489,44 @@ impl Agent for RealtimeAgent {
                         break;
                     }
                     None => {
-                        // Session closed
+                        // A provider that refuses the setup (Gemini Live: 1007 on a response
+                        // modality the model does not support) or fails the session closes the
+                        // socket with a code that says so; a normal close ends the run quietly.
+                        failed_close = session
+                            .disconnect_reason()
+                            .filter(|reason| reason.code.is_some_and(|code| !matches!(code, 1000 | 1001)));
                         break;
                     }
                 }
+            }
+
+            // What the user said last is kept even when the session ended before the model
+            // answered it.
+            for (_, text) in user_transcripts.drain(..) {
+                if !text.trim().is_empty() {
+                    yield Ok(user_turn(&invocation_id, text));
+                }
+            }
+
+            // 1002, 1003, 1007, 1009 and 1010 report something the client sent that the
+            // provider refused, such as a setup the model does not support.
+            if let Some(reason) = failed_close {
+                let refused = reason.code.is_some_and(|code| matches!(code, 1002 | 1003 | 1007 | 1009 | 1010));
+                let (category, guidance) = if refused {
+                    (
+                        adk_core::ErrorCategory::InvalidInput,
+                        "the provider refused the session's setup or a message on it; check the \
+                         model name, modalities, voice and tool schemas against what the model supports",
+                    )
+                } else {
+                    (adk_core::ErrorCategory::Unavailable, "the provider ended the session")
+                };
+                yield Err(AdkError::new(
+                    adk_core::ErrorComponent::Model,
+                    category,
+                    "model.realtime.session_closed",
+                    format!("realtime session closed by the provider ({reason}): {guidance}"),
+                ));
             }
 
             // ===== STOP AVATAR SESSION (cleanup) =====
@@ -1218,6 +1585,25 @@ impl Agent for RealtimeAgent {
     }
 }
 
+/// The item a reply's text is saved under: the provider's item, or for a reply streamed
+/// without one (Gemini Live) an id minted on its first delta and kept until its response ends.
+fn reply_item_id(item_id: String, reply_item: &mut Option<String>) -> String {
+    if !item_id.is_empty() {
+        return item_id;
+    }
+    reply_item.get_or_insert_with(|| format!("reply-{}", uuid::Uuid::new_v4())).clone()
+}
+
+/// The user's spoken turn, saved as the runner saves a user message: authored `user`, in the
+/// run's invocation, marked as an input transcript.
+fn user_turn(invocation_id: &str, text: String) -> Event {
+    let mut event = Event::new(invocation_id);
+    event.author = "user".to_string();
+    event.provider_metadata.insert("adk.realtime.transcript".to_string(), "input".to_string());
+    event.llm_response.content = Some(Content::new("user").with_text(text));
+    event
+}
+
 fn pcm16_mono_wav(pcm: &[u8], sample_rate: u32) -> Vec<u8> {
     let data_len = u32::try_from(pcm.len()).unwrap_or(u32::MAX);
     let mut wav = Vec::with_capacity(44 + pcm.len());
@@ -1246,6 +1632,41 @@ struct ToolResultPolicy {
     screen: Option<Arc<dyn adk_core::ToolResultScreen>>,
     /// Whether tool and callback error messages reach the model.
     expose_error_messages: bool,
+}
+
+/// Screens the model's completed `text` with the output guardrails, as `LlmAgent` screens
+/// final text: a transform rewrites it, a block fails the run with the guardrail's error.
+#[cfg(feature = "guardrails")]
+async fn screen_output(
+    guardrails: Option<&adk_guardrail::GuardrailSet>,
+    text: String,
+) -> Result<String> {
+    use adk_guardrail::{GuardrailExecutor, GuardrailPhase};
+
+    let Some(guardrails) = guardrails else {
+        return Ok(text);
+    };
+    if guardrails.is_empty() || text.trim().is_empty() {
+        return Ok(text);
+    }
+    let content = Content::new("model").with_text(&text);
+    let screening = GuardrailExecutor::enforce(guardrails, &content, GuardrailPhase::Output, false)
+        .await
+        .map_err(AdkError::from)?;
+    Ok(screening.content.parts.iter().filter_map(|part| part.text()).collect())
+}
+
+#[cfg(not(feature = "guardrails"))]
+async fn screen_output(text: String) -> Result<String> {
+    Ok(text)
+}
+
+/// The callbacks and result policy one dispatch runs under.
+#[derive(Clone, Copy)]
+struct DispatchHooks<'a> {
+    before_tool_callbacks: &'a [BeforeToolCallback],
+    after_tool_callbacks: &'a [AfterToolCallback],
+    policy: &'a ToolResultPolicy,
 }
 
 /// What one realtime tool call produced.
@@ -1279,10 +1700,10 @@ async fn dispatch_tool(
     tool: &Arc<dyn Tool>,
     call_id: &str,
     arguments: &str,
-    before_tool_callbacks: &[BeforeToolCallback],
-    after_tool_callbacks: &[AfterToolCallback],
-    policy: &ToolResultPolicy,
+    hooks: &DispatchHooks<'_>,
+    resumes: Option<adk_core::ToolConfirmationRequest>,
 ) -> Result<ToolDispatch> {
+    let DispatchHooks { before_tool_callbacks, after_tool_callbacks, policy } = *hooks;
     let name = tool.name().to_string();
     let args = match crate::runner::parse_tool_arguments(arguments) {
         Ok(args) => args,
@@ -1375,8 +1796,11 @@ async fn dispatch_tool(
         Some(result) => result,
         None => {
             let gate = adk_core::ToolGate::for_context(ctx.as_ref());
-            let call = adk_core::GovernedCall::for_tool(tool.as_ref(), call_id, args)
+            let mut call = adk_core::GovernedCall::for_tool(tool.as_ref(), call_id, args)
                 .requiring_confirmation(ctx.requires_tool_confirmation(&name));
+            if let Some(held) = resumes {
+                call = call.resuming(held);
+            }
             match adk_core::authorize_tool_call(&gate, call).await? {
                 adk_core::ToolAuthorization::Execute { args, confirmation: decision } => {
                     confirmation = decision;
@@ -1407,6 +1831,28 @@ async fn dispatch_tool(
             }
         }
     };
+
+    // An agent tool whose delegate held a call of its own holds this call with it: the
+    // run surfaces the delegate's request, and this call resumes once that request has a
+    // decision (spec 3.1 §10 F4), as `LlmAgent` does.
+    if executed && held.is_none() {
+        let mut actions = tool_ctx.actions();
+        if let Some(mut request) = actions.tool_confirmation.take() {
+            actions.skip_summarization = false;
+            actions.escalate = false;
+            tool_ctx.set_actions(actions);
+            // The request describes the delegate's call; its ID is this call's, so the
+            // hold resumes as the agent-tool call (`held_tool_calls`).
+            request.function_call_id = Some(call_id.to_string());
+            held = Some(request);
+            run_after_tool_callbacks = false;
+            if !adk_core::is_confirmation_pending(&result) {
+                result = adk_core::confirmation_pending_response(format!(
+                    "Tool '{name}' is waiting for a confirmation"
+                ));
+            }
+        }
+    }
 
     if run_after_tool_callbacks {
         let mut failed: Option<AdkError> = None;
@@ -1684,11 +2130,110 @@ mod tool_safety_tests {
             session: TestSession,
             shared: Arc::new(SharedState::new()),
         }) as Arc<dyn InvocationContext>;
-        dispatch_tool(&ctx, tool, "call-1", arguments, &before, &after, policy).await
+        let hooks =
+            DispatchHooks { before_tool_callbacks: &before, after_tool_callbacks: &after, policy };
+        dispatch_tool(&ctx, tool, "call-1", arguments, &hooks, None).await
     }
 
     fn counting(executions: &Arc<AtomicUsize>) -> Arc<dyn Tool> {
         Arc::new(CountingTool { executions: Arc::clone(executions) })
+    }
+
+    /// A tool whose delegate held a call: it surfaces the delegate's request through the
+    /// context's actions, as `AgentTool` does when its agent holds a call.
+    struct DelegatingTool;
+
+    #[async_trait]
+    impl Tool for DelegatingTool {
+        fn name(&self) -> &str {
+            "reviewer"
+        }
+        fn description(&self) -> &str {
+            "delegates"
+        }
+        async fn execute(
+            &self,
+            ctx: Arc<dyn ToolContext>,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            let request =
+                adk_core::ToolConfirmationRequest::new("write_file", serde_json::json!({ "p": 1 }))
+                    .with_function_call_id("inner-1");
+            ctx.set_actions(EventActions {
+                tool_confirmation: Some(request),
+                ..Default::default()
+            });
+            Ok(adk_core::confirmation_pending_response("the reviewer is waiting"))
+        }
+    }
+
+    /// ROADMAP "realtime runners ignore an `AgentTool` delegate's hold": on `main` the
+    /// agent-tool call was treated as finished and the delegate's request was dropped.
+    #[tokio::test]
+    async fn a_delegates_hold_holds_the_agent_tool_call() {
+        let tool: Arc<dyn Tool> = Arc::new(DelegatingTool);
+        let config = RunConfig::builder()
+            .tool_policy(Arc::new(adk_core::DeclarativePolicy::builder().allow("reviewer").build()))
+            .build();
+        let outcome = dispatch_with(config, &tool, "{}", vec![], vec![]).await.unwrap();
+        let held = outcome.held.expect("the delegate's request holds this call");
+        assert_eq!(held.tool_name, "write_file", "the request is the delegate's");
+        assert_eq!(held.function_call_id.as_deref(), Some("call-1"), "under this call's ID");
+        assert!(adk_core::is_confirmation_pending(&outcome.result), "{}", outcome.result);
+        assert!(outcome.actions.tool_confirmation.is_none(), "the request is carried as the hold");
+        assert!(!outcome.actions.escalate && !outcome.actions.skip_summarization);
+    }
+
+    /// A held call resumes under its decision: the request it resumes is the decision's key.
+    #[tokio::test]
+    async fn a_resumed_call_runs_under_its_recorded_decision() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tool = counting(&executions);
+        let policy = adk_core::DeclarativePolicy::builder()
+            .require_approval("counting", "needs a person")
+            .build();
+        let held = {
+            let config = RunConfig::builder().tool_policy(Arc::new(policy.clone())).build();
+            let outcome = dispatch_with(config, &tool, "{}", vec![], vec![]).await.unwrap();
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+            outcome.held.expect("held without a decision")
+        };
+        let config = RunConfig::builder()
+            .tool_policy(Arc::new(policy))
+            .tool_approval(held.fingerprint(), adk_core::ToolApproval::approve())
+            .build();
+        let ctx = Arc::new(CapableParent {
+            content: Content::new("user"),
+            config,
+            session: TestSession,
+            shared: Arc::new(SharedState::new()),
+        }) as Arc<dyn InvocationContext>;
+        let policy = ToolResultPolicy {
+            timeout: std::time::Duration::from_millis(50),
+            screen: None,
+            expose_error_messages: false,
+        };
+        let hooks = DispatchHooks {
+            before_tool_callbacks: &[],
+            after_tool_callbacks: &[],
+            policy: &policy,
+        };
+        let outcome = dispatch_tool(&ctx, &tool, "call-1", "{}", &hooks, Some(held)).await.unwrap();
+        assert!(outcome.held.is_none(), "the decision resumed the call");
+        assert_eq!(outcome.result, serde_json::json!({ "ran": true }));
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+    }
+
+    /// ROADMAP "No content guardrails on the model's own text or transcript events".
+    #[cfg(feature = "guardrails")]
+    #[tokio::test]
+    async fn final_text_is_screened_by_the_output_guardrails() {
+        use adk_guardrail::{GuardrailSet, PiiRedactor};
+        let set = GuardrailSet::new().with(PiiRedactor::new());
+        let text = screen_output(Some(&set), "Mail ana@example.com".to_string()).await.unwrap();
+        assert_eq!(text, "Mail [EMAIL REDACTED]");
+        let unchanged = screen_output(None, "Mail ana@example.com".to_string()).await.unwrap();
+        assert_eq!(unchanged, "Mail ana@example.com");
     }
 
     #[tokio::test]
