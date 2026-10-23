@@ -1,1 +1,0 @@
-- **adk-sandbox**: let restricted-token commands start Windows child processes while keeping owner-only private files inaccessible. Separate public runtime reads from scoped write checks, and keep read-only grants and ACL ownership from authorizing writes.
