@@ -147,7 +147,11 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$SUITE" == kernel ]]; then
-            CI=true devenv shell cargo nextest run --locked -p adk-kernel --features drivers,sqlite --test driver_ledger_property_tests --test driver_park_restart --no-fail-fast
+            CI=true devenv shell cargo fmt --all -- --check
+            python3 scripts/changelog-assemble.py --check
+            CI=true devenv shell cargo clippy --locked -p adk-kernel --features drivers,sqlite --lib --no-deps -- -D warnings
+            CI=true devenv shell cargo nextest run --locked -p adk-kernel --features drivers,sqlite --lib -E 'test(drivers::launch::tests::)' --no-fail-fast
+            CI=true ADK_SANDBOX_REQUIRE_ENFORCER=1 devenv shell cargo nextest run --locked -p adk-kernel --features drivers,sqlite --test driver_ledger_property_tests --test driver_park_restart --test driver_sandbox_tests --no-fail-fast
           else
             CI=true devenv shell cargo nextest run --locked -p adk-agent --features team-tools --lib -E 'test(team::tests::)' --no-fail-fast
           fi
