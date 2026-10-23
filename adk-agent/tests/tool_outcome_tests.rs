@@ -9,10 +9,11 @@
 
 use adk_agent::LlmAgentBuilder;
 use adk_core::{
-    ActionLedger, ActionOutcome, AdkError, Content, ErrorCategory, ErrorComponent, Event,
-    InMemoryActionLedger, Llm, LlmRequest, LlmResponse, LlmResponseStream, Part,
-    RESULT_WITHHELD_STATUS, Result, RunConfig, SessionId, TOOL_ERROR_MESSAGE_LIMIT,
-    TOOL_INVALID_ARGUMENTS_CODE, Tool, ToolContext, ToolEffect, UserId,
+    ActionLedger, ActionOutcome, AdkError, BackpressurePolicy, Content, ErrorCategory,
+    ErrorComponent, Event, InMemoryActionLedger, Llm, LlmRequest, LlmResponse, LlmResponseStream,
+    Part, RESULT_WITHHELD_STATUS, Result, RunConfig, SessionId, TOOL_ERROR_MESSAGE_LIMIT,
+    TOOL_INVALID_ARGUMENTS_CODE, Tool, ToolConcurrencyConfig, ToolContext, ToolEffect,
+    ToolResultStatus, UserId,
 };
 use adk_plugin::{Plugin, PluginConfig, PluginManager};
 use adk_runner::Runner;
@@ -159,6 +160,22 @@ impl Run {
                 _ => None,
             })
             .expect("call-1 is answered")
+    }
+
+    fn failed_answer(&self) -> Value {
+        assert_eq!(self.status(), Some(ToolResultStatus::Failed));
+        self.answer()
+    }
+
+    fn status(&self) -> Option<ToolResultStatus> {
+        self.session_events
+            .iter()
+            .filter_map(|event| event.llm_response.content.as_ref())
+            .flat_map(|content| &content.parts)
+            .find(
+                |part| matches!(part, Part::FunctionResponse {id: Some(id), ..} if id == "call-1"),
+            )
+            .and_then(Part::tool_result_status)
     }
 
     fn invocation_id(&self) -> String {
@@ -308,7 +325,7 @@ async fn a_failed_after_tool_stage_withholds_the_result_and_says_the_call_ran() 
 
         assert!(outcome.error.is_none(), "{stage:?}: {:?}", outcome.error);
         assert_eq!(runs.load(Ordering::SeqCst), 1, "{stage:?}");
-        let answer = outcome.answer();
+        let answer = outcome.failed_answer();
         assert_eq!(
             answer,
             adk_core::result_withheld_response("charge_card", &audit_error(), false),
@@ -350,7 +367,7 @@ async fn a_failed_after_tool_stage_ends_the_pipeline() {
         .unwrap();
     let outcome = run(agent, None, RunConfig::default()).await;
     assert_eq!(later.load(Ordering::SeqCst), 0);
-    assert_eq!(outcome.answer()["status"], RESULT_WITHHELD_STATUS);
+    assert_eq!(outcome.failed_answer()["status"], RESULT_WITHHELD_STATUS);
 }
 
 #[tokio::test]
@@ -366,7 +383,7 @@ async fn exposing_error_messages_puts_the_callback_message_in_the_withheld_answe
         .unwrap();
     let outcome = run(agent, None, RunConfig::default()).await;
     assert_eq!(
-        outcome.answer(),
+        outcome.failed_answer(),
         adk_core::result_withheld_response("charge_card", &audit_error(), true)
     );
 }
@@ -401,7 +418,7 @@ async fn a_tool_error_message_stays_out_of_the_model_request_and_the_session() {
 
     assert_eq!(runs.load(Ordering::SeqCst), 1);
     assert_eq!(
-        outcome.answer(),
+        outcome.failed_answer(),
         json!({"error": "tool 'lookup_order' failed: tool.unavailable (tool.orders_db.unavailable)"})
     );
     let sent = serde_json::to_string(&model.requests()[1].contents).unwrap();
@@ -480,7 +497,7 @@ async fn exposing_error_messages_sends_the_tool_error_message() {
         .build()
         .unwrap();
     let outcome = run(agent, None, RunConfig::default()).await;
-    assert_eq!(outcome.answer(), json!({"error": "tool.not_found: no ORD-7"}));
+    assert_eq!(outcome.failed_answer(), json!({"error": "tool.not_found: no ORD-7"}));
 }
 
 #[tokio::test]
@@ -532,7 +549,7 @@ async fn an_invalid_arguments_error_keeps_its_message() {
     );
     let agent = LlmAgentBuilder::new("support").model(model).tool(Arc::new(tool)).build().unwrap();
     let outcome = run(agent, None, RunConfig::default()).await;
-    assert_eq!(outcome.answer(), json!({"error": "tool.invalid_input: missing field `id`"}));
+    assert_eq!(outcome.failed_answer(), json!({"error": "tool.invalid_input: missing field `id`"}));
 }
 
 #[tokio::test]
@@ -548,7 +565,7 @@ async fn a_before_tool_callback_error_message_stays_local() {
     let outcome = run(agent, None, RunConfig::default()).await;
     assert_eq!(runs.load(Ordering::SeqCst), 0);
     assert_eq!(
-        outcome.answer(),
+        outcome.failed_answer(),
         json!({"error": "tool 'lookup_order' was not run: a before-tool callback failed with agent.unavailable (audit.sink_unavailable)"})
     );
 }
@@ -590,7 +607,32 @@ async fn a_sub_second_timeout_is_reported_in_milliseconds() {
         .build()
         .unwrap();
     let outcome = run(agent, None, RunConfig::default()).await;
-    assert_eq!(outcome.answer(), json!({"error": "Tool 'slow_report' timed out after 50ms"}));
+    assert_eq!(
+        outcome.failed_answer(),
+        json!({"error": "Tool 'slow_report' timed out after 50ms"})
+    );
+}
+
+#[tokio::test]
+async fn interrupted_effects_keep_unknown_outcomes() {
+    let model = ScriptedModel::new(vec![call("charge_card", json!({}))]);
+    let (mut tool, runs) = CountingTool::ok("charge_card", json!({"charged":true}));
+    tool.delay = Some(Duration::from_secs(5));
+    let agent = LlmAgentBuilder::new("payments")
+        .model(model)
+        .tool(Arc::new(tool))
+        .tool_timeout(Duration::from_millis(50))
+        .build()
+        .unwrap();
+    let outcome = run(agent, None, RunConfig::default()).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.status(), Some(ToolResultStatus::OutcomeUnknown));
+    assert_eq!(
+        outcome.answer(),
+        adk_core::outcome_unknown_response(
+            "Tool 'charge_card' timed out after 50ms. The call may have taken effect; check its result before calling it again."
+        )
+    );
 }
 
 #[tokio::test]
@@ -606,7 +648,7 @@ async fn a_call_with_undecodable_arguments_is_answered_without_executing() {
 
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
     assert_eq!(runs.load(Ordering::SeqCst), 0);
-    let answer = outcome.answer()["error"].as_str().unwrap().to_string();
+    let answer = outcome.failed_answer()["error"].as_str().unwrap().to_string();
     assert!(answer.starts_with("tool 'get_weather' was not run: arguments are not valid JSON"));
     // The run continues: the model is asked again with the call answered.
     assert_eq!(model.requests().len(), 2);
@@ -649,4 +691,176 @@ async fn a_scope_guard_denial_reaches_the_model_as_a_denial_naming_the_scope() {
                       required scopes: [finance:write] (tool requires: [finance:write])"
         })
     );
+}
+
+#[tokio::test]
+async fn successful_business_errors_stay_unchanged() {
+    let result = json!({"isError":true, "error":"business value", "status":"available"});
+    let model = ScriptedModel::new(vec![call("lookup_order", json!({}))]);
+    let (tool, runs) = CountingTool::ok("lookup_order", result.clone());
+    let agent =
+        LlmAgentBuilder::new("support").model(model.clone()).tool(Arc::new(tool)).build().unwrap();
+    let outcome = run(agent, None, RunConfig::default()).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(outcome.status(), None);
+    assert_eq!(outcome.answer(), result);
+    let responses: Vec<_> = model.requests()[1]
+        .contents
+        .iter()
+        .flat_map(|content| &content.parts)
+        .filter_map(|part| match part {
+            Part::FunctionResponse { function_response, .. } => {
+                Some(function_response.response.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(responses, vec![result]);
+}
+
+#[tokio::test]
+async fn successful_callback_payloads_stay_unchanged() {
+    let value = json!({"isError": true, "error": "domain row"});
+    for stage in ["before", "after", "error"] {
+        let model = ScriptedModel::new(vec![call("lookup_order", json!({}))]);
+        let (tool, runs) = if stage == "error" {
+            CountingTool::failing(
+                "lookup_order",
+                ErrorCategory::Unavailable,
+                "tool.unavailable",
+                "offline",
+            )
+        } else {
+            CountingTool::ok("lookup_order", json!({"original": true}))
+        };
+        let mut builder = LlmAgentBuilder::new("support").model(model.clone()).tool(Arc::new(tool));
+        let result = value.clone();
+        builder = match stage {
+            "before" => builder.before_tool_callback(Box::new(move |_| {
+                let result = result.clone();
+                Box::pin(async move {
+                    Ok(Some(Content {
+                        role: "function".to_string(),
+                        parts: vec![Part::FunctionResponse {
+                            function_response: adk_core::FunctionResponseData::new(
+                                "cached", result,
+                            ),
+                            id: None,
+                            annotations: None,
+                        }],
+                    }))
+                })
+            })),
+            "after" => builder.after_tool_callback_full(Box::new(move |_, _, _, _| {
+                let result = result.clone();
+                Box::pin(async move { Ok(Some(result)) })
+            })),
+            _ => builder.on_tool_error(Box::new(move |_, _, _, _| {
+                let result = result.clone();
+                Box::pin(async move { Ok(Some(result)) })
+            })),
+        };
+        let outcome = run(builder.build().unwrap(), None, RunConfig::default()).await;
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(runs.load(Ordering::SeqCst), usize::from(stage != "before"));
+        assert_eq!(outcome.answer(), value);
+        assert_eq!(outcome.status(), None);
+        let requests = model.requests();
+        let request = &requests[1];
+        let sent: Vec<_> = request
+            .contents
+            .iter()
+            .flat_map(|content| &content.parts)
+            .filter_map(|part| {
+                if let Part::FunctionResponse { function_response, .. } = part {
+                    Some(function_response.response.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(sent, vec![value.clone()]);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_keeps_its_distinct_status() {
+    fn cancelled() -> AdkError {
+        AdkError::new(ErrorComponent::Tool, ErrorCategory::Cancelled, "tool.cancelled", "stopped")
+    }
+    for stage in ["before", "execute", "after"] {
+        let model = ScriptedModel::new(vec![call("lookup_order", json!({}))]);
+        let (tool, runs) = if stage == "execute" {
+            CountingTool::failing(
+                "lookup_order",
+                ErrorCategory::Cancelled,
+                "tool.cancelled",
+                "stopped",
+            )
+        } else {
+            CountingTool::ok("lookup_order", json!({"row": 1}))
+        };
+        let mut builder = LlmAgentBuilder::new("support").model(model).tool(Arc::new(tool));
+        if stage == "before" {
+            builder =
+                builder.before_tool_callback(Box::new(|_| Box::pin(async { Err(cancelled()) })));
+        } else if stage == "after" {
+            builder =
+                builder.after_tool_callback(Box::new(|_| Box::pin(async { Err(cancelled()) })));
+        }
+        let outcome = run(builder.build().unwrap(), None, RunConfig::default()).await;
+        assert_eq!(runs.load(Ordering::SeqCst), usize::from(stage != "before"));
+        assert_eq!(outcome.status(), Some(ToolResultStatus::Cancelled));
+        let expected = match stage {
+            "before" => {
+                json!({"error": "tool 'lookup_order' was not run: a before-tool callback failed with tool.cancelled (tool.cancelled)"})
+            }
+            "after" => adk_core::result_withheld_response("lookup_order", &cancelled(), false),
+            _ => adk_core::tool_error_response("lookup_order", &cancelled(), false),
+        };
+        assert_eq!(outcome.answer(), expected);
+    }
+}
+
+#[tokio::test]
+async fn runner_hook_errors_skip_execution() {
+    let model = ScriptedModel::new(vec![call("lookup_order", json!({}))]);
+    let (tool, runs) = CountingTool::ok("lookup_order", json!({}));
+    let agent = LlmAgentBuilder::new("support").model(model).tool(Arc::new(tool)).build().unwrap();
+    let plugin = Plugin::new(PluginConfig {
+        name: "audit".into(),
+        before_tool: Some(Box::new(|_| Box::pin(async { Err(audit_error()) }))),
+        ..Default::default()
+    });
+    let outcome = run(agent, Some(plugin), RunConfig::default()).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        outcome.failed_answer(),
+        json!({"error": "tool 'lookup_order' was not run: a before-tool callback failed with agent.unavailable (audit.sink_unavailable)"})
+    );
+}
+
+#[tokio::test]
+async fn missing_tools_are_explicit_failures() {
+    let model = ScriptedModel::new(vec![call("missing", json!({}))]);
+    let agent = LlmAgentBuilder::new("support").model(model).build().unwrap();
+    let outcome = run(agent, None, RunConfig::default()).await;
+    assert_eq!(outcome.failed_answer(), json!({"error": "Tool missing not found"}));
+}
+
+#[tokio::test]
+async fn concurrency_rejections_skip_execution() {
+    let model = ScriptedModel::new(vec![call("lookup_order", json!({}))]);
+    let (tool, runs) = CountingTool::ok("lookup_order", json!({}));
+    let agent = LlmAgentBuilder::new("support").model(model).tool(Arc::new(tool)).build().unwrap();
+    let config = RunConfig::builder()
+        .tool_concurrency(ToolConcurrencyConfig {
+            max_concurrency: Some(0),
+            backpressure: BackpressurePolicy::Fail,
+            ..Default::default()
+        })
+        .build();
+    let outcome = run(agent, None, config).await;
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert!(outcome.failed_answer()["error"].as_str().unwrap().contains("concurrency limit"));
 }

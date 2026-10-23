@@ -205,6 +205,35 @@ impl EmbeddedResource {
     }
 }
 
+/// Annotation key carrying an execution status reported by the tool dispatcher.
+pub const TOOL_RESULT_STATUS_KEY: &str = "adk.tool_result.status";
+
+/// A non-success tool-result status reported outside the tool's response payload.
+///
+/// These are execution facts, not interpretations of application-owned JSON. A
+/// successful tool or callback may return fields named `isError` or `error` without
+/// setting this annotation. An absent status does not imply a framework failure.
+///
+/// # Example
+///
+/// ```rust
+/// use adk_core::ToolResultStatus;
+///
+/// assert_ne!(ToolResultStatus::Failed, ToolResultStatus::OutcomeUnknown);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultStatus {
+    /// The call or its result pipeline failed with a known outcome.
+    Failed,
+    /// The call was cancelled rather than completed with a tool failure.
+    Cancelled,
+    /// The call may have taken effect, so repeating it is unsafe.
+    OutcomeUnknown,
+    /// The call is held for an approval decision and has not failed.
+    Pending,
+}
+
 /// Data for a function (tool) response, including optional multimodal parts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionResponseData {
@@ -723,6 +752,37 @@ impl Part {
             Part::InlineData { annotations, .. }
             | Part::FileData { annotations, .. }
             | Part::FunctionResponse { annotations, .. } => annotations.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Returns an explicit execution status attached to a function response.
+    ///
+    /// The response payload is never inspected. Other part types and unrecognized
+    /// annotations return `None`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_core::{FunctionResponseData, Part, TOOL_RESULT_STATUS_KEY, ToolResultStatus};
+    /// use serde_json::json;
+    ///
+    /// let part = Part::FunctionResponse {
+    ///     function_response: FunctionResponseData::new("lookup", json!({"error": "unavailable"})),
+    ///     id: Some("call-1".to_string()),
+    ///     annotations: Some(json!({TOOL_RESULT_STATUS_KEY: "failed"})),
+    /// };
+    /// assert_eq!(part.tool_result_status(), Some(ToolResultStatus::Failed));
+    /// ```
+    pub fn tool_result_status(&self) -> Option<ToolResultStatus> {
+        let Self::FunctionResponse { annotations: Some(annotations), .. } = self else {
+            return None;
+        };
+        match annotations.get(TOOL_RESULT_STATUS_KEY)?.as_str()? {
+            "failed" => Some(ToolResultStatus::Failed),
+            "cancelled" => Some(ToolResultStatus::Cancelled),
+            "outcome_unknown" => Some(ToolResultStatus::OutcomeUnknown),
+            "pending" => Some(ToolResultStatus::Pending),
             _ => None,
         }
     }
@@ -1317,5 +1377,59 @@ mod tests {
         let frd = FunctionResponseData::from_tool_result("tool", value);
         assert_eq!(frd.inline_data.len(), 1);
         assert_eq!(frd.response, serde_json::json!({"status": "ok"}));
+    }
+
+    mod tool_status {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn preserves_payload_during_roundtrip() {
+            let response = json!({"isError": true, "error": "domain row"});
+            for (encoded, status) in [
+                ("failed", ToolResultStatus::Failed),
+                ("cancelled", ToolResultStatus::Cancelled),
+                ("outcome_unknown", ToolResultStatus::OutcomeUnknown),
+                ("pending", ToolResultStatus::Pending),
+            ] {
+                let part = Part::FunctionResponse {
+                    function_response: FunctionResponseData::new("lookup", response.clone()),
+                    id: Some("call-1".to_string()),
+                    annotations: Some(json!({TOOL_RESULT_STATUS_KEY: encoded})),
+                };
+                let decoded: Part =
+                    serde_json::from_value(serde_json::to_value(&part).unwrap()).unwrap();
+                assert_eq!(decoded, part);
+                assert_eq!(decoded.tool_result_status(), Some(status));
+                let Part::FunctionResponse { function_response, .. } = decoded else {
+                    unreachable!()
+                };
+                assert_eq!(function_response.response, response);
+            }
+        }
+
+        #[test]
+        fn ignores_business_fields_and_other_parts() {
+            let response =
+                json!({"isError": true, "error": "domain row", TOOL_RESULT_STATUS_KEY: "failed"});
+            for annotations in [
+                None,
+                Some(json!({"isError": true})),
+                Some(json!({TOOL_RESULT_STATUS_KEY: "unknown"})),
+            ] {
+                let part = Part::FunctionResponse {
+                    function_response: FunctionResponseData::new("lookup", response.clone()),
+                    id: None,
+                    annotations,
+                };
+                assert_eq!(part.tool_result_status(), None);
+            }
+            let part = Part::FileData {
+                mime_type: "text/plain".to_string(),
+                file_uri: "https://example.test/document".to_string(),
+                annotations: Some(json!({TOOL_RESULT_STATUS_KEY: "failed"})),
+            };
+            assert_eq!(part.tool_result_status(), None);
+        }
     }
 }
