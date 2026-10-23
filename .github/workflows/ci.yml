@@ -1,4 +1,4 @@
-name: Windows enforcer diagnostics
+name: Enforcer diagnostics
 
 on:
   workflow_dispatch:
@@ -7,6 +7,15 @@ on:
         description: Revision to check out
         required: false
         type: string
+      linux_suite:
+        description: Run a scoped Linux suite under the PR Nix environment
+        required: false
+        type: choice
+        default: none
+        options:
+          - none
+          - kernel
+          - team
       changelog_only:
         description: Validate UTF-8 fragments without rebuilding unchanged Rust inputs
         required: false
@@ -44,7 +53,7 @@ jobs:
       - name: Validate UTF-8 changelog fragments
         run: python -X utf8 scripts/changelog-assemble.py --check
   windows-enforcer:
-    if: ${{ !inputs.changelog_only }}
+    if: ${{ !inputs.changelog_only && inputs.linux_suite == 'none' }}
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -110,3 +119,52 @@ jobs:
           Import-Csv $csv | Where-Object {
             $_.'Process Name' -in @('windows-peer.exe', 'cmd.exe', 'localcmd.exe') -and $_.Result -ne 'SUCCESS'
           } | Select-Object -Last 100 'Time of Day', 'Process Name', PID, Operation, Path, Result, Detail | Format-List
+
+  nix-runtime:
+    if: inputs.linux_suite != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 2
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+      - name: Record the source revision
+        run: git rev-parse HEAD
+      - uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866
+        with:
+          name: devenv
+      - run: nix profile install nixpkgs#devenv
+      - name: Run the scoped tests
+        env:
+          SUITE: ${{ inputs.linux_suite }}
+        run: |
+          set -euo pipefail
+          if [[ "$SUITE" == kernel ]]; then
+            CI=true devenv shell cargo nextest run --locked -p adk-kernel --features drivers,sqlite --test driver_ledger_property_tests --test driver_park_restart --no-fail-fast
+          else
+            CI=true devenv shell cargo nextest run --locked -p adk-agent --features team-tools --lib -E 'test(team::tests::)' --no-fail-fast
+          fi
+      - name: Record executable interpreters
+        if: always()
+        run: |
+          python3 - <<'PYTHON'
+          import pathlib, subprocess
+          for path in pathlib.Path('target/debug/deps').glob('driver_*'):
+              if path.suffix or not path.is_file():
+                  continue
+              with path.open('rb') as stream:
+                  if stream.read(4) != b'\x7fELF':
+                      continue
+              print(path, flush=True)
+              result = subprocess.run(['/usr/bin/readelf', '-l', str(path)], capture_output=True, text=True)
+              for line in result.stdout.splitlines():
+                  if 'interpreter' in line:
+                      print(line)
+          PYTHON
