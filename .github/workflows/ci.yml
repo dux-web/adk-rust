@@ -7,6 +7,11 @@ on:
         description: Revision to check out
         required: false
         type: string
+      trace:
+        description: Capture the native child failure with Process Monitor
+        required: false
+        type: boolean
+        default: false
       test_target:
         description: Sandbox integration test target
         type: choice
@@ -35,7 +40,43 @@ jobs:
         run: |
           rustc --edition=2024 -C target-feature=+crt-static adk-sandbox/tests/support/windows_peer.rs -o windows-peer.exe
           "ADK_WINDOWS_PROBE_EXE=$((Resolve-Path windows-peer.exe).Path)" >> $env:GITHUB_ENV
+      - name: Prepare a short native child trace
+        if: inputs.trace
+        run: |
+          cargo test --locked -p adk-sandbox --features sandbox-windows --test windows_spawn_diagnostics --no-run
+          $tool = Join-Path $env:RUNNER_TEMP 'Procmon64.exe'
+          Invoke-WebRequest 'https://live.sysinternals.com/Procmon64.exe' -OutFile $tool
+          $signature = Get-AuthenticodeSignature $tool
+          $signature | Select-Object Status, @{Name='Signer';Expression={$_.SignerCertificate.Subject}}
+          if ($signature.Status -ne 'Valid') { throw 'The diagnostic tool signature is invalid' }
+          Get-FileHash $tool -Algorithm SHA256
+          $trace = Join-Path $env:RUNNER_TEMP 'restricted-spawn.pml'
+          $capture = Start-Process $tool -ArgumentList @('-accepteula', '-backingfile', $trace, '-quiet', '-minimized') -PassThru
+          "ADK_PROCMON_PID=$($capture.Id)" >> $env:GITHUB_ENV
+          Start-Sleep -Seconds 3
       - name: Run the selected Windows enforcer tests
         env:
           TEST_TARGET: ${{ inputs.test_target }}
-        run: cargo test --locked -p adk-sandbox --features sandbox-windows --test "$env:TEST_TARGET" -- --nocapture
+          TRACE: ${{ inputs.trace }}
+        run: |
+          if ($env:TRACE -eq 'true') {
+            cargo test --locked -p adk-sandbox --features sandbox-windows --test "$env:TEST_TARGET" native_child_launch -- --nocapture
+          } else {
+            cargo test --locked -p adk-sandbox --features sandbox-windows --test "$env:TEST_TARGET" -- --nocapture
+          }
+      - name: Stop the capture and print relevant denied operations
+        if: always() && inputs.trace
+        run: |
+          $tool = Join-Path $env:RUNNER_TEMP 'Procmon64.exe'
+          & $tool -terminate -quiet
+          if ($env:ADK_PROCMON_PID) {
+            Wait-Process -Id $env:ADK_PROCMON_PID -Timeout 30 -ErrorAction SilentlyContinue
+          }
+          $trace = Join-Path $env:RUNNER_TEMP 'restricted-spawn.pml'
+          $csv = Join-Path $env:RUNNER_TEMP 'restricted-spawn.csv'
+          $export = Start-Process $tool -ArgumentList @('-openlog', $trace, '-saveas', $csv, '-quiet') -PassThru
+          if (-not $export.WaitForExit(60000)) { $export.Kill(); throw 'Trace export timed out' }
+          Get-Item $trace, $csv | Select-Object Name, Length
+          Import-Csv $csv | Where-Object {
+            $_.'Process Name' -in @('windows-peer.exe', 'cmd.exe', 'localcmd.exe') -and $_.Result -ne 'SUCCESS'
+          } | Select-Object -Last 100 'Time of Day', 'Process Name', PID, Operation, Path, Result, Detail | Format-List
