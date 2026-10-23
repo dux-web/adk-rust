@@ -8,6 +8,7 @@ pub mod interactions_convert;
 pub mod interactions_target;
 /// Streaming response handling for Gemini.
 pub mod streaming;
+mod transport;
 
 pub use crate::retry::RetryConfig;
 pub use client::{GeminiModel, vertex_env_requested};

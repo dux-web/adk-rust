@@ -98,6 +98,29 @@ const CODE_INSECURE_HTTP_OPT_IN: &str =
 const ENV_INSECURE_HTTP_OPT_IN: &str =
     "set ANTHROPIC_ALLOW_INSECURE_HTTP=1 alongside ANTHROPIC_BASE_URL";
 
+/// Optional raw generation request executor, called after serialization and headers.
+///
+/// Non-generation API calls do not use this hook. The executor owns HTTP sends
+/// only; response parsing and streaming remain with the SDK.
+pub type GenerationExecutor = Arc<
+    dyn Fn(ReqwestClient, reqwest::Request) -> futures::future::BoxFuture<'static, Result<Response>>
+        + Send
+        + Sync,
+>;
+
+/// Generation executor receiving the current per-send response-header timeout.
+///
+/// The timeout applies to each send, excluding retry backoff and response bodies.
+pub type TimedGenerationExecutor = Arc<
+    dyn Fn(
+            ReqwestClient,
+            reqwest::Request,
+            Duration,
+        ) -> futures::future::BoxFuture<'static, Result<Response>>
+        + Send
+        + Sync,
+>;
+
 /// Client for the Anthropic API with performance optimizations.
 ///
 /// # Timeouts
@@ -121,6 +144,7 @@ pub struct Anthropic {
     stream_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     max_retries: usize,
+    generation_executor: Option<TimedGenerationExecutor>,
     throughput_ops_sec: f64,
     reserve_capacity: f64,
     /// Cached headers for performance - Arc for cheap cloning
@@ -176,6 +200,7 @@ impl Anthropic {
                 connect_timeout.min(MAX_CONNECT_TIMEOUT)
             })
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .pool_max_idle_per_host(10) // Connection pooling optimization
             .pool_idle_timeout(Duration::from_secs(90))
             .tcp_keepalive(Duration::from_secs(60));
@@ -352,6 +377,7 @@ impl Anthropic {
             reserve_capacity: 1.0 / 60.0,
             cached_headers,
             allow_insecure_http: false,
+            generation_executor: None,
         })
     }
 
@@ -751,6 +777,39 @@ impl Anthropic {
         format!("{}/v1/{}", base, endpoint)
     }
 
+    /// Install an optional raw executor for generation requests.
+    ///
+    /// Callers providing request retries should also disable `with_max_retries`
+    /// to avoid nesting the SDK response-level retry policy.
+    pub fn with_generation_executor(mut self, executor: GenerationExecutor) -> Self {
+        self.generation_executor =
+            Some(Arc::new(move |client, request, _| executor(client, request)));
+        self
+    }
+
+    /// Installs a generation executor with the current per-send header deadline.
+    ///
+    /// Unlike a timer around the executor, this lets retries wait their full
+    /// backoff while bounding each individual send. Parsing stays with this SDK.
+    pub fn with_timed_generation_executor(mut self, executor: TimedGenerationExecutor) -> Self {
+        self.generation_executor = Some(executor);
+        self
+    }
+
+    async fn execute_generation(
+        &self,
+        client: &ReqwestClient,
+        builder: reqwest::RequestBuilder,
+    ) -> Result<Response> {
+        let request = builder.build().map_err(|error| self.map_request_error(error))?;
+        if request.url().path().ends_with("/messages")
+            && let Some(executor) = &self.generation_executor
+        {
+            return executor(client.clone(), request, self.timeout).await;
+        }
+        client.execute(request).await.map_err(|error| self.map_request_error(error))
+    }
+
     /// Retry wrapper that implements exponential backoff with header-based retry-after
     async fn retry_with_backoff<F, Fut, T>(&self, operation: F) -> Result<T>
     where
@@ -908,13 +967,8 @@ impl Anthropic {
         let headers = headers.unwrap_or_else(|| self.default_headers());
 
         let response = self
-            .client
-            .post(url)
-            .headers(headers)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| self.map_request_error(e))?;
+            .execute_generation(&self.client, self.client.post(url).headers(headers).json(body))
+            .await?;
 
         if !response.status().is_success() {
             return Err(Self::process_error_response(response).await);
@@ -945,7 +999,15 @@ impl Anthropic {
             request = request.timeout(stream_timeout);
         }
 
-        let response = tokio::time::timeout(self.timeout, request.send())
+        let response = if self.generation_executor.is_some() {
+            // The executor owns per-send transport deadlines, not a timer spanning
+            // its server-advised backoff and all retries.
+            self.execute_generation(&self.stream_client, request).await?
+        } else {
+            tokio::time::timeout(
+                self.timeout,
+                self.execute_generation(&self.stream_client, request),
+            )
             .await
             .map_err(|_| {
                 Error::timeout(
@@ -955,8 +1017,8 @@ impl Anthropic {
                     ),
                     Some(self.timeout.as_secs_f64()),
                 )
-            })?
-            .map_err(|e| self.map_request_error(e))?;
+            })??
+        };
 
         if !response.status().is_success() {
             return Err(Self::process_error_response(response).await);
@@ -1883,6 +1945,7 @@ mod tests {
             reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
             allow_insecure_http: false,
+            generation_executor: None,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1921,6 +1984,7 @@ mod tests {
             reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
             allow_insecure_http: false,
+            generation_executor: None,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1957,6 +2021,7 @@ mod tests {
             reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
             allow_insecure_http: false,
+            generation_executor: None,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -1994,6 +2059,7 @@ mod tests {
             reserve_capacity: 1.0 / 60.0,
             cached_headers: Arc::new(HeaderMap::new()),
             allow_insecure_http: false,
+            generation_executor: None,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));
@@ -2482,6 +2548,7 @@ mod tests {
             reserve_capacity: 1.0,
             cached_headers: Arc::new(HeaderMap::new()),
             allow_insecure_http: false,
+            generation_executor: None,
         };
 
         let attempt_counter = Arc::new(AtomicUsize::new(0));

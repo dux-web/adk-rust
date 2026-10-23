@@ -192,3 +192,160 @@ async fn zero_argument_tool_call_has_empty_object_arguments() {
         }]
     );
 }
+
+#[tokio::test]
+async fn raw_policy_preserves_status_type_and_deadline() {
+    use adk_model::request_retry::RequestRetryConfig;
+    use futures::TryStreamExt;
+    for (status, sends) in [(503, 5), (429, 1), (401, 1)] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "0")
+                .set_body_json(serde_json::json!({"error":{"type":"actual_provider_type","message":"fixture failure"}})))
+            .expect(sends).mount(&server).await;
+        let client = AnthropicClient::new(
+            AnthropicConfig::new("test-key", "claude-sonnet-4-6").with_base_url(server.uri()),
+        )
+        .unwrap()
+        .with_retry_config(RetryConfig::disabled())
+        .with_request_retry(RequestRetryConfig {
+            max_retries: 4,
+            initial_delay: std::time::Duration::ZERO,
+        });
+        let error = client
+            .generate_content(
+                LlmRequest::new("claude-sonnet-4-6", vec![Content::new("user").with_text("Hello")]),
+                true,
+            )
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap_err();
+        assert_eq!(error.details.upstream_status_code, Some(status));
+        assert_eq!(error.details.metadata["provider_error_type"], "actual_provider_type");
+        assert_eq!(error.details.metadata["transport_phase"], "request");
+        assert_eq!(error.message, "fixture failure");
+        assert!(error.retry_deadline().is_some());
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn recovery_keeps_stream_failures_typed() {
+    use adk_model::request_retry::RequestRetryConfig;
+    for failure in [
+        "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+        "event: content_block_delta\ndata: invalid\n\n",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("{MESSAGE_START}{failure}")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AnthropicClient::new(
+            AnthropicConfig::new("test-key", "claude-sonnet-4-6").with_base_url(server.uri()),
+        )
+        .unwrap()
+        .with_retry_config(RetryConfig::disabled())
+        .with_request_retry(RequestRetryConfig::default());
+        let items: Vec<_> = client
+            .generate_content(
+                LlmRequest::new("claude-sonnet-4-6", vec![Content::new("user").with_text("Hello")]),
+                true,
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let error = items.last().unwrap().as_ref().unwrap_err();
+        assert_eq!(error.details.metadata["transport_phase"], "stream");
+        assert!(
+            items
+                .iter()
+                .filter_map(|item| item.as_ref().ok())
+                .all(|response| response.error_code.is_none())
+        );
+        if failure.starts_with("event: error") {
+            assert_eq!(error.details.metadata["provider_error_type"], "overloaded_error");
+            assert_eq!(error.details.upstream_status_code, None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn unreadable_error_bodies_preserve_response_headers() {
+    use adk_model::request_retry::RequestRetryConfig;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (status, category) in
+        [(400, ErrorCategory::InvalidInput), (429, ErrorCategory::RateLimited)]
+    {
+        for stream in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                loop {
+                    let mut bytes = [0; 8192];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert_ne!(count, 0);
+                    received.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = received.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&received[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        if received.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Length: 1024\r\nRetry-After: 17\r\nConnection: close\r\n\r\n{{").as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+            let client = AnthropicClient::new(
+                AnthropicConfig::new("test-key", "claude-sonnet-4-6")
+                    .with_base_url(format!("http://{address}")),
+            )
+            .unwrap()
+            .with_retry_config(RetryConfig::disabled())
+            .with_request_retry(RequestRetryConfig::default());
+            let result = client
+                .generate_content(
+                    LlmRequest::new(
+                        "claude-sonnet-4-6",
+                        vec![Content::new("user").with_text("Hello")],
+                    ),
+                    stream,
+                )
+                .await;
+            let error = match result {
+                Err(error) => error,
+                Ok(mut events) => events.next().await.unwrap().unwrap_err(),
+            };
+            assert_eq!(error.details.upstream_status_code, Some(status));
+            assert_eq!(error.category, category);
+            assert_eq!(error.code, "model.anthropic.api");
+            assert_eq!(error.details.metadata["response_body_error"], true);
+            let delay = error
+                .retry_deadline()
+                .unwrap()
+                .saturating_duration_since(std::time::Instant::now());
+            assert!(delay > std::time::Duration::from_secs(15));
+            assert!(delay <= std::time::Duration::from_secs(17));
+            server.await.unwrap();
+        }
+    }
+}

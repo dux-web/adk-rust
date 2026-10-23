@@ -3,7 +3,7 @@
 //! This backend communicates with `generativelanguage.googleapis.com` using
 //! API-key authentication and standard REST/SSE endpoints.
 
-use super::{BackendStream, GeminiBackend};
+use super::{BackendStream, GeminiBackend, GenerationExecutor};
 use crate::{
     batch::model::{
         BatchGenerateContentRequest, BatchGenerateContentResponse, ListBatchesResponse,
@@ -57,7 +57,6 @@ pub fn v1_base_url() -> &'static Url {
 }
 
 /// AI Studio REST backend.
-#[derive(Debug)]
 pub struct StudioBackend {
     pub(crate) http_client: Client,
     pub(crate) base_url: Url,
@@ -66,6 +65,17 @@ pub struct StudioBackend {
     /// When true, `includeServerSideToolInvocations` is stripped from requests
     /// because Vertex AI rejects it with `INVALID_ARGUMENT`.
     pub(crate) is_vertex_url: bool,
+    executor: Option<GenerationExecutor>,
+}
+
+impl std::fmt::Debug for StudioBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StudioBackend")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("has_executor", &self.executor.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl StudioBackend {
@@ -79,17 +89,18 @@ impl StudioBackend {
         let http_client = Client::builder()
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .expect("all parameters must be valid");
 
         let is_vertex_url = Self::detect_vertex_url(&base_url);
-        Ok(Self { http_client, base_url, model, is_vertex_url })
+        Ok(Self { http_client, base_url, model, is_vertex_url, executor: None })
     }
 
     /// Create with a custom `reqwest::Client` (e.g. for proxy support).
     pub fn with_client(http_client: Client, model: Model, base_url: Url) -> Self {
         let is_vertex_url = Self::detect_vertex_url(&base_url);
-        Self { http_client, base_url, model, is_vertex_url }
+        Self { http_client, base_url, model, is_vertex_url, executor: None }
     }
 
     /// Returns `true` if the URL points to a Vertex AI endpoint.
@@ -208,6 +219,11 @@ impl StudioBackend {
 
 #[async_trait]
 impl GeminiBackend for StudioBackend {
+    fn set_generation_executor(&mut self, executor: GenerationExecutor) -> Result<(), Error> {
+        self.executor = Some(executor);
+        Ok(())
+    }
+
     // ── Core ────────────────────────────────────────────────────────────
 
     async fn generate_content(
@@ -218,13 +234,12 @@ impl GeminiBackend for StudioBackend {
             request.strip_vertex_unsupported_fields();
         }
         let url = self.build_url("generateContent")?;
-        let response = self
-            .http_client
-            .post(url)
-            .json(&request)
-            .send()
-            .await
-            .context(PerformRequestNewSnafu)?;
+        let request =
+            self.http_client.post(url).json(&request).build().context(PerformRequestNewSnafu)?;
+        let response = match &self.executor {
+            Some(executor) => executor(self.http_client.clone(), request).await?,
+            None => self.http_client.execute(request).await.context(PerformRequestNewSnafu)?,
+        };
         let body =
             Self::check_response(response).await?.text().await.context(DecodeResponseSnafu)?;
         super::decode_generation_response(&body)
@@ -240,13 +255,12 @@ impl GeminiBackend for StudioBackend {
         let mut url = self.build_url("streamGenerateContent")?;
         url.query_pairs_mut().append_pair("alt", "sse");
 
-        let response = self
-            .http_client
-            .post(url)
-            .json(&request)
-            .send()
-            .await
-            .context(PerformRequestNewSnafu)?;
+        let request =
+            self.http_client.post(url).json(&request).build().context(PerformRequestNewSnafu)?;
+        let response = match &self.executor {
+            Some(executor) => executor(self.http_client.clone(), request).await?,
+            None => self.http_client.execute(request).await.context(PerformRequestNewSnafu)?,
+        };
         let response = Self::check_response(response).await?;
 
         let stream = response

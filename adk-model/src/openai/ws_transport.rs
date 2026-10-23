@@ -239,6 +239,9 @@ impl WsTransport {
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
+    pub(super) fn fallback_to_http(&self) -> bool {
+        self.options.fallback_to_http
+    }
     pub(super) fn enabled(&self) -> bool {
         (self.options.enabled)() && !proxy_in_effect(&self.url)
     }
@@ -400,6 +403,7 @@ impl WsTransport {
             None,
             native_tools,
             (false, false),
+            false,
         )
         .await
         .map_err(|failure| failure.error)
@@ -430,6 +434,7 @@ impl WsTransport {
         observer: Option<super::ResponseObserver>,
         native_tools: bool,
         normalization: (bool, bool),
+        response_recovery: bool,
     ) -> Result<LlmResponseStream, BeforeEvent> {
         let mut lease = self.lease(self.connection.clone().lock_owned().await);
         if let Some((attempted, refusal)) = lease.guard.preconnect_failure.take()
@@ -491,7 +496,9 @@ impl WsTransport {
         }
         self.observe(TransportEvent::WebSocket { reused, incremental });
         let timeout = self.options.read_timeout;
-        Ok(Box::pin(try_stream! {
+        let completed_tools = Arc::new(AtomicBool::new(false));
+        let observed_tools = completed_tools.clone();
+        let response_stream = try_stream! {
             let mut lease = lease;
             let mut next = Some(first);
             let mut state = StreamState::new(native_tools);
@@ -500,6 +507,7 @@ impl WsTransport {
             let mut in_flight = false;
             loop {
                 let value = match next.take() { Some(value) => value, None => read(&mut lease, timeout).await.map_err(|failure| delivery(failure.error))? };
+                if response_recovery && super::responses_transport::ignore_event(&value) { continue; }
                 if value.get("type").and_then(Value::as_str) == Some("error") {
                     // A request-level error rejects the frame before any response
                     // starts, so the socket stays reusable. After a response has
@@ -510,15 +518,16 @@ impl WsTransport {
                     Err(error_event(&value))?;
                 }
                 in_flight = true;
+                if super::responses_transport::tool_completed(&value) { observed_tools.store(true, Ordering::Relaxed); }
                 let bytes = normalized.normalize_line(value.to_string().as_bytes(), normalization.0, normalization.1).map_err(|_| invalid())?;
                 let value:Value = serde_json::from_slice(&bytes).map_err(|error| parse::error(&error, &value.to_string(), parse::Layer::StreamEvent))?;
                 // A terminal provider outcome finishes the lease even when its
                 // projection is an error. No frames from this response remain pending.
                 lease.finished = is_terminal(&value);
                 if lease.finished { lease.guard.continuation = None; }
-                match wire::event(value.clone())? {
+                match super::responses_transport::event(value.clone(), response_recovery)? {
                     wire::Event::Terminal(response) => {
-                        let result = state.finish(&response)?;
+                        let result = super::responses_transport::finish(&mut state, &response, response_recovery)?;
                         if let (Some(id), Some(output)) = (value.pointer("/response/id").and_then(Value::as_str), value.pointer("/response/output").and_then(Value::as_array)) {
                             lease.guard.continuation = Some(Continuation { request: body.clone(), response: id.into(), output: output.clone() });
                         }
@@ -529,7 +538,7 @@ impl WsTransport {
                     wire::Event::Content(event) => if let Some(response) = state.partial(*event) { yield response; },
                     wire::Event::Activity if is_terminal(&value) => {
                         let response = wire::response(value.get("response").cloned().unwrap_or(Value::Null), &value, parse::Layer::StreamEvent)?;
-                        let result = state.finish(&response)?;
+                        let result = super::responses_transport::finish(&mut state, &response, response_recovery)?;
                         lease.finished = true;
                         yield result;
                         break;
@@ -537,7 +546,15 @@ impl WsTransport {
                     wire::Event::Activity => {},
                 }
             }
-        }))
+        };
+        Ok(Box::pin(response_stream.map(move |result| {
+            result.map_err(|error| {
+                super::responses_transport::committed(
+                    super::responses_transport::annotate(error, "websocket", "stream"),
+                    completed_tools.load(Ordering::Relaxed),
+                )
+            })
+        })))
     }
 }
 fn observe_headers(lease: &mut Lease, observer: Option<&super::ResponseObserver>) {
@@ -551,10 +568,13 @@ fn observe_headers(lease: &mut Lease, observer: Option<&super::ResponseObserver>
 // socket is an uncertain delivery outcome, even before any text is emitted.
 fn delivery(mut error: AdkError) -> AdkError {
     error.retry.should_retry = false;
-    error
+    super::responses_transport::annotate(error, "websocket", "stream")
 }
 fn before(error: AdkError, refusal: WsRefusal) -> BeforeEvent {
-    BeforeEvent { error, refusal }
+    BeforeEvent {
+        error: super::responses_transport::annotate(error, "websocket", "request"),
+        refusal,
+    }
 }
 fn create_event(body: &Value) -> Result<Value, AdkError> {
     let mut event = body.clone();
@@ -802,7 +822,7 @@ fn error_event(value: &Value) -> AdkError {
             .and_then(|v| u16::try_from(v).ok())
             .map_or(ErrorCategory::Internal, category_for_status_code),
     };
-    crate::error_metadata::with_code(
+    let mut mapped = crate::error_metadata::with_code(
         AdkError::new(
             ErrorComponent::Model,
             category,
@@ -811,7 +831,14 @@ fn error_event(value: &Value) -> AdkError {
         )
         .with_provider("openai-responses"),
         code,
-    )
+    );
+    if let Some(status) =
+        value.get("status").and_then(Value::as_u64).and_then(|value| u16::try_from(value).ok())
+    {
+        mapped = mapped.with_upstream_status(status);
+    }
+    mapped.details.metadata.insert("provider_event_type".into(), "error".into());
+    super::responses_transport::provider(mapped, value.get("error").unwrap_or(value))
 }
 fn derive_ws_url(base: &str) -> String {
     let base = if base.contains("://") { base.to_owned() } else { format!("wss://{base}") };

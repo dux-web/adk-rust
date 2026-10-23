@@ -9,6 +9,7 @@ use crate::retry::{parse_retry_after, with_retry_after};
 struct HttpError {
     error: ApiErrorResponse,
     retry_after: Option<Duration>,
+    retry_deadline: Option<std::time::Instant>,
     request_id: Option<String>,
     /// The provider's code, read from the raw body by the rule every client shares.
     provider_code: Option<String>,
@@ -43,6 +44,7 @@ pub(super) async fn normalize_response(
     let status = response.status();
     let header = |name| response.headers().get(name).and_then(|value| value.to_str().ok());
     let retry_after = header(http::header::RETRY_AFTER).and_then(parse_retry_after);
+    let retry_deadline = super::responses_transport::response_deadline(&response);
     let request_id = header(http::HeaderName::from_static("x-request-id"))
         .and_then(identifier)
         .map(str::to_owned);
@@ -65,6 +67,7 @@ pub(super) async fn normalize_response(
     Err(OpenAIError::Boxed(Box::new(HttpError {
         error: ApiErrorResponse { status_code: status, api_error },
         retry_after,
+        retry_deadline,
         request_id,
         provider_code,
     })))
@@ -115,6 +118,9 @@ pub(super) fn mapped_http_error(error: &OpenAIError) -> Option<AdkError> {
     let error = error.downcast_ref::<HttpError>()?;
     // The retry owner bounds the wait while retaining the original server hint.
     let mut mapped = with_retry_after(map_api_error(&error.error), error.retry_after);
+    if let Some(deadline) = error.retry_deadline {
+        mapped = mapped.with_retry_deadline(deadline);
+    }
     // The body's `status`, and a `code` that is not a string, do not survive `ApiError`.
     if error.provider_code.is_some() {
         mapped = crate::error_metadata::with_code(mapped, error.provider_code.as_deref());
@@ -148,9 +154,12 @@ pub(super) fn map_api_error(api_err: &ApiErrorResponse) -> AdkError {
     )
     .with_provider("openai-responses")
     .with_upstream_status(status_code);
-    crate::error_metadata::with_first_code(
+    super::responses_transport::provider(
         mapped,
-        [api_err.api_error.code.as_deref(), api_err.api_error.r#type.as_deref()],
+        &serde_json::json!({
+            "code": api_err.api_error.code, "type": api_err.api_error.r#type,
+            "message": api_err.api_error.message,
+        }),
     )
 }
 

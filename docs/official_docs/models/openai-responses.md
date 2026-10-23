@@ -654,6 +654,29 @@ cargo run --manifest-path examples/gemini_ws_outcomes/Cargo.toml
 
 ---
 
+## Raw request retries and stream recovery
+
+`OpenAIResponsesClient::with_request_retry` configures sends before response-body
+consumption. `RequestRetryConfig::default()` disables this layer. An enabled policy
+retries HTTP 5xx and connection, timeout or network errors with exponential backoff
+and jitter. HTTP 429 and request-construction failures return to the caller.
+`Retry-After` uses one monotonic deadline, including time spent reading an error body.
+
+Use `RetryConfig::disabled()` when the caller owns model-level or stream recovery,
+so the two retry policies do not multiply generation attempts.
+
+`with_response_recovery(true)` changes HTTP and WebSocket stream handling explicitly:
+ordinary standalone error events remain advisory, `flex_unavailable` is terminal,
+and incomplete responses retain their reason. Interrupted responses continue through
+the agent's existing turn loop. An error after completed provider-tool execution
+carries `provider_tool_completed`; generating a client-owned tool call does not
+count as execution. This setting does not enable HTTP fallback after a socket failure.
+
+Errors retain the transport (`http` or `websocket`), request or stream phase,
+provider status and bounded provider error fields. Anthropic raw sends also preserve
+the HTTP status if an error body cannot be read, and each retry has its own configured
+header timeout.
+
 ## Background Mode & Cancellation
 
 A request with `"background": true` in its `openai` extension is submitted with

@@ -300,6 +300,13 @@ impl fmt::Display for Model {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
 pub enum Error {
+    /// A custom raw generation executor failed with its original typed cause.
+    #[snafu(display("generation transport failed: {source}"))]
+    GenerationTransport {
+        /// The error returned by the configured generation executor.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     /// The provided API key is not a valid HTTP header value.
     #[snafu(display("failed to parse API key"))]
     InvalidApiKey {
@@ -575,6 +582,7 @@ impl Error {
 /// contents — so neither is logged; the caller receives them in the returned error.
 fn log_failure(error: &Error) {
     let kind = match error {
+        Error::GenerationTransport { .. } => "generation_transport",
         Error::InvalidApiKey { .. } => "invalid_api_key",
         Error::ConstructUrl { .. } => "construct_url",
         Error::PerformRequestNew { .. } | Error::PerformRequest { .. } => "perform_request",
@@ -1288,6 +1296,7 @@ impl GeminiBuilder {
             .client_builder
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .context(PerformRequestNewSnafu)?;
         let studio =
@@ -1310,6 +1319,21 @@ pub struct Gemini {
 }
 
 impl Gemini {
+    /// Sets the Studio generation executor before creating request builders.
+    ///
+    /// Returns a validation error if request builders already share the client or
+    /// the selected backend does not expose raw Studio HTTP generation requests.
+    pub fn with_generation_executor(
+        mut self,
+        executor: backend::GenerationExecutor,
+    ) -> Result<Self, Error> {
+        let client = Arc::get_mut(&mut self.client).ok_or_else(|| Error::Validation {
+            message: "configure the generation executor before creating request builders".into(),
+        })?;
+        client.backend.set_generation_executor(executor)?;
+        Ok(self)
+    }
+
     /// Create a new client with the specified API key
     pub fn new<K: AsRef<str>>(api_key: K) -> Result<Self, Error> {
         Self::with_model(api_key, Model::default())

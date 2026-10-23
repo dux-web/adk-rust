@@ -2,6 +2,7 @@
 
 use super::config::AzureAIConfig;
 use super::convert;
+use crate::request_retry::{RequestRetryConfig, http as request_http};
 use crate::retry::{RetryConfig, execute_with_retry, is_retryable_model_error};
 use adk_core::{AdkError, ErrorComponent, Llm, LlmRequest, LlmResponse, LlmResponseStream, Part};
 use async_stream::try_stream;
@@ -41,6 +42,7 @@ pub struct AzureAIClient {
     api_key: String,
     model: String,
     retry_config: RetryConfig,
+    request_retry: RequestRetryConfig,
 }
 
 impl AzureAIClient {
@@ -49,6 +51,7 @@ impl AzureAIClient {
         let client = crate::HttpTimeouts::default()
             .apply(Client::builder())
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|e| AdkError::model(format!("Failed to create HTTP client: {e}")))?;
 
@@ -58,7 +61,15 @@ impl AzureAIClient {
             api_key: config.api_key,
             model: config.model,
             retry_config: RetryConfig::default(),
+            request_retry: RequestRetryConfig::default(),
         })
+    }
+
+    /// Configures retries of raw HTTP sends before a response body starts.
+    #[must_use]
+    pub fn with_request_retry(mut self, policy: RequestRetryConfig) -> Self {
+        self.request_retry = policy;
+        self
     }
 
     /// Sets the connect and idle timeouts of the HTTP transport, so a stalled stream fails
@@ -88,6 +99,7 @@ impl AzureAIClient {
         self.client = timeouts
             .apply(Client::builder())
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|e| AdkError::model(format!("Failed to create HTTP client: {e}")))?;
         Ok(self)
@@ -156,6 +168,7 @@ impl Llm for AzureAIClient {
         let endpoint = self.endpoint.clone();
         let client = self.client.clone();
         let retry_config = self.retry_config.clone();
+        let request_retry = self.request_retry;
 
         let body = convert::build_request_body(
             &model,
@@ -173,19 +186,21 @@ impl Llm for AzureAIClient {
                 let body = body.clone();
                 let endpoint = endpoint.clone();
                 async move {
-                    let resp = client
+                    let request_error = |e: reqwest::Error| request_http::network(AdkError::new(
+                        ErrorComponent::Model,
+                        crate::http_timeouts::transport_category(&e),
+                        "model.azure_ai.request",
+                        format!("Azure AI request failed: {e}"),
+                    ).with_provider("azure-ai"), &e, "request");
+                    let request = client
                         .post(&api_url)
                         .header("api-key", &api_key)
                         .header("Content-Type", "application/json")
                         .json(&body)
-                        .send()
-                        .await
-                        .map_err(|e| AdkError::new(
-                            ErrorComponent::Model,
-                            crate::http_timeouts::transport_category(&e),
-                            "model.azure_ai.request",
-                            format!("Azure AI error for endpoint={endpoint}: {e}"),
-                        ).with_provider("azure-ai"))?;
+
+                        .build().map_err(&request_error)?;
+                    let resp = request_http::send(&client, request, request_retry)
+                        .await.map_err(request_error)?;
 
                     if !resp.status().is_success() {
                         let status = resp.status();
@@ -195,6 +210,7 @@ impl Llm for AzureAIClient {
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|value| value.to_str().ok())
                             .and_then(crate::retry::parse_retry_after);
+                        let deadline = request_http::deadline(&resp);
                         let error_text = resp.text().await.unwrap_or_default();
                         let error = AdkError::new(
                             ErrorComponent::Model,
@@ -205,10 +221,10 @@ impl Llm for AzureAIClient {
                                 adk_core::upstream_excerpt(&error_text)
                             ),
                         ).with_upstream_status(status_code).with_provider("azure-ai");
-                        return Err(crate::retry::with_retry_after(
-                            crate::error_metadata::from_body(error, &error_text),
-                            retry_after,
-                        ));
+                        let mut error = crate::retry::with_retry_after(
+                            crate::error_metadata::from_body(error, &error_text), retry_after);
+                        if let Some(deadline) = deadline { error = error.with_retry_deadline(deadline); }
+                        return Err(request_http::annotate(error, "request"));
                     }
 
                     Ok(resp)
@@ -319,18 +335,18 @@ impl Llm for AzureAIClient {
                     yield response;
                 }
             } else {
-                let response_text = response.text().await.map_err(|e| AdkError::new(
+                let response_text = response.text().await.map_err(|e| request_http::network(AdkError::new(
                     ErrorComponent::Model,
                     crate::http_timeouts::transport_category(&e),
                     "model.azure_ai.request",
                     format!("Azure AI response could not be read: {e}"),
-                ).with_provider("azure-ai"))?;
+                ).with_provider("azure-ai"), &e, "stream"))?;
 
                 let response_json: Value = serde_json::from_str(&response_text)
-                    .map_err(|e| AdkError::model(format!(
+                    .map_err(|e| request_http::annotate(AdkError::model(format!(
                         "Azure AI response parse failed: {}",
                         adk_core::json_error_summary(&e)
-                    )))?;
+                    )), "stream"))?;
 
                 yield convert::parse_response(&response_json);
             }

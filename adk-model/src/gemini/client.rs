@@ -180,6 +180,23 @@ impl GeminiBuiltinToolUses {
 /// `details.metadata["provider_error_code"]`: the first `ErrorInfo.reason`, then the
 /// error object's string `code`, then its `status`.
 pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkError {
+    if let adk_gemini::ClientError::GenerationTransport { source } = e
+        && let Some(original) = source.downcast_ref::<adk_core::AdkError>()
+    {
+        let mut error = adk_core::AdkError::new(
+            original.component,
+            original.category,
+            original.code,
+            original.message.clone(),
+        );
+        error.details = original.details.clone();
+        error.retry = original.retry.clone();
+        if let Some(deadline) = original.retry_deadline() {
+            error = error.with_retry_deadline(deadline);
+        }
+        return error;
+    }
+
     fn format_error_chain(e: &dyn std::error::Error) -> String {
         let mut msg = e.to_string();
         let mut source = e.source();
@@ -258,6 +275,21 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
         _ => None,
     };
     let err = crate::error_metadata::with_code(err, provider_code.as_deref());
+    let phase = match e {
+        adk_gemini::ClientError::BadPart { .. }
+        | adk_gemini::ClientError::ErrorInResponse { .. }
+        | adk_gemini::ClientError::Deserialize { .. }
+        | adk_gemini::ClientError::DecodeResponse { .. } => "stream",
+        _ => "request",
+    };
+    let mut err = crate::error_metadata::transport(err, phase);
+    if let Some(source) = e.request_error() {
+        err = crate::request_retry::http::network(err, source, phase);
+    }
+    if let Some(status) = reported_status {
+        err.details.metadata.insert("provider_reported_status".into(), status.into());
+    }
+
     let header = match e {
         adk_gemini::ClientError::BadResponse { retry_after: Some(header), .. } => {
             crate::retry::parse_retry_after(header)
@@ -878,6 +910,18 @@ impl GeminiModel {
             .with_provider("gemini"));
         };
         Self::new(api_key, model)
+    }
+
+    /// Configures retries of raw Studio generation sends before the response body starts.
+    pub fn with_request_retry(
+        mut self,
+        policy: crate::request_retry::RequestRetryConfig,
+    ) -> Result<Self> {
+        self.client = self
+            .client
+            .with_generation_executor(super::transport::executor(policy))
+            .map_err(|error| gemini_error_to_adk(&error))?;
+        Ok(self)
     }
 
     /// Set the retry configuration (builder pattern).
@@ -1796,13 +1840,13 @@ impl GeminiModel {
                     }
                 }
                 if !finished {
-                    yield Err(adk_core::AdkError::new(
+                    yield Err(crate::error_metadata::transport(adk_core::AdkError::new(
                         ErrorComponent::Model,
                         ErrorCategory::Unavailable,
                         "model.gemini.unfinished_stream",
                         "Gemini stream ended before any chunk carried a finish reason",
                     )
-                    .with_provider("gemini"));
+                    .with_provider("gemini"), "stream"));
                 }
             };
 

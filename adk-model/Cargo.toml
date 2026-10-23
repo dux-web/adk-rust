@@ -61,7 +61,7 @@ openai-conversations = ["openai"]
 # adk-server directly for webhook verification/handling.
 openai-responses-full = ["openai-ws", "openai-conversations"]
 xai = ["openai"]
-anthropic = ["dep:adk-anthropic"]
+anthropic = ["dep:adk-anthropic", "dep:reqwest"]
 opencode = ["openai", "anthropic", "gemini"]
 deepseek = ["dep:reqwest"]
 ollama = ["dep:ollama-rs", "dep:schemars", "dep:reqwest"]

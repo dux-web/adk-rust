@@ -1360,3 +1360,95 @@ async fn honors_environment_proxy_bypass() {
         );
     }
 }
+
+#[tokio::test]
+async fn fallback_requires_explicit_opt_in() {
+    use adk_core::{Content, Llm, LlmRequest};
+    use adk_model::openai::{OpenAIResponsesClient, WsOptions};
+    let server =
+        Server::combined(Arc::new(|_| answer("unexpected HTTP")), Arc::new(|_| Some(426)), true)
+            .await;
+    let client = OpenAIResponsesClient::new(server.config())
+        .unwrap()
+        .with_retry_config(RetryConfig::disabled())
+        .with_websocket(WsOptions::default());
+    assert!(
+        client
+            .generate_content(
+                LlmRequest::new("test-model", vec![Content::new("user").with_text("first")]),
+                true
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(server.handshakes(), 1);
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn completed_mcp_calls_mark_stream_interruptions() {
+    for (kind, completed) in
+        [("response.mcp_call.completed", true), ("response.mcp_call.in_progress", false)]
+    {
+        let event =
+            json!({"type":kind, "sequence_number":1, "output_index":0, "item_id":"mcp-call"});
+        let (_, error) =
+            single(Arc::new(move |_| vec![Step::Send(event.clone()), Step::Close])).await;
+        let error = error.expect("unfinished response must fail");
+        assert_eq!(
+            error
+                .details
+                .metadata
+                .get("provider_tool_completed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            completed
+        );
+        assert_eq!(error.details.metadata["transport"], "websocket");
+    }
+}
+
+#[tokio::test]
+async fn execution_markers_distinguish_generated_calls() {
+    for (event, completed) in [
+        (
+            json!({"type":"response.code_interpreter_call.completed","sequence_number":1,
+                "output_index":0,"item_id":"code-call"}),
+            true,
+        ),
+        (
+            json!({"type":"response.code_interpreter_call.in_progress","sequence_number":1,
+                "output_index":0,"item_id":"code-call"}),
+            false,
+        ),
+        (
+            json!({"type":"response.output_item.done","sequence_number":1,"output_index":0,
+                "item":{"type":"local_shell_call","id":"local","call_id":"call","status":"completed",
+                    "action":{"type":"exec","command":["echo","done"],"env":{}}}}),
+            false,
+        ),
+    ] {
+        let server = Server::start(
+            Arc::new(move |_| vec![Step::Send(event.clone()), Step::Close]),
+            accept_all(),
+        )
+        .await;
+        let transport = WsTransport::connect(&server.config()).await.unwrap();
+        let (responses, error) = collect(&transport, "fixture").await;
+        let error = error.expect("unfinished response must fail");
+        assert_eq!(error.code, "model.openai_responses.unfinished_stream");
+        assert_eq!(
+            error
+                .details
+                .metadata
+                .get("provider_tool_completed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            completed
+        );
+        assert_eq!(error.details.metadata["transport"], "websocket");
+        assert!(!error.retry.should_retry);
+        assert!(responses.iter().all(|response| !response.turn_complete));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+}

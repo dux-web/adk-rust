@@ -36,6 +36,18 @@ use std::pin::Pin;
 /// A boxed, pinned stream of results — the common return type for streaming operations.
 pub type BackendStream<T> = Pin<Box<dyn Stream<Item = Result<T, Error>> + Send>>;
 
+/// Executes one prepared generation request before its response body is consumed.
+///
+/// The hook applies only to Studio generation, not file, cache or embedding operations.
+pub type GenerationExecutor = std::sync::Arc<
+    dyn Fn(
+            reqwest::Client,
+            reqwest::Request,
+        ) -> futures::future::BoxFuture<'static, Result<reqwest::Response, Error>>
+        + Send
+        + Sync,
+>;
+
 /// Decodes a `generateContent` body or one `streamGenerateContent` event.
 ///
 /// Every field of [`GenerationResponse`] is optional, so an `{"error": {...}}` object
@@ -68,6 +80,11 @@ pub(crate) fn decode_generation_response(data: &str) -> Result<GenerationRespons
 /// return `GoogleCloudUnsupported`, so backends only implement what they support.
 #[async_trait]
 pub trait GeminiBackend: Send + Sync + std::fmt::Debug {
+    /// Installs a raw generation executor when this backend supports one.
+    fn set_generation_executor(&mut self, _executor: GenerationExecutor) -> Result<(), Error> {
+        Err(Error::Validation { message: "generation executors require the Studio backend".into() })
+    }
+
     // ── Core operations (required) ──────────────────────────────────────
 
     /// Generate content (non-streaming).

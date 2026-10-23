@@ -131,7 +131,8 @@ impl OpenCodeClient {
                         client
                             .with_reasoning_replay(true)
                             .with_default_headers(headers)?
-                            .with_retry_config(config.retry),
+                            .with_retry_config(config.retry)
+                            .with_request_retry(config.request_retry),
                     )
                 } else {
                     let native = OpenAIResponsesConfig::new(config.api_key, config.model)
@@ -146,7 +147,13 @@ impl OpenCodeClient {
                     if let Some(timeouts) = config.timeouts {
                         client = client.with_timeouts(timeouts)?;
                     }
-                    Arc::new(client.with_default_headers(headers)?.with_retry_config(config.retry))
+                    Arc::new(
+                        client
+                            .with_default_headers(headers)?
+                            .with_retry_config(config.retry)
+                            .with_request_retry(config.request_retry)
+                            .with_response_recovery(config.response_recovery),
+                    )
                 }
             }
             OpenCodeApi::Messages => {
@@ -167,7 +174,12 @@ impl OpenCodeClient {
                 if let Some(timeouts) = config.timeouts {
                     client = client.with_timeouts(timeouts)?;
                 }
-                Arc::new(client.with_default_headers(headers).with_retry_config(config.retry))
+                Arc::new(
+                    client
+                        .with_default_headers(headers)
+                        .with_retry_config(config.retry)
+                        .with_request_retry(config.request_retry),
+                )
             }
             OpenCodeApi::GenerateContent => {
                 if config.reasoning_effort.is_some()
@@ -187,8 +199,9 @@ impl OpenCodeClient {
                     .with_http_client(http)
                     .build()
                     .map_err(|err| crate::gemini::client::gemini_error_to_adk(&err))?;
-                let mut model =
-                    GeminiModel::from_client(client, config.model).with_retry_config(config.retry);
+                let mut model = GeminiModel::from_client(client, config.model)
+                    .with_retry_config(config.retry)
+                    .with_request_retry(config.request_retry)?;
                 if let Some(thinking) = config.gemini_thinking {
                     model = model.with_thinking_config(thinking);
                 }

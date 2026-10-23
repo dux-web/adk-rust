@@ -12,13 +12,16 @@ use serde_json::Value;
 /// The stream ended before the provider's terminal event, so the answer or a tool call may
 /// be truncated. Retryable: the request can be sent again.
 pub(crate) fn incomplete(provider: &str, code: &'static str, unfinished: &str) -> AdkError {
-    AdkError::new(
-        ErrorComponent::Model,
-        ErrorCategory::Unavailable,
-        code,
-        format!("{provider} stream ended before {unfinished}"),
+    crate::error_metadata::transport(
+        AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::Unavailable,
+            code,
+            format!("{provider} stream ended before {unfinished}"),
+        )
+        .with_provider(provider),
+        "stream",
     )
-    .with_provider(provider)
 }
 
 /// The connection failed, or sent nothing for the idle timeout, while the stream was being
@@ -32,21 +35,27 @@ pub(crate) fn incomplete(provider: &str, code: &'static str, unfinished: &str) -
 ))]
 pub(crate) fn interrupted(provider: &str, code: &'static str, error: &reqwest::Error) -> AdkError {
     if error.is_timeout() {
-        return AdkError::new(
-            ErrorComponent::Model,
-            ErrorCategory::Timeout,
-            code,
-            format!("{provider} stream sent no data within the idle timeout: {error}"),
-        )
-        .with_provider(provider);
+        return crate::error_metadata::transport(
+            AdkError::new(
+                ErrorComponent::Model,
+                ErrorCategory::Timeout,
+                code,
+                format!("{provider} stream sent no data within the idle timeout: {error}"),
+            )
+            .with_provider(provider),
+            "stream",
+        );
     }
-    AdkError::new(
-        ErrorComponent::Model,
-        ErrorCategory::Unavailable,
-        code,
-        format!("{provider} stream was interrupted: {error}"),
+    crate::error_metadata::transport(
+        AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::Unavailable,
+            code,
+            format!("{provider} stream was interrupted: {error}"),
+        )
+        .with_provider(provider),
+        "stream",
     )
-    .with_provider(provider)
 }
 
 /// A stream chunk that is not valid JSON or does not match the provider's chunk schema.
@@ -63,16 +72,19 @@ pub(crate) fn undecodable(
     error: &serde_json::Error,
 ) -> AdkError {
     // Data errors can quote the offending value, so only the class and position are kept.
-    AdkError::new(
-        ErrorComponent::Model,
-        ErrorCategory::Internal,
-        code,
-        format!(
-            "{provider} sent a stream chunk that could not be decoded ({})",
-            adk_core::json_error_summary(error)
-        ),
+    crate::error_metadata::transport(
+        AdkError::new(
+            ErrorComponent::Model,
+            ErrorCategory::Internal,
+            code,
+            format!(
+                "{provider} sent a stream chunk that could not be decoded ({})",
+                adk_core::json_error_summary(error)
+            ),
+        )
+        .with_provider(provider),
+        "stream",
     )
-    .with_provider(provider)
 }
 
 /// An error the provider reported inside the stream, as an OpenAI-shaped object
@@ -80,7 +92,7 @@ pub(crate) fn undecodable(
 /// only finished with `finish_reason: "error"`.
 ///
 /// A numeric `code` or `status` in the HTTP error range sets the category and the
-/// upstream status; otherwise the string code or type does, and an unrecognized failure
+/// reported status metadata; otherwise the string code or type does, and an unrecognized failure
 /// is `Unavailable`, since a generation that fails after it started is a server-side
 /// failure.
 pub(crate) fn reported(provider: &str, code: &'static str, error: &Value) -> AdkError {
@@ -113,10 +125,12 @@ pub(crate) fn reported(provider: &str, code: &'static str, error: &Value) -> Adk
         Some(message) => format!("{provider} reported an error during generation: {message}"),
         None => format!("{provider} reported an error during generation"),
     };
-    let mut mapped =
-        AdkError::new(ErrorComponent::Model, category, code, message).with_provider(provider);
+    let mut mapped = crate::error_metadata::transport(
+        AdkError::new(ErrorComponent::Model, category, code, message).with_provider(provider),
+        "stream",
+    );
     if let Some(status) = status {
-        mapped = mapped.with_upstream_status(status);
+        mapped.details.metadata.insert("provider_reported_status".into(), status.into());
     }
     crate::error_metadata::with_code(mapped, provider_code.or(kind))
 }
@@ -156,7 +170,8 @@ mod tests {
     fn reported_uses_numeric_status_codes() {
         let error = reported("openrouter", CODE, &json!({"code": 429, "message": "slow down"}));
         assert_eq!(error.category, ErrorCategory::RateLimited);
-        assert_eq!(error.details.upstream_status_code, Some(429));
+        assert_eq!(error.details.upstream_status_code, None);
+        assert_eq!(error.details.metadata["provider_reported_status"], 429);
         let out_of_range = reported("provider", CODE, &json!({"code": 12}));
         assert_eq!(out_of_range.category, ErrorCategory::Unavailable);
         assert_eq!(out_of_range.details.upstream_status_code, None);
