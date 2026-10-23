@@ -17,7 +17,7 @@ fn native_child_launch() {
     let system_cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
         .join("System32")
         .join("cmd.exe");
-    std::fs::copy(&system_cmd, workspace.join("localcmd.exe")).unwrap();
+    std::fs::write(workspace.join("localcmd.exe"), std::fs::read(&system_cmd).unwrap()).unwrap();
     let acl = std::process::Command::new("icacls").arg(&system_cmd).output().unwrap();
     println!("HOST CMD ACL: {}", String::from_utf8_lossy(&acl.stdout));
     let mut policy =
@@ -46,6 +46,11 @@ fn nested_shell_commands() {
         ("caret", "cmd /c echo child^> child.txt 2> spawn-err.txt"),
         ("plain", "cmd /c echo child> child.txt 2> spawn-err.txt"),
         ("batch", "cmd /c child.cmd 2> spawn-err.txt"),
+        ("granted_shell", ".\\localcmd.exe /c child.cmd 2> spawn-err.txt"),
+        (
+            "granted_descendant",
+            "start /b .\\localcmd.exe /c writer.cmd 2> start-err.txt & for /l %j in (1,1,1000000) do @rem",
+        ),
         ("absolute_batch", "%SystemRoot%\\System32\\cmd.exe /c child.cmd 2> spawn-err.txt"),
         (
             "start_caret",
@@ -65,6 +70,11 @@ fn nested_shell_commands() {
             "@echo off\r\nfor /l %%i in (1,1,1000000) do @echo x>> tick.txt\r\n",
         )
         .unwrap();
+        let system_cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+            .join("System32")
+            .join("cmd.exe");
+        std::fs::write(workspace.join("localcmd.exe"), std::fs::read(&system_cmd).unwrap())
+            .unwrap();
         let policy = SandboxPolicyBuilder::new().allow_read_write(&workspace).build();
         let result = WindowsEnforcer::new().run_confined(
             &policy,

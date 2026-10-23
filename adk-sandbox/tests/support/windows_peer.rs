@@ -114,6 +114,11 @@ fn main() {
             .push_str(&format!("system {name}: metadata={metadata:?}; read={readable:?}\n"));
     }
     let local = std::env::current_dir().unwrap().join("localcmd.exe");
+    observations.push_str(&format!(
+        "local cmd metadata={:?}; read={:?}\n",
+        std::fs::metadata(&local).map(|metadata| metadata.len()),
+        std::fs::File::open(&local).map(|_| ()),
+    ));
     for program in [Path::new("cmd.exe"), &system.join("cmd.exe"), &local] {
         let output = std::process::Command::new(program)
             .args(["/d", "/c", "echo child> child.txt"])
