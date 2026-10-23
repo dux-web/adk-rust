@@ -42,6 +42,8 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
+    fn GetCurrentProcessId() -> u32;
+    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
     fn GetLastError() -> u32;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn CreateProcessW(
@@ -95,8 +97,18 @@ fn direct_spawn(program: &Path) -> String {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("child") {
+        std::fs::write("native-child.txt", "started").unwrap();
+        return;
+    }
     let mut observations = String::new();
-    for (name, access) in [("query", 0x0008), ("duplicate", 0x0002), ("assign", 0x0001)] {
+    for (name, access) in [
+        ("query", 0x0008),
+        ("duplicate", 0x0002),
+        ("assign", 0x0001),
+        ("impersonate", 0x0004),
+        ("all", 0x000f01ff),
+    ] {
         let mut token = std::ptr::null_mut();
         let ok = unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) };
         let error = if ok == 0 { unsafe { GetLastError() } } else { 0 };
@@ -105,6 +117,24 @@ fn main() {
             unsafe { CloseHandle(token) };
         }
     }
+    for (name, access) in
+        [("create", 0x0080), ("duplicate", 0x0040), ("query", 0x1000), ("all", 0x001fffff)]
+    {
+        let process = unsafe { OpenProcess(access, 0, GetCurrentProcessId()) };
+        observations.push_str(&format!(
+            "self process {name}: ok={}, error={}\n",
+            !process.is_null(),
+            if process.is_null() { unsafe { GetLastError() } } else { 0 }
+        ));
+        if !process.is_null() {
+            unsafe {
+                CloseHandle(process);
+            }
+        }
+    }
+    let own = std::env::current_exe().unwrap();
+    let self_spawn = std::process::Command::new(&own).arg("child").output();
+    observations.push_str(&format!("self child spawn={self_spawn:?}\n"));
     let system = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32");
     for name in ["cmd.exe", "kernel32.dll", "ucrtbase.dll", "vcruntime140.dll"] {
         let path = system.join(name);
