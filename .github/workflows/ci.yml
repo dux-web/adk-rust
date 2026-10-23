@@ -7,6 +7,11 @@ on:
         description: Revision to check out
         required: false
         type: string
+      changelog_only:
+        description: Validate UTF-8 fragments without rebuilding unchanged Rust inputs
+        required: false
+        type: boolean
+        default: false
       strict:
         description: Run formatting, changelog, lint and Windows token unit checks
         required: false
@@ -29,7 +34,17 @@ permissions:
   contents: read
 
 jobs:
+  changelog:
+    if: inputs.changelog_only
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+      - name: Validate UTF-8 changelog fragments
+        run: python -X utf8 scripts/changelog-assemble.py --check
   windows-enforcer:
+    if: ${{ !inputs.changelog_only }}
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -44,8 +59,11 @@ jobs:
         if: inputs.strict
         run: |
           cargo fmt --all -- --check
-          python scripts/changelog-assemble.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -X utf8 scripts/changelog-assemble.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo clippy --locked -p adk-sandbox --features sandbox-windows --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p adk-sandbox --features sandbox-windows --lib sandbox::windows::tests -- --nocapture
       - name: Build the native probe without a dynamic CRT
         if: inputs.test_target == 'windows_spawn_diagnostics'
