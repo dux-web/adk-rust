@@ -134,6 +134,23 @@ jobs:
           ref: ${{ inputs.revision || github.sha }}
       - name: Record the source revision
         run: git rev-parse HEAD
+      - name: Install bubblewrap for the driver suite
+        if: inputs.linux_suite == 'kernel'
+        timeout-minutes: 10
+        uses: ./.github/actions/apt-install
+        with:
+          packages: bubblewrap
+      - name: Require a working Linux enforcer
+        if: inputs.linux_suite == 'kernel'
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --version
+          bwrap --ro-bind / / --unshare-user --unshare-pid --new-session -- /bin/true
+          if bwrap --ro-bind / / --unshare-user --unshare-pid --new-session -- /bin/sh -c 'echo x > /tmp/adk-driver-nix-probe' 2>/dev/null; then
+            echo 'bubblewrap allowed a write to a read-only root' >&2
+            exit 1
+          fi
       - uses: cachix/install-nix-action@08dcb3a5e62fa31e2da3d490afc4176ef55ecd72
         with:
           nix_path: nixpkgs=channel:nixos-unstable
