@@ -19,6 +19,7 @@ on:
       - 'examples/harness_agent/src/sandbox.rs'
       - '.github/workflows/sandbox-docker.yml'
       - '.github/actions/setup-rust/**'
+      - '.github/actions/apt-install/**'
   workflow_dispatch:
 
 permissions:
@@ -49,6 +50,15 @@ jobs:
       uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
       with:
         tool: cargo-nextest
+
+    # The harness_agent example links libdbus-sys through its keychain support.
+    - name: Install system dependencies
+      # A stalled apt mirror once held jobs for the full six-hour limit; the action bounds and
+      # retries each apt attempt, and the step timeout bounds the whole install.
+      timeout-minutes: 10
+      uses: ./.github/actions/apt-install
+      with:
+        packages: libdbus-1-dev
 
     # The tests create containers from this image and never pull it themselves.
     - name: Pull the test image

@@ -258,12 +258,59 @@ pub(crate) fn gemini_error_to_adk(e: &adk_gemini::ClientError) -> adk_core::AdkE
         _ => None,
     };
     let err = crate::error_metadata::with_code(err, provider_code.as_deref());
-    match e {
+    let header = match e {
         adk_gemini::ClientError::BadResponse { retry_after: Some(header), .. } => {
-            crate::retry::with_retry_after(err, crate::retry::parse_retry_after(header))
+            crate::retry::parse_retry_after(header)
         }
-        _ => err,
+        _ => None,
+    };
+    crate::retry::with_retry_after(err, header.or_else(|| retry_info_delay(e)))
+}
+
+/// The delay a `google.rpc.RetryInfo` detail of the error asks for: the Gemini API reports
+/// the wait a quota needs there (`"retryDelay": "37s"`), not in a `Retry-After` header.
+fn retry_info_delay(error: &adk_gemini::ClientError) -> Option<std::time::Duration> {
+    let details: Vec<serde_json::Value> = match error {
+        adk_gemini::ClientError::BadResponse { description: Some(body), .. }
+        | adk_gemini::ClientError::ErrorInResponse { description: body, .. } => {
+            if body.len() > crate::error_metadata::MAX_BODY_LEN {
+                return None;
+            }
+            let body: serde_json::Value = serde_json::from_str(body).ok()?;
+            let error =
+                body.get("error").or_else(|| body.get(0).and_then(|item| item.get("error")))?;
+            error.get("details")?.as_array()?.clone()
+        }
+        #[cfg(feature = "gemini-vertex")]
+        adk_gemini::ClientError::GoogleCloudRequest { source } => source
+            .status()?
+            .details
+            .iter()
+            .filter_map(|detail| serde_json::to_value(detail).ok())
+            .collect(),
+        _ => return None,
+    };
+    details
+        .iter()
+        .filter(|detail| {
+            detail["@type"].as_str().is_some_and(|kind| kind.ends_with("google.rpc.RetryInfo"))
+        })
+        .find_map(|detail| parse_rpc_duration(detail["retryDelay"].as_str()?))
+}
+
+/// Parses a protobuf `Duration` in its JSON form (`"12s"`, `"1.5s"`), rounded up to whole
+/// milliseconds so a retry never starts early. Negative or malformed values are `None`.
+fn parse_rpc_duration(value: &str) -> Option<std::time::Duration> {
+    let value = value.strip_suffix('s')?;
+    let (seconds, fraction) = value.split_once('.').unwrap_or((value, ""));
+    let digits = |text: &str| text.bytes().all(|byte| byte.is_ascii_digit());
+    if seconds.is_empty() || !digits(seconds) || fraction.len() > 9 || !digits(fraction) {
+        return None;
     }
+    let nanos: u32 = format!("{fraction:0<9}").parse().ok()?;
+    let delay = std::time::Duration::new(seconds.parse().ok()?, nanos);
+    let millis = u64::try_from(delay.as_nanos().div_ceil(1_000_000)).ok()?;
+    Some(std::time::Duration::from_millis(millis))
 }
 
 /// Whether a google-cloud-gax error without a status is a failed connection or
@@ -439,6 +486,36 @@ fn vertex_target_from_env() -> Result<(String, String)> {
 }
 
 impl GeminiModel {
+    /// The thinking configuration of one request (spec 3.1 §7.23, §10 C4): the request's
+    /// `effort` becomes the `thinking_level` for this call on Gemini 3 and later, or on any
+    /// model configured with a level, replacing a configured token budget; elsewhere it is
+    /// logged and ignored.
+    fn request_thinking_config(&self, req: &LlmRequest) -> Option<adk_gemini::ThinkingConfig> {
+        let configured = self.thinking_config.clone();
+        let Some(level) = req.config.as_ref().and_then(|config| config.effort) else {
+            return configured;
+        };
+        let configured_level =
+            configured.as_ref().is_some_and(|config| config.thinking_level.is_some());
+        let generation = self.model_name.find("gemini-").and_then(|start| {
+            let version = &self.model_name[start + "gemini-".len()..];
+            let end = version.find(|c: char| !c.is_ascii_digit()).unwrap_or(version.len());
+            version[..end].parse::<u32>().ok()
+        });
+        if !configured_level && generation.is_none_or(|major| major < 3) {
+            tracing::debug!(
+                model.name = %self.model_name,
+                effort = %level,
+                "model takes no thinking level; the request's effort is ignored"
+            );
+            return configured;
+        }
+        let mut config = configured.unwrap_or_default();
+        config.thinking_budget = None;
+        config.thinking_level = Some(level.into());
+        Some(config)
+    }
+
     fn gemini_part_thought_signature(value: &serde_json::Value) -> Option<String> {
         value.get("thoughtSignature").and_then(serde_json::Value::as_str).map(str::to_string)
     }
@@ -1365,6 +1442,7 @@ impl GeminiModel {
         stream: bool,
     ) -> Result<LlmResponseStream> {
         let mut builder = self.client.generate_content();
+        let thinking_config = self.request_thinking_config(&req);
 
         // Build a map of function_name → thought_signature from FunctionCall parts
         // in model content. Gemini 3.x requires thought_signature on FunctionResponse
@@ -1609,7 +1687,7 @@ impl GeminiModel {
                 } else {
                     None
                 },
-                thinking_config: self.thinking_config.clone(),
+                thinking_config: thinking_config.clone(),
                 ..Default::default()
             };
             builder = builder.with_generation_config(gen_config);
@@ -1619,11 +1697,11 @@ impl GeminiModel {
                 let handle = self.client.get_cached_content(name);
                 builder = builder.with_cached_content(&handle);
             }
-        } else if self.thinking_config.is_some() {
+        } else if thinking_config.is_some() {
             // No generation config from the request, but we have a default
             // thinking config — apply it in an otherwise-default gen config.
             let gen_config = adk_gemini::GenerationConfig {
-                thinking_config: self.thinking_config.clone(),
+                thinking_config: thinking_config.clone(),
                 ..Default::default()
             };
             builder = builder.with_generation_config(gen_config);
@@ -1839,7 +1917,7 @@ impl GeminiModel {
 
         // Resolve the thinking level (Gemini 3 level-based reasoning). Budget-only
         // configs (Gemini 2.5) carry no level, so this stays `None` for them.
-        let thinking_level = self.thinking_config.as_ref().and_then(|c| c.thinking_level);
+        let thinking_level = self.request_thinking_config(&req).and_then(|c| c.thinking_level);
 
         let stateful = self.interaction_options.stateful;
         let store = self.interaction_options.store;
@@ -1998,7 +2076,7 @@ impl GeminiModel {
             .with_provider("gemini")
         })?;
 
-        let thinking_level = self.thinking_config.as_ref().and_then(|c| c.thinking_level);
+        let thinking_level = self.request_thinking_config(&req).and_then(|c| c.thinking_level);
         let stateful = self.interaction_options.stateful;
         let store = self.interaction_options.store;
 
@@ -2100,6 +2178,20 @@ impl Llm for GeminiModel {
     #[cfg(feature = "gemini-interactions")]
     fn uses_interactions_api(&self) -> bool {
         self.transport == GeminiTransport::Interactions
+    }
+
+    // generateContent serves `google_search` beside function tools on both backends, with
+    // no domain allowlist; the Interactions transport refuses that mix (spec 3.1 §7.20).
+    fn native_web_search(&self) -> Option<adk_core::NativeWebSearch> {
+        #[cfg(feature = "gemini-interactions")]
+        if self.transport == GeminiTransport::Interactions {
+            return None;
+        }
+        Some(adk_core::NativeWebSearch::new(
+            "gemini",
+            adk_core::NativeWebSearchTool::GoogleSearch,
+            false,
+        ))
     }
 
     // Named distinctly from the agent layer's `call_llm` span (which carries
@@ -2519,6 +2611,67 @@ mod tests {
             description: Some(without_reason.to_string()),
         });
         assert_eq!(error.details.metadata["provider_error_code"], "RESOURCE_EXHAUSTED");
+    }
+
+    fn quota_body(retry_delay: &str) -> String {
+        serde_json::json!({"error": {
+            "code": 429,
+            "message": "You exceeded your current quota.",
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [
+                {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": []},
+                {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay}
+            ]
+        }})
+        .to_string()
+    }
+
+    #[test]
+    fn retry_info_delay_is_the_retry_hint() {
+        for (delay, expected) in [
+            ("12s", Some(Duration::from_secs(12))),
+            ("1.5s", Some(Duration::from_millis(1500))),
+            ("0.000001s", Some(Duration::from_millis(1))),
+            ("0s", Some(Duration::ZERO)),
+            ("-1s", None),
+            ("12", None),
+            ("1.5.0s", None),
+            ("1.0000000001s", None),
+            ("s", None),
+            ("soon", None),
+        ] {
+            let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+                retry_after: None,
+                code: 429,
+                description: Some(quota_body(delay)),
+            });
+            assert_eq!(error.retry.retry_after(), expected, "{delay}");
+        }
+
+        // The header is the server's explicit answer; the body is the fallback.
+        let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+            retry_after: Some("3".into()),
+            code: 429,
+            description: Some(quota_body("40s")),
+        });
+        assert_eq!(error.retry.retry_after(), Some(Duration::from_secs(3)));
+
+        // An error object inside a successful response carries the same detail.
+        let error = gemini_error_to_adk(&adk_gemini::ClientError::ErrorInResponse {
+            code: Some(429),
+            status: Some("RESOURCE_EXHAUSTED".into()),
+            message: None,
+            description: quota_body("7s"),
+        });
+        assert_eq!(error.retry.retry_after(), Some(Duration::from_secs(7)));
+
+        // A non-retryable error carries no hint.
+        let error = gemini_error_to_adk(&adk_gemini::ClientError::BadResponse {
+            retry_after: None,
+            code: 400,
+            description: Some(quota_body("12s")),
+        });
+        assert_eq!(error.retry.retry_after(), None);
     }
 
     #[test]
@@ -3362,6 +3515,26 @@ mod vertex_transport_tests {
         assert_eq!(mapped.code, "model.gemini.rate_limited");
         assert_eq!(mapped.details.upstream_status_code, None);
         assert_eq!(mapped.details.metadata["provider_error_code"], "RATE_LIMITED");
+    }
+
+    #[test]
+    fn retry_info_on_the_status_is_the_retry_hint() {
+        let detail: StatusDetails = serde_json::from_value(serde_json::json!({
+            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+            "retryDelay": "2.5s"
+        }))
+        .expect("valid RetryInfo detail");
+        let status = Status::default()
+            .set_code(Code::ResourceExhausted)
+            .set_message("quota")
+            .set_details([detail]);
+        let error = adk_gemini::ClientError::GoogleCloudRequest {
+            source: GaxError::service_with_http_metadata(status, Some(429), None),
+        };
+        assert_eq!(
+            gemini_error_to_adk(&error).retry.retry_after(),
+            Some(std::time::Duration::from_millis(2500))
+        );
     }
 
     #[test]

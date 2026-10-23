@@ -42,6 +42,8 @@
 1 adk-harness hooks
 # The payments pack (spec 3.1 §7.16) links adk-payments, which no other harness feature does.
 1 adk-harness payments
+# The voice surface (spec 3.1 §7.17): the harness over adk-realtime's integrated runner.
+1 adk-harness voice
 # The crate docs' examples under the default tier: an `artifacts` example once compiled only
 # with `full`, and nothing ran the doctests below it.
 1 adk-rust minimal doc
@@ -54,6 +56,9 @@
 1 adk-harness docker,hooks
 # The managed form: HarnessDef, HarnessResolver and the managed runtime round trips.
 1 adk-harness managed
+# The kernel host (spec 3.2 §10 HK1, HK3): `Harness::kernel`, the approval wake and the goal
+# stall; no workspace member enables it until adk-cli's `harness` does.
+1 adk-harness kernel
 # The browser and computer-use packs (spec 3.1 §7.24): adk-browser and adk-computer-use enter
 # the harness only through them; `web-fixture` admits the loopback fixture page.
 1 adk-harness browser,computer-use,web-fixture doc
@@ -80,8 +85,19 @@
 2 adk-cli gcp-deploy
 # `audit export` from SQLite and PostgreSQL audit stores.
 2 adk-cli audit-sql
+# `serve --store postgres://…|redis://…` (spec 3.1 §8.2, §13 Q2).
+2 adk-cli postgres,redis
 # The `chat` end-to-end tests in a pseudo-terminal: held calls, Ctrl-C, sessions.
 2 adk-cli scripted-model
+# `adk-rust --voice` (spec 3.1 §7.17) end to end on a scripted realtime provider.
+2 adk-cli voice,scripted-model
+# adk-cli without the harness: the chat agent and the legacy `code`, `goal` and `ultracode`.
+2 adk-cli gemini no-default
+# The kernel's shared process stores for replicas (spec 3.2 §13 Q8); the live-server
+# conformance suites run in the postgres job.
+2 adk-kernel postgres,redis
+# The kernel without SQLite, webhooks or the histograms, with its conformance suites.
+2 adk-kernel conformance no-default
 
 # Shard 3 — adk-graph, adk-managed, adk-code.
 # No workspace member enables these four; four clippy failures and two uncompilable doc
@@ -94,6 +110,9 @@
 # Checkpointers for shared databases: compiles them and runs the in-process conformance
 # suites; the live-server suites run in the nightly `durable-stores` job.
 3 adk-graph postgres,redis,mongodb,neo4j,firestore
+# The harness's shared mode and rule stores and its plan checkpointer URLs over the same
+# backends (spec 3.1 §13 Q2, Q5); the live-server suites run in the postgres job.
+3 adk-harness postgres,redis,mongodb,neo4j,firestore
 # Two entries on purpose: `memory` alone left `sandbox` unbuilt, and a renamed
 # EnforcedLimits field kept its old name at a call site for two releases.
 3 adk-managed memory
@@ -132,9 +151,14 @@
 
 # Shard 5 — adk-realtime, adk-session, adk-memory, adk-eval, adk-deploy, adk-bench.
 5 adk-realtime integration
+# Held calls, metering and output guardrails on the integrated runner, and the scripted
+# provider the voice surface tests run on.
+5 adk-realtime integration,guardrails,scripted
 # The OpenAI realtime session and its WebSocket transport: compiled by the nightly `full`
 # build but never tested anywhere else.
 5 adk-realtime openai
+# The Gemini Live session: setup, usage reports, the audio stream end on commit.
+5 adk-realtime gemini
 5 adk-session vertex-session
 5 adk-session postgres
 # Durable stores on every backend: compiles them and runs the SQLite conformance suites;
@@ -175,6 +199,9 @@
 # Linux-only and feature-gated: nothing built it until a container run found the
 # bubblewrap probe could never succeed and its property tests did not compile.
 6 adk-sandbox sandbox-linux
+# The Windows restricted-token enforcer (spec 3.2 §10 W5): its grant mapping and probe compile
+# and are tested on every host; the Win32 launch runs on the PR tier's `windows` job.
+6 adk-sandbox sandbox-windows
 # `DockerClient` and its host-config and bind-mount tests: no workspace member enables
 # `workspace-docker`; the tests that need a Docker daemon are ignored.
 6 adk-sandbox workspace-docker
@@ -184,3 +211,5 @@
 # A surrealdb 3.2 parser change broke create_collection while every required check stayed
 # green; tests run on the embedded kv-mem engine.
 7 adk-rag surrealdb
+1 adk-harness mcp
+4 adk-model gemini no-default

@@ -26,16 +26,18 @@
 //! | `MemberSpec`, `HarnessTeam` (feature `team`) | §7.10 |
 //! | `PlanGraphs`, `compile_plan` (feature `graph`), [`GoalSpec`], [`GoalStore`], [`UntilCheckAgent`] | §7.11 |
 //! | `MemoryFact`, `FactStore`, `FactIndex`, `LongTermMemoryConfig`, `memory_search`, `memory_remember` (feature `memory`) | §7.15.2 |
+//! | `ConsolidationConfig`, `ConsolidationRequest`, `ConsolidationRecord`, `undo_consolidation`, `Harness::{distill_sessions, consolidate_memory}` (feature `memory`) | spec 3.2 §7.5, §10 HK2 |
 //! | `hooks::HookSpec`, `hooks::HookSet`, `hooks::HookRunner` (feature `hooks`) | §7.22 |
 //! | `packs::managed::{HarnessDef, HarnessResolver}` (feature `managed`) | §7.18 |
 //! | [`coding::CodingAgent`] | §7.19 |
-//! | [`WebConfig`], [`SearchProvider`], [`ProviderWebTools`], `web_fetch`, `web_search` (feature `web`) | §7.20 |
+//! | [`WebConfig`], [`SearchProvider`], [`ProviderWebTools`], [`WebSearchPath`], `web_fetch`, `web_search`, `SearxngSearch`, `DeepSeekSearch` (feature `web`) | §7.20 |
 //! | [`McpInteractionConfig`], `HarnessElicitationHandler`, `HarnessSamplingHandler`, `mcp_*_resource` (feature `mcp`) | §7.21 |
 //! | [`EffortPolicy`], [`Effort`] | §7.23 |
 //! | `encrypted::{StoreKeySource, StoreKeyring, StoreEnvelope, StoreRotation}` (feature `encrypted`) | §7.12 |
 //! | `packs::payments::{PaymentsPack, PaymentMandate}` (feature `payments`) | §7.16 |
 //! | `packs::browser::BrowserPack` (feature `browser`) | §7.24 |
 //! | `packs::computer_use::ComputerUsePack` (feature `computer-use`) | §7.24 |
+//! | `packs::voice::{VoiceSurface, VoiceConfig, VoiceEvent, SpokenDecision}` (feature `voice`) | §7.17 |
 //!
 //! # Example
 //!
@@ -59,6 +61,8 @@
 mod agent;
 mod audit;
 mod builder;
+#[cfg(feature = "graph")]
+mod checkpoint;
 mod config;
 #[cfg(feature = "encrypted")]
 pub mod encrypted;
@@ -71,6 +75,8 @@ mod harness;
 #[cfg(feature = "auth")]
 mod identity;
 mod instructions;
+#[cfg(feature = "kernel")]
+mod kernel;
 mod ledger;
 pub mod mcp;
 #[cfg(feature = "memory")]
@@ -102,6 +108,10 @@ pub mod conformance;
 pub mod hooks;
 
 pub use agent::{HARNESS_UNGOVERNED_CODE, HarnessAgent, HarnessInfo, HarnessLayer, HarnessRuntime};
+#[cfg(feature = "postgres")]
+pub use approvals::PostgresStandingRuleStore;
+#[cfg(feature = "redis")]
+pub use approvals::RedisStandingRuleStore;
 #[cfg(feature = "sqlite")]
 pub use approvals::SqliteStandingRuleStore;
 pub use approvals::{
@@ -114,6 +124,10 @@ pub use approvals::{
 #[cfg(feature = "observe")]
 pub use builder::LoopGuard;
 pub use builder::{HarnessAgentBuilder, Pack};
+#[cfg(all(feature = "graph", feature = "encrypted"))]
+pub use checkpoint::SealedCheckpointer;
+#[cfg(feature = "graph")]
+pub use checkpoint::checkpointer_from_url;
 pub use config::{HARNESS_CONFIG_FILE, HarnessConfig};
 #[cfg(any(feature = "memory-embeddings", feature = "memory-embeddings-local"))]
 pub use facts::RagEmbedder;
@@ -121,18 +135,27 @@ pub use facts::RagEmbedder;
 pub use facts::SqliteFactStore;
 #[cfg(feature = "memory")]
 pub use facts::{
+    BesideKnown, CONSOLIDATION_CLUSTER_SCORE, ChangeReason, ConsolidationConfig,
+    ConsolidationRecord, ConsolidationRequest, ConsolidationUndo, FactChange, SessionDistillation,
+    find_consolidation, undo_consolidation,
+};
+#[cfg(feature = "memory")]
+pub use facts::{
     FACT_AUTHOR_PREFIX, FACT_TEXT_MAX_CHARS, FactFilter, FactIndex, FactKind, FactProjects,
     FactScope, FactSource, FactStatus, FactStore, FileFactStore, InMemoryFactStore, LocalFactIndex,
     LongTermMemoryConfig, MemoryFact, MemoryServiceIndex, Provenance, fact_digest,
     redact_fact_text,
 };
+#[cfg(all(feature = "memory", feature = "kernel"))]
+pub use facts::{HarnessConsolidator, SessionStateFilter};
+pub use fsutil::redact_store_url;
 #[cfg(feature = "graph")]
 pub use goal::GoalEngine;
 #[cfg(feature = "sqlite")]
 pub use goal::SqliteGoalStore;
 pub use goal::{
-    GOAL_QUEUE, GOAL_STATE_KEY, GOAL_TARGET, GoalRecord, GoalSpec, GoalState, GoalStatus,
-    GoalStore, InMemoryGoalStore, UNTIL_CHECK_AGENT, UntilCheckAgent,
+    GOAL_QUEUE, GOAL_STALL_WINDOW, GOAL_STATE_KEY, GOAL_TARGET, GoalRecord, GoalSpec, GoalState,
+    GoalStatus, GoalStore, InMemoryGoalStore, UNTIL_CHECK_AGENT, UntilCheckAgent,
 };
 #[cfg(feature = "runner")]
 pub use harness::{CANCELLED_BY_MODE_CHANGE_STATUS, CloseReport, Harness, HarnessDecision};
@@ -154,6 +177,10 @@ pub use memory::{
     FileMemory, MEMORY_INDEX_FILE, MEMORY_INDEX_MARKER, MemoryChange, MemoryConfig, MemoryLayout,
     MemoryLimits, MemoryTopic, MemoryWritePolicy, project_slug,
 };
+#[cfg(feature = "postgres")]
+pub use mode::PostgresModeStore;
+#[cfg(feature = "redis")]
+pub use mode::RedisModeStore;
 #[cfg(feature = "sqlite")]
 pub use mode::SqliteModeStore;
 pub use mode::{
@@ -175,6 +202,11 @@ pub use packs::browser::{
 pub use packs::computer_use::{COMPUTER_USE_TOOL_NAMES, ComputerUsePack};
 #[cfg(feature = "payments")]
 pub use packs::payments::{PAYMENT_AUDIT_ACTION, PAYMENT_TOOL_NAMES, PaymentMandate, PaymentsPack};
+#[cfg(feature = "voice")]
+pub use packs::voice::{
+    DecisionSource, SpokenDecision, VOICE_AUDIT_DECIDED, VOICE_AUDIT_HELD, VOICE_AUDIT_RESUMED,
+    VoiceConfig, VoiceEvent, VoiceSurface, parse_spoken_decision,
+};
 #[cfg(feature = "graph")]
 pub use plan_graph::{
     ActivePlan, PLAN_GATE_TOOL, PlanGraphShape, PlanGraphs, PlanRunStatus, compile_plan,
@@ -219,4 +251,7 @@ pub use tools::{MemoryRememberTool, MemorySearchTool};
 #[cfg(feature = "web")]
 pub use tools::{WEB_TURN_CAP_CODE, WebFetchTool, WebSearchTool};
 pub use toolset::HarnessToolset;
+pub use web::WebSearchPath;
+#[cfg(feature = "web")]
+pub use web::{DeepSeekSearch, SearxngSearch};
 pub use web::{ProviderWebTools, SearchHit, SearchProvider, WebConfig};

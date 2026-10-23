@@ -125,6 +125,10 @@ pub struct HarnessAgentBuilder {
     confirmation_handler: Option<Arc<dyn ToolConfirmationHandler>>,
     approval_store: Option<Arc<dyn ApprovalStore>>,
     approval_service: Option<Arc<dyn ApprovalService>>,
+    #[cfg(feature = "kernel")]
+    kernel_approvals: Arc<crate::kernel::LateApprovalNotifier>,
+    #[cfg(feature = "kernel")]
+    kernel_agenda: adk_kernel::AgendaHandle,
     action_ledger: Option<Arc<dyn ActionLedger>>,
     confirmation_timeout: Duration,
     shell: ShellConfig,
@@ -172,7 +176,8 @@ pub struct HarnessAgentBuilder {
     last_todos: Option<Arc<Mutex<TodoList>>>,
     web: Option<crate::web::WebConfig>,
     search_provider: Option<Arc<dyn crate::web::SearchProvider>>,
-    provider_web_tools: crate::web::ProviderWebTools,
+    /// `None`: the model provider's search when `web` is set (spec 3.1 §7.20).
+    provider_web_tools: Option<crate::web::ProviderWebTools>,
     mcp_interaction: crate::mcp::McpInteractionConfig,
     #[cfg(feature = "mcp")]
     mcp_servers: Vec<crate::mcp::McpServerSet>,
@@ -193,6 +198,7 @@ pub struct HarnessAgentBuilder {
     #[cfg(feature = "computer-use")]
     computer_use: Option<crate::packs::computer_use::ComputerUsePack>,
     computer_use_requested: bool,
+    voice_requested: bool,
 }
 
 impl HarnessAgentBuilder {
@@ -216,6 +222,10 @@ impl HarnessAgentBuilder {
             confirmation_handler: None,
             approval_store: None,
             approval_service: None,
+            #[cfg(feature = "kernel")]
+            kernel_approvals: Arc::default(),
+            #[cfg(feature = "kernel")]
+            kernel_agenda: adk_kernel::AgendaHandle::default(),
             action_ledger: None,
             confirmation_timeout: Duration::from_secs(300),
             shell: ShellConfig::default(),
@@ -262,7 +272,7 @@ impl HarnessAgentBuilder {
             last_todos: None,
             web: None,
             search_provider: None,
-            provider_web_tools: crate::web::ProviderWebTools::default(),
+            provider_web_tools: None,
             mcp_interaction: crate::mcp::McpInteractionConfig::default(),
             #[cfg(feature = "mcp")]
             mcp_servers: Vec::new(),
@@ -283,12 +293,14 @@ impl HarnessAgentBuilder {
             #[cfg(feature = "computer-use")]
             computer_use: None,
             computer_use_requested: false,
+            voice_requested: false,
         }
     }
 
-    /// Governed web access (spec 3.1 §7.20): `web_fetch`, and `web_search` when a
-    /// [`search_provider`](Self::search_provider) is set, under `config`'s allowlist and
-    /// caps. Without feature `web` the configuration is kept and no tool is added.
+    /// Governed web access (spec 3.1 §7.20): `web_fetch` under `config`'s allowlist and
+    /// caps, and web search — the built-in search of the provider the model's client serves,
+    /// or the governed `web_search` when a [`search_provider`](Self::search_provider) is set.
+    /// Without feature `web` the configuration is kept and no tool is added.
     ///
     /// # Example
     ///
@@ -304,20 +316,40 @@ impl HarnessAgentBuilder {
         self
     }
 
-    /// The search backend behind `web_search` (spec 3.1 §7.20); none by default, so
-    /// `web_search` is declared only when one is set.
+    /// The search backend behind the governed `web_search` (spec 3.1 §7.20); none by
+    /// default. A configured provider replaces the model provider's built-in search, so
+    /// every search runs under the policy, screening and a per-call record.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let harness = HarnessAgent::builder("harness")
+    ///     .model(model)
+    ///     .workspace(workspace)
+    ///     .web(WebConfig::default())
+    ///     .search_provider(Arc::new(SearxngSearch::new("http://localhost:8888")?))
+    ///     .build()?;
+    /// assert!(harness.info().tools.contains(&"web_search".to_string()));
+    /// ```
     pub fn search_provider(mut self, provider: Arc<dyn crate::web::SearchProvider>) -> Self {
         self.search_provider = Some(provider);
         self
     }
 
-    /// Provider-executed search and URL tools (spec 3.1 §7.20); all off by default.
+    /// Provider-executed search and URL tools (spec 3.1 §7.20). Without this call a
+    /// harness with [`web`](Self::web) declares
+    /// [`ProviderWebTools::provider_default`](crate::web::ProviderWebTools::provider_default)
+    /// — the search built-in of the provider the model's client serves — unless a
+    /// [`search_provider`](Self::search_provider) is set; one without `web` declares none.
+    /// [`ProviderWebTools::off`](crate::web::ProviderWebTools::off) turns them off.
     ///
-    /// An enabled tool is attached for the harness model's provider only, carries the
-    /// allowlist where the provider supports one, is declared only to a run starting in
-    /// Ask or Auto, and is recorded as `harness.web.provider_enabled` once per run (I49).
+    /// An enabled tool is attached for the provider the model's client serves only
+    /// ([`adk_core::Llm::native_web_search`]), carries the allowlist where the provider
+    /// supports one, is declared only to a run starting in Ask or Auto, is recorded as
+    /// `harness.web.provider_enabled` once per run, and what it searched is recorded as
+    /// `harness.web.searched` after each response (I49).
     pub fn provider_web_tools(mut self, tools: crate::web::ProviderWebTools) -> Self {
-        self.provider_web_tools = tools;
+        self.provider_web_tools = Some(tools);
         self
     }
 
@@ -472,7 +504,12 @@ impl HarnessAgentBuilder {
     }
 
     /// The approval inbox held calls are submitted to.
+    ///
+    /// With feature `kernel`, the harness keeps a wrapper that also reports each request
+    /// reaching its outcome to the kernel `Harness::kernel` builds (spec 3.2 §7.4).
     pub fn approval_service(mut self, service: Arc<dyn ApprovalService>) -> Self {
+        #[cfg(feature = "kernel")]
+        let service = crate::kernel::NotifyingApprovals::wrap(service, &self.kernel_approvals);
         self.approval_service = Some(service);
         self
     }
@@ -682,12 +719,42 @@ impl HarnessAgentBuilder {
         self
     }
 
-    /// Where plan graphs are checkpointed (spec 3.1 §7.11; default in memory): SQLite
-    /// beside the harness stores in the CLI, the session's backend on a server.
+    /// Where plan graphs and the `Graph` goal engine are checkpointed (spec 3.1 §7.11,
+    /// §13 Q5). Without this or [`plan_checkpoint_store`](Self::plan_checkpoint_store),
+    /// plans live in memory and do not survive a restart; `adk-rust` checkpoints them in
+    /// the backend that holds its sessions.
     #[cfg(feature = "graph")]
     pub fn plan_checkpointer(mut self, checkpointer: Arc<dyn adk_graph::Checkpointer>) -> Self {
         self.plan_checkpointer = Some(checkpointer);
         self
+    }
+
+    /// Checkpoints plan graphs and the `Graph` goal engine in the store `url` names
+    /// (spec 3.1 §7.11, §13 Q5): `sqlite://`, `postgres://`, `redis://`, `mongodb://`,
+    /// `neo4j://` or `firestore://`, opened by [`checkpointer_from_url`](crate::checkpointer_from_url).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn example(model: std::sync::Arc<dyn adk_core::Llm>) -> adk_core::Result<()> {
+    /// let agent = adk_harness::HarnessAgent::builder("harness")
+    ///     .model(model)
+    ///     .plan_checkpoint_store("postgres://harness@db/harness")
+    ///     .await?
+    ///     .build()?;
+    /// # let _ = agent;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`checkpointer_from_url`](crate::checkpointer_from_url): an
+    /// unknown scheme, a scheme whose feature this build does not include, or a backend
+    /// that cannot be opened.
+    #[cfg(feature = "graph")]
+    pub async fn plan_checkpoint_store(self, url: &str) -> Result<Self> {
+        Ok(self.plan_checkpointer(crate::checkpoint::checkpointer_from_url(url).await?))
     }
 
     /// Long-term facts (spec 3.1 §7.15.2; off until set): recall into each user turn,
@@ -795,16 +862,16 @@ impl HarnessAgentBuilder {
     /// `managed`; `Pack::Browser` installs the browser pack over `BrowserConfig::default()`
     /// (Chrome, headless, WebDriver at `localhost:4444`) and fails at `build` without feature
     /// `browser`; `Pack::ComputerUse` needs the runtime `pack_computer_use` carries, so on its
-    /// own it fails at `build`; `Pack::Voice` is not yet implemented.
+    /// own it fails at `build`; `Pack::Voice` marks the harness for the voice surface
+    /// (`packs::voice::VoiceSurface` runs it, spec 3.1 §7.17) and fails at `build` without
+    /// feature `voice`.
     pub fn pack(mut self, pack: Pack) -> Self {
         match pack {
             Pack::Payments => self.payments_requested = true,
             Pack::Managed => self.managed_requested = true,
             Pack::Browser => self.browser_requested = true,
             Pack::ComputerUse => self.computer_use_requested = true,
-            Pack::Voice => {
-                self.unimplemented.push(format!("pack {pack:?} (spec 3.1 §7.17)"));
-            }
+            Pack::Voice => self.voice_requested = true,
         }
         self
     }
@@ -924,10 +991,21 @@ impl HarnessAgentBuilder {
     /// The reasoning effort of each mode and model role (spec 3.1 §7.23); the defaults
     /// are the spec's table (plan high, members low).
     ///
-    /// Until §10 C4 lands, providers read effort when their client is built, so the policy
-    /// applies where clients are built: `HarnessAgent::effort` reports it and a surface
-    /// builds the harness model at the session mode's level, the member model at `members`
-    /// and the distiller at `distiller`.
+    /// The policy applies per model call (§10 C4): each request of the harness model carries
+    /// the level of the mode it reads, a member's request `members`, the distiller's
+    /// `distiller` and an MCP sampling request `sampling`, as `GenerateContentConfig::effort`,
+    /// which each `adk-model` provider maps to its own control. A mode switch changes the
+    /// next call's effort without rebuilding a client.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use adk_harness::{Effort, EffortPolicy, HarnessAgent};
+    ///
+    /// let builder = HarnessAgent::builder("coder")
+    ///     .effort(EffortPolicy { plan: Effort::High, ask: Effort::Low, ..EffortPolicy::default() });
+    /// # let _ = builder;
+    /// ```
     pub fn effort(mut self, policy: crate::posture::EffortPolicy) -> Self {
         self.effort = policy;
         self
@@ -1064,6 +1142,13 @@ impl HarnessAgentBuilder {
                 ));
             }
         }
+        if self.voice_requested && cfg!(not(feature = "voice")) {
+            return Err(AdkError::config(
+                "the voice surface needs adk-harness feature `voice`: packs::voice::VoiceSurface \
+                 runs a harness marked Pack::Voice as the agent of an IntegratedRealtimeRunner \
+                 (spec 3.1 §7.17)",
+            ));
+        }
         let harness_names: HashSet<&str> = HARNESS_TOOL_NAMES.iter().copied().collect();
         for tool in &self.tools {
             if harness_names.contains(tool.name()) {
@@ -1114,7 +1199,9 @@ impl HarnessAgentBuilder {
                 )));
             }
         }
-        if self.search_provider.is_some() && self.provider_web_tools.anthropic_web_search {
+        if self.search_provider.is_some()
+            && self.provider_web_tools.is_some_and(|tools| tools.anthropic_web_search)
+        {
             return Err(AdkError::config(
                 "the governed web_search and Anthropic's provider web_search share one tool name; \
                  set a search provider or enable anthropic_web_search, not both (spec 3.1 §7.20)",
@@ -1325,6 +1412,13 @@ impl HarnessAgentBuilder {
             None => plan_exit,
         };
         tools.push(Arc::new(plan_exit));
+        // Follow-ups go on the agenda of the kernel hosting the harness (spec 3.2 §7.5).
+        #[cfg(feature = "kernel")]
+        tools.push(Arc::new(crate::kernel::ProposeFollowupTool::new(
+            self.kernel_agenda.clone(),
+            mode_store.clone(),
+            self.mode,
+        )));
         #[cfg(feature = "memory")]
         let memory_resolver = self.memory.clone().map(|config| {
             let resolver =
@@ -1349,6 +1443,7 @@ impl HarnessAgentBuilder {
                 self.member_model.clone().unwrap_or_else(|| model.clone()),
                 self.budget.clone(),
                 (mode_store.clone(), self.mode),
+                self.effort.distiller,
             )?
         };
         #[cfg(feature = "memory")]
@@ -1369,11 +1464,16 @@ impl HarnessAgentBuilder {
         // answer through, which is bound once the handler is built.
         #[cfg(feature = "mcp")]
         let mcp = (!self.mcp_servers.is_empty()).then(|| {
+            // Sampling runs at `sampling` (spec 3.1 §7.23), whichever model answers it.
+            let at_sampling =
+                |model: Arc<dyn Llm>| crate::posture::AtEffort::wrap(model, self.effort.sampling);
+            let mut interaction = self.mcp_interaction.clone();
+            interaction.sampling_model = interaction.sampling_model.map(at_sampling);
             Arc::new(crate::mcp::McpInteractionRuntime::new(
-                self.mcp_interaction.clone(),
+                interaction,
                 self.mcp_servers.clone(),
-                model.clone(),
-                self.member_model.clone(),
+                at_sampling(model.clone()),
+                self.member_model.clone().map(at_sampling),
             ))
         });
         #[cfg(feature = "mcp")]
@@ -1474,8 +1574,9 @@ impl HarnessAgentBuilder {
             observers.push(payments.reminder.clone());
         }
         #[cfg_attr(not(feature = "memory"), allow(unused_mut))]
-        let mut toolset =
-            HarnessToolset::new(tools, mode_store.clone(), self.mode).with_observers(&observers);
+        let mut toolset = HarnessToolset::new(tools, mode_store.clone(), self.mode)
+            .with_observers(&observers)
+            .with_effort(self.effort);
         #[cfg(feature = "docker")]
         if let Some(pool) = container_pool {
             toolset = toolset.with_containers(pool);
@@ -1486,21 +1587,52 @@ impl HarnessAgentBuilder {
         }
         let toolset = Arc::new(toolset);
 
-        // Provider-executed search and URL tools, for the model's provider only, declared
-        // to runs starting in Ask or Auto (spec 3.1 §7.20, I49).
+        // Provider-executed search and URL tools, for the provider the model's client
+        // serves only, declared to runs starting in Ask or Auto; by default the provider's
+        // search when web is on, replaced by a configured search provider (spec 3.1 §7.20,
+        // I49).
         #[cfg(feature = "web")]
-        let provider_web = if self.provider_web_tools.any() {
-            let allowlist =
-                self.web.as_ref().map(|web| web.allowed_domains.clone()).unwrap_or_default();
-            Some(Arc::new(crate::web::provider::ProviderWebToolset::new(
-                self.provider_web_tools,
-                model.name(),
-                allowlist,
-                mode_store.clone(),
-                self.mode,
-            )?))
-        } else {
-            None
+        let (provider_web, web_search_path) = {
+            let tools = self.provider_web_tools.unwrap_or(if self.web.is_some() {
+                crate::web::ProviderWebTools::provider_default()
+            } else {
+                crate::web::ProviderWebTools::off()
+            });
+            let toolset = if tools.any() {
+                let allowlist =
+                    self.web.as_ref().map(|web| web.allowed_domains.clone()).unwrap_or_default();
+                Some(crate::web::provider::ProviderWebToolset::new(
+                    tools,
+                    model.as_ref(),
+                    allowlist,
+                    self.search_provider.is_some(),
+                    mode_store.clone(),
+                    self.mode,
+                )?)
+            } else {
+                None
+            };
+            let path = match (&self.search_provider, &self.web) {
+                (Some(provider), Some(_)) => {
+                    crate::web::WebSearchPath::Governed { provider: provider.name().to_string() }
+                }
+                _ => match toolset.as_ref().and_then(|toolset| toolset.search_path()) {
+                    Some(path) => path,
+                    None if self.web.is_none() => {
+                        crate::web::WebSearchPath::None { reason: "web is off".into() }
+                    }
+                    None => crate::web::WebSearchPath::None {
+                        reason: "provider search is off and no search provider is configured"
+                            .into(),
+                    },
+                },
+            };
+            let toolset = toolset.filter(|toolset| !toolset.tool_names().is_empty()).map(Arc::new);
+            (toolset, path)
+        };
+        #[cfg(not(feature = "web"))]
+        let web_search_path = crate::web::WebSearchPath::None {
+            reason: "adk-harness is built without feature web".into(),
         };
         #[cfg(feature = "web")]
         let provider_web_names: BTreeSet<String> =
@@ -1581,6 +1713,9 @@ impl HarnessAgentBuilder {
         }
         if self.managed_requested {
             packs.push("managed".to_string());
+        }
+        if self.voice_requested {
+            packs.push("voice".to_string());
         }
         let environment = Environment {
             root: workspace.root().display().to_string(),
@@ -1673,8 +1808,20 @@ impl HarnessAgentBuilder {
         } else {
             non_waivable
         };
+        // A provider that refuses its built-in web tools gets the request again without
+        // them (spec 3.1 §7.20).
+        #[cfg(feature = "web")]
+        let agent_model: Arc<dyn Llm> = match &provider_web {
+            Some(provider_web) => Arc::new(crate::web::provider::ProviderSearchFallback::new(
+                model.clone(),
+                provider_web.clone(),
+            )),
+            None => model.clone(),
+        };
+        #[cfg(not(feature = "web"))]
+        let agent_model = model.clone();
         let mut builder = LlmAgentBuilder::new(self.name.clone())
-            .model(model.clone())
+            .model(agent_model)
             .description(self.description.unwrap_or_else(|| {
                 "A governed harness that reads, edits and runs code in the workspace under approvals."
                     .to_string()
@@ -1746,6 +1893,7 @@ impl HarnessAgentBuilder {
                 #[cfg(feature = "skills")]
                 skills: &self.skills,
                 observers: &observers,
+                effort: self.effort,
             })?)),
             None => None,
         };
@@ -1821,6 +1969,7 @@ impl HarnessAgentBuilder {
             tools: tool_names,
             effort: self.effort,
             context_caching: self.context_caching,
+            web_search: web_search_path,
         };
         let _ = (self.default_members, self.member_model, self.plan_graph);
         Ok(HarnessAgent {
@@ -1864,6 +2013,10 @@ impl HarnessAgentBuilder {
                 #[cfg(feature = "graph")]
                 plan_graph: plan_graphs,
                 goals,
+                #[cfg(feature = "kernel")]
+                kernel_approvals: self.kernel_approvals,
+                #[cfg(feature = "kernel")]
+                kernel_agenda: self.kernel_agenda,
                 #[cfg(feature = "web")]
                 provider_web,
                 #[cfg(feature = "mcp")]
@@ -1871,7 +2024,6 @@ impl HarnessAgentBuilder {
                 #[cfg(feature = "hooks")]
                 hooks: hook_runner,
                 effort: self.effort,
-                #[cfg(feature = "runner")]
                 cache_capable: self.context_caching.then_some(self.cache_capable).flatten(),
                 #[cfg(feature = "payments")]
                 payments: payments.map(|payments| payments.reminder),
@@ -1998,6 +2150,7 @@ impl LongTermOptions {
         member_model: Arc<dyn Llm>,
         budget: Option<RunBudget>,
         (mode_store, default_mode): (Arc<dyn ModeStore>, HarnessMode),
+        distiller: crate::posture::Effort,
     ) -> Result<Option<Arc<crate::facts::runtime::FactsRuntime>>> {
         let Some(config) = self.config.clone() else {
             if self.store.is_some() || self.index.is_some() || self.embedder.is_some() {
@@ -2023,20 +2176,29 @@ impl LongTermOptions {
             ),
             (None, None) => Arc::new(crate::facts::LocalFactIndex::new(store.clone())),
         };
-        let distill_model = config.distill_model.clone().unwrap_or(member_model);
-        Ok(Some(Arc::new(crate::facts::runtime::FactsRuntime::new(
-            config,
-            store,
-            index,
-            crate::memory::project_slug(workspace_root),
-            agent.to_string(),
-            require_authenticated,
-            audit,
-            distill_model,
-            budget,
-            mode_store,
-            default_mode,
-        ))))
+        // The distiller runs at `distiller` (spec 3.1 §7.23), whichever model it is.
+        let distill_model = crate::posture::AtEffort::wrap(
+            config.distill_model.clone().unwrap_or(member_model),
+            distiller,
+        );
+        // Consolidation embeds with the default index's embedder (spec 3.2 §7.5).
+        let embedder = if self.index.is_none() { self.embedder.clone() } else { None };
+        Ok(Some(Arc::new(
+            crate::facts::runtime::FactsRuntime::new(
+                config,
+                store,
+                index,
+                crate::memory::project_slug(workspace_root),
+                agent.to_string(),
+                require_authenticated,
+                audit,
+                distill_model,
+                budget,
+                mode_store,
+                default_mode,
+            )
+            .with_embedder(embedder),
+        )))
     }
 }
 

@@ -6,7 +6,6 @@ mod prompt;
 mod rule;
 mod store;
 
-#[cfg(feature = "runner")]
 pub(crate) use prompt::rule_audit_fields;
 pub use prompt::{
     ApprovalPrompt, ApprovalPrompter, DEFAULT_PROMPTS_PER_TURN, PromptAnswer,
@@ -16,6 +15,10 @@ pub use rule::{
     ArgSpec, OriginPin, RuleOwner, RulePredicate, RuleScope, RuleSuggestion,
     SHELL_PREFIX_SUGGESTION_DENYLIST, StandingDecision, StandingRule, SuggestedScope,
 };
+#[cfg(feature = "postgres")]
+pub use store::PostgresStandingRuleStore;
+#[cfg(feature = "redis")]
+pub use store::RedisStandingRuleStore;
 #[cfg(feature = "sqlite")]
 pub use store::SqliteStandingRuleStore;
 pub use store::{FileStandingRuleStore, InMemoryStandingRuleStore, StandingRuleStore};

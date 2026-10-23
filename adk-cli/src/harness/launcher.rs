@@ -1,5 +1,5 @@
-//! `HarnessLauncher`: the harness REPL, one-turn runs and the served harness
-//! (spec 3.1 §8.1, §8.2).
+//! `HarnessLauncher`: the harness REPL, one-turn runs, the served harness (spec 3.1 §8.1,
+//! §8.2) and its resident form on the agent kernel (spec 3.2 §7.1, §8.1).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -40,9 +40,9 @@ const SERVE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Rebuilds the harness with the OS sandbox on (`true`) or off, for `/sandbox on|off`.
 pub type HarnessRebuild = Arc<dyn Fn(bool) -> Result<HarnessAgent> + Send + Sync>;
 
-/// Rebuilds the harness with its model clients at another effort, for
-/// `/effort low|medium|high` (spec 3.1 §7.23): the providers read effort when a client
-/// is built, so the session's clients are restarted.
+/// Rebuilds the harness with every mode and role at another effort, for
+/// `/effort low|medium|high` (spec 3.1 §7.23); the harness sets each request's effort, so
+/// the next model call runs at it on the same client.
 pub type HarnessEffortRebuild =
     Arc<dyn Fn(Effort) -> Pin<Box<dyn Future<Output = Result<HarnessAgent>> + Send>> + Send + Sync>;
 
@@ -86,6 +86,10 @@ pub struct TurnOutcome {
 ///   the operator by default ([`LoopbackOperatorExtractor`]); any other address needs
 ///   one set with [`with_request_context_extractor`](Self::with_request_context_extractor),
 ///   such as [`BearerTokenExtractor`](super::BearerTokenExtractor).
+/// - With a kernel ([`with_kernel`](Self::with_kernel)) serve mode is the resident form
+///   (spec 3.2 §8.1): the kernel's workers execute the runs, its control plane is mounted
+///   under `/api/kernel` and on its socket, and `POST /api/admin/freeze` parks running
+///   processes. [`run`](Self::run) parses `up [--port] [--host]` for it.
 ///
 /// # Example
 ///
@@ -128,6 +132,8 @@ pub struct HarnessLauncher {
     security_config: Option<SecurityConfig>,
     bind_address: IpAddr,
     run_store: Option<Arc<dyn DurableRunStore>>,
+    goal_queue: Option<String>,
+    kernel: Option<adk_kernel::Kernel>,
     hooks_disabled: bool,
     opened: Option<Arc<Shared>>,
 }
@@ -147,8 +153,25 @@ impl HarnessLauncher {
     /// A launcher for `agent`, running as user `"user"` in the app named after the agent,
     /// with in-memory sessions, until configured otherwise.
     pub fn new(agent: HarnessAgent) -> Self {
+        Self::shared(Arc::new(agent))
+    }
+
+    /// [`new`](Self::new) for an agent other parts of the program hold too, such as the
+    /// `Harness` a resident kernel is built from with `Harness::kernel` (spec 3.2 §10 HK1):
+    /// the served inbox then decides through the same agent's approval service, which wakes
+    /// the kernel's approval sleepers.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let agent = Arc::new(harness_agent);
+    /// let harness = Harness::with_runner(agent.clone(), runner)?;
+    /// let kernel = harness.kernel().build()?;
+    /// HarnessLauncher::shared(agent).with_kernel(kernel).run_serve_directly(8080).await?;
+    /// ```
+    pub fn shared(agent: Arc<HarnessAgent>) -> Self {
         Self {
-            agent: Arc::new(agent),
+            agent,
             app_name: None,
             session_service: None,
             user_id: "user".to_string(),
@@ -169,6 +192,8 @@ impl HarnessLauncher {
             security_config: None,
             bind_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             run_store: None,
+            goal_queue: None,
+            kernel: None,
             hooks_disabled: false,
             opened: None,
         }
@@ -251,14 +276,14 @@ impl HarnessLauncher {
         self
     }
 
-    /// Lets `/effort low|medium|high` rebuild the harness with its model clients at that
+    /// Lets `/effort low|medium|high` rebuild the harness with every mode and role at that
     /// level (spec 3.1 §7.23).
     pub fn with_effort_rebuild(mut self, rebuild: HarnessEffortRebuild) -> Self {
         self.effort_rebuild = Some(rebuild);
         self
     }
 
-    /// The effort the session's clients were built at, shown by `/effort`.
+    /// The effort `/effort` shows for the session; without it `/effort` shows "per mode".
     pub fn with_effort(mut self, effort: Effort) -> Self {
         self.effort = Some(effort);
         self
@@ -320,6 +345,40 @@ impl HarnessLauncher {
         self
     }
 
+    /// Enqueues durable goals on `queue` instead of
+    /// [`GOAL_QUEUE`](adk_harness::GOAL_QUEUE): `background` hands them to a running
+    /// kernel's background worker (spec 3.2 §8.1, `goal` on a running kernel).
+    pub fn with_goal_queue(mut self, queue: impl Into<String>) -> Self {
+        self.goal_queue = Some(queue.into());
+        self
+    }
+
+    /// Serves the harness as the resident agent kernel's HTTP surface (spec 3.2 §7.1,
+    /// §7.11, §8.1).
+    ///
+    /// [`run_serve_directly`](Self::run_serve_directly) then starts `kernel` before it
+    /// listens, mounts its control plane ([`adk_kernel::control::router`]) under
+    /// `/api/kernel` behind the same extractor as the approvals inbox, shares the kernel's
+    /// kill switch with the server, registers the kernel as the freeze delegate of
+    /// `POST /api/admin/freeze` (spec 3.2 §10 S4), and on Ctrl-C or `SIGTERM` drains and
+    /// stops the kernel. Build the kernel over the same run store, approval service and
+    /// sessions as the launcher, and its background runs with the `interactive` queue and
+    /// no embedded worker, so the kernel's workers execute every run.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let kernel = adk_kernel::Kernel::builder()
+    ///     .run_store(runs.clone())
+    ///     .agent("adk-rust", runner)
+    ///     .build()?;
+    /// HarnessLauncher::new(harness).with_run_store(runs).with_kernel(kernel).run_serve_directly(8080).await?;
+    /// ```
+    pub fn with_kernel(mut self, kernel: adk_kernel::Kernel) -> Self {
+        self.kernel = Some(kernel);
+        self
+    }
+
     /// The session the launcher works in, once a turn or the REPL has opened it.
     pub fn session_id(&self) -> Option<&str> {
         self.opened.as_ref().map(|shared| shared.session.as_ref())
@@ -349,6 +408,13 @@ impl HarnessLauncher {
                 #[arg(long)]
                 host: Option<IpAddr>,
             },
+            /// Run the harness as the agent kernel, in the foreground (spec 3.2 §8.1)
+            Up {
+                #[arg(long, default_value_t = 8080)]
+                port: u16,
+                #[arg(long)]
+                host: Option<IpAddr>,
+            },
         }
         match Cli::parse().command.unwrap_or(Command::Chat) {
             Command::Chat => self.run_console_directly().await,
@@ -359,7 +425,70 @@ impl HarnessLauncher {
                 };
                 launcher.run_serve_directly(port).await
             }
+            Command::Up { port, host } => {
+                let launcher = match host {
+                    Some(host) => self.with_bind_address(host),
+                    None => self,
+                };
+                launcher.resident()?.run_serve_directly(port).await
+            }
         }
+    }
+
+    /// This launcher with a kernel over its own stores, for `up` from [`run`](Self::run):
+    /// the launcher's run store or an in-memory one, its approval service and sessions, the
+    /// harness runner as the `adk-rust`-style app target and as `harness.goal`, and its
+    /// home under the user's config directory named after the app.
+    fn resident(mut self) -> Result<Self> {
+        if self.kernel.is_some() {
+            return Ok(self);
+        }
+        let app_name = self.resolved_app_name();
+        let sessions =
+            self.session_service.clone().unwrap_or_else(|| Arc::new(InMemorySessionService::new()));
+        self.session_service = Some(sessions.clone());
+        let runs: Arc<dyn DurableRunStore> =
+            self.run_store.clone().unwrap_or_else(|| Arc::new(adk_core::InMemoryRunStore::new()));
+        self.run_store = Some(runs.clone());
+        let root: Arc<dyn Agent> = self.agent.clone();
+        let runner = Runner::builder()
+            .app_name(&app_name)
+            .agent(root)
+            .session_service(sessions)
+            .approval_store(self.agent.runtime().approval_store().clone())
+            .build()?;
+        // The harness glue registers the runner, its services and the goal progress
+        // (spec 3.2 §10 HK1).
+        let harness = Harness::with_runner(self.agent.clone(), runner)?
+            .with_run_store(runs.clone())
+            .with_goal_queue(adk_kernel::QueueClass::BACKGROUND);
+        let home = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join(&app_name);
+        let kernel = harness
+            .kernel()
+            .config(adk_kernel::KernelConfig::default().with_app_name(&app_name).with_home(home))
+            .build()
+            .map_err(AdkError::from)?;
+        // Decisions go through the harness's service, which wakes the kernel's approval
+        // sleepers.
+        if let Some(service) = self.agent.runtime().approval_service() {
+            self.approval_service = Some(service.clone());
+        }
+        if self.background_runs.is_none() {
+            let (target, runner) = harness.goal_target();
+            self.background_runs = Some(
+                BackgroundState::new()
+                    .with_run_store(runs)
+                    .with_app_name(&app_name)
+                    .with_agent(app_name, runner.clone())
+                    .with_agent(target, runner)
+                    .with_worker_config(
+                        adk_server::background::DurableWorkerConfig::default()
+                            .with_queue(adk_kernel::QueueClass::INTERACTIVE),
+                    )
+                    .with_embedded_worker(false),
+            );
+        }
+        Ok(self.with_kernel(kernel))
     }
 
     pub(super) async fn open(&mut self) -> Result<Arc<Shared>> {
@@ -384,6 +513,10 @@ impl HarnessLauncher {
         .await?;
         let harness =
             harness_for(self.agent.clone(), &app_name, sessions.clone(), self.run_store.clone())?;
+        let harness = match &self.goal_queue {
+            Some(queue) => harness.with_goal_queue(queue.clone()),
+            None => harness,
+        };
         let user = UserId::new(self.user_id.clone())?;
         let session = SessionId::new(session)?;
         if let Some(mode) = self.mode
@@ -526,7 +659,10 @@ impl HarnessLauncher {
     /// Builds the HTTP app serving the harness (spec 3.1 §8.2).
     ///
     /// The harness is mounted through `ServerBuilder` with the approval inbox and
-    /// background runs when configured. Without an extractor, loopback peers are admitted
+    /// background runs when configured, and its standing rules under `/api/rules`
+    /// (spec 3.1 §7.5): list, create from a held call's suggestion or explicitly, revoke,
+    /// for callers with the `operator` scope, each audited with `surface: rest`. Without an
+    /// extractor, loopback peers are admitted
     /// as the operator ([`LoopbackOperatorExtractor`]), and the router records each
     /// request's peer for it; serve it with `into_make_service_with_connect_info`.
     ///
@@ -535,9 +671,23 @@ impl HarnessLauncher {
     /// Returns a configuration error when the bind address is not loopback and no
     /// extractor authenticates requests.
     pub fn build_app(self) -> Result<Router> {
+        let kernel = self.kernel.clone();
+        let rules = super::rules::rules_router(super::rules::RuleEndpoints {
+            agent: self.agent.clone(),
+            app_name: self.resolved_app_name(),
+            approvals: self.approval_service.clone(),
+        });
         let mut launcher = Launcher::new(self.agent.agent())
             .app_name(self.resolved_app_name())
-            .with_bind_address(self.bind_address);
+            .with_bind_address(self.bind_address)
+            .with_api_routes(rules);
+        // The kernel's control plane beside the inbox, behind the same extractor, and its
+        // kill switch on the server (spec 3.2 §7.11, §10 S4).
+        if let Some(kernel) = kernel {
+            launcher = launcher
+                .with_api_routes(adk_kernel::control::router(kernel.clone()))
+                .with_kernel_governance(kernel.config().governance.clone(), Arc::new(kernel));
+        }
         if let Some(sessions) = self.session_service {
             launcher = launcher.with_session_service(sessions);
         }
@@ -585,10 +735,14 @@ impl HarnessLauncher {
     pub async fn run_serve_directly(self, port: u16) -> Result<()> {
         let addr = SocketAddr::new(self.bind_address, port);
         let info = self.agent.info().clone();
+        let kernel = self.kernel.clone();
         let app = self.build_app()?;
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| AdkError::config(format!("failed to bind {addr}: {e}")))?;
+        if let Some(kernel) = kernel {
+            return serve_resident(kernel, listener, app, addr, &info).await;
+        }
         println!("ADK-Rust harness serving on http://{addr}");
         println!(
             "  mode {} · shell {}",
@@ -596,12 +750,47 @@ impl HarnessLauncher {
             terminal_safe(&info.isolation.to_string())
         );
         println!("  approvals: GET /api/approvals, POST /api/approvals/{{id}}/decide");
+        println!("  standing rules: GET /api/rules, POST /api/rules, DELETE /api/rules/{{id}}");
         println!("Press Ctrl+C to stop\n");
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| AdkError::config(format!("server error: {e}")))
     }
+}
+
+/// Serves `app` on `listener` with `kernel` resident: the kernel starts before the first
+/// request and drains and stops on Ctrl-C or `SIGTERM` (spec 3.2 §7.2, §8.1).
+async fn serve_resident(
+    kernel: adk_kernel::Kernel,
+    listener: tokio::net::TcpListener,
+    app: Router,
+    addr: SocketAddr,
+    info: &adk_harness::HarnessInfo,
+) -> Result<()> {
+    kernel.start().await.map_err(AdkError::from)?;
+    let config = kernel.config();
+    println!("ADK-Rust kernel up on http://{addr}");
+    if let Some(socket) = config.control.socket_path(&config.home) {
+        println!("  socket {}", socket.display());
+    }
+    println!("  home {}", config.home.display());
+    println!("  mode {} · shell {}", info.default_mode, terminal_safe(&info.isolation.to_string()));
+    let queues: Vec<&str> = config.queues.iter().map(adk_kernel::QueueClass::as_str).collect();
+    println!("  queues {}", queues.join(", "));
+    println!("  control: adk-rust ps | top | attach | kill | suspend | resume | freeze | events");
+    println!("  approvals: GET /api/approvals, POST /api/approvals/{{id}}/decide");
+    println!("Press Ctrl+C to drain and stop\n");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+    });
+    // Both wait for the same signal: the server stops accepting, the kernel drains.
+    let stopped = kernel.shutdown_on_signal().await.map_err(AdkError::from);
+    let served = server.await.map_err(|e| AdkError::config(format!("server task failed: {e}")))?;
+    served.map_err(|e| AdkError::config(format!("server error: {e}")))?;
+    stopped
 }
 
 /// Prints how a REPL turn ended.
@@ -828,7 +1017,7 @@ impl Shared {
         out
     }
 
-    /// Replaces the harness with one whose model clients run at `effort`
+    /// Replaces the harness with one whose every mode and role runs at `effort`
     /// (spec 3.1 §7.23).
     pub(crate) async fn rebuild_effort(&self, effort: Effort) -> Result<Option<Arc<Harness>>> {
         let Some(rebuild) = &self.effort_rebuild else {
@@ -846,7 +1035,7 @@ impl Shared {
         Ok(Some(harness))
     }
 
-    /// The effort the session's clients run at, when the surface told the launcher.
+    /// The session's effort, once `/effort` or the surface set one.
     pub(crate) fn current_effort(&self) -> Option<Effort> {
         *self.effort.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }

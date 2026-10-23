@@ -9,6 +9,7 @@ adk-rust serve                                  # 127.0.0.1:8080, plan mode
 adk-rust serve --mode ask --dir ./project       # edits and commands wait for approval
 adk-rust serve --host 0.0.0.0 --auth-token "$TOKEN"
 adk-rust serve --agent chat                     # the plain chat agent, as before the harness
+adk-rust serve --store postgres://harness@db/harness --port 8081   # one replica of several
 ```
 
 | Default | Value |
@@ -16,8 +17,10 @@ adk-rust serve --agent chat                     # the plain chat agent, as befor
 | Agent and app name | `adk-rust` |
 | Mode | `plan`; the model reads the workspace and proposes plans, nothing changes |
 | Approval inbox | `/api/approvals`, expiry ticker every 30 s |
+| Standing rules | `/api/rules`, for callers with the `operator` scope |
 | Background runs | `/api/runs`, target `adk-rust` |
-| Storage | `<config dir>/adk-rust/harness.db`, shared with the REPL |
+| Storage | `<config dir>/adk-rust/harness.db`, shared with the REPL; `--store <url>` for [replicas](#running-replicas) |
+| Plans and goal graphs | Checkpointed in the same store; `--checkpointer <url>` names another |
 | Request timeout | 15 minutes, since a turn runs model calls and commands (`with_security_config` sets another) |
 
 > **Important:** a served harness in plan mode still lets the model read the whole workspace.
@@ -40,6 +43,59 @@ own runs.
 
 The bundled web UI sends no `Authorization` header and never calls `/api/approvals`: use it
 on loopback, and decide held calls with `adk-rust approvals` or `curl`.
+
+## Running replicas
+
+Several `adk-rust serve` processes behind one load balancer share their state through one
+store (spec 3.1 §8.2, §13 Q2). `--store` names it, and every store of the served harness moves
+there together:
+
+```bash
+cargo install adk-cli --features postgres          # or --features redis
+adk-rust serve --store postgres://harness:…@db/harness --host 0.0.0.0 --port 8080 --auth-token "$TOKEN"
+adk-rust serve --store postgres://harness:…@db/harness --host 0.0.0.0 --port 8081 --auth-token "$TOKEN"
+```
+
+| Store | `postgres://…` | `redis://…` |
+|---|---|---|
+| Sessions | `PostgresSessionService` | `RedisSessionService` |
+| Held calls and decisions | `PostgresApprovalStore` | `RedisApprovalStore` |
+| Durable runs | `PostgresRunStore` | `RedisRunStore` |
+| Modes | `PostgresModeStore` (`adk_harness_modes`) | `RedisModeStore` |
+| Standing rules | `PostgresStandingRuleStore` (`adk_harness_rules`, `adk_harness_rule_versions`) | `RedisStandingRuleStore` |
+| Plans and goal graphs | `PostgresCheckpointer` | `RedisCheckpointer` |
+
+The PostgreSQL stores share one connection pool and migrate under advisory locks, so
+replicas can start together. The banner names the store with its password redacted.
+`adk-rust rules --store <url>` lists, adds and revokes the standing rules every replica
+reads:
+
+```bash
+adk-rust rules add bash --prefix "cargo test" --store postgres://harness:…@db/harness
+adk-rust rules list --store postgres://harness:…@db/harness
+adk-rust rules rm 1 --store postgres://harness:…@db/harness
+```
+
+| Guarantee | Mechanism |
+|---|---|
+| A mode tightened through one replica applies on every replica at the next tool call (I14) | The policy reads the mode store on every evaluation |
+| A rule granted through one replica's inbox is matched by every replica | Rules live in the shared store; a replica reads them at evaluation time |
+| A revocation through one replica is refused by every replica from its next call (I4) | Each grant and revocation increments the app's rule version in the transaction or script that changes the rule; a replica serves rules from its cache only while the stored version matches, so an unchanged app costs one primary-key read or one `GET` per call |
+| A decision taken on one replica wakes the parked run on any replica | The approval store and the durable run store are shared |
+| An approved plan or a goal's graph continues on another replica | Checkpoints are in the shared store |
+
+`adk-harness/tests/shared_store_postgres_tests.rs` and `shared_store_redis_tests.rs` run the
+mode and rule conformance suites, two store instances over one backend, and two `Harness`
+values over one backend: a rule granted through the first is matched by the second, a
+revocation through the first is refused by the second on its next call, and a mode tightened
+on the first applies on the second. CI's `postgres` job runs both against its PostgreSQL and
+Redis services.
+
+| Limit | Reason |
+|---|---|
+| `--store` refuses a store key (`--store-key`, `[store] key`) | The shared mode and rule stores are not sealed by the store envelope; encrypt the backend at rest instead (spec 3.1 I57) |
+| The shell ledger, goal records and workspace trust stay per process | An unsandboxed retry is offered only on the replica that saw the failed command; goal records live in the memory of the replica that started the goal, so run goals against one replica |
+| Long-term memory is off | As on every served harness (spec 3.1 §7.15.2) |
 
 ## Deciding a held call over HTTP
 
@@ -74,6 +130,41 @@ adk-rust approvals list --server http://127.0.0.1:8080
 adk-rust approvals approve apr_… --server http://127.0.0.1:8080
 adk-rust approvals deny apr_… --reason "not on main" --server https://agents.example.com --token "$TOKEN"
 ```
+
+## Standing rules over HTTP
+
+A served harness keeps its standing rules under `/api/rules` (spec 3.1 §7.5). The routes sit
+behind the same authentication as `/api/approvals` and need the `operator` scope: no caller
+is `401`, a caller without the scope `403`. A rule's subject is always the authenticated
+caller — a body that names a `userId` is refused — so a rule covers only the caller's own
+calls, and a caller lists and revokes only their own rules.
+
+| Route | Effect |
+|---|---|
+| `GET /api/rules` | The caller's rules, oldest first |
+| `GET /api/rules/suggestions/{approvalId}` | The rules a call held in one of the caller's sessions offers, as a prompt would |
+| `POST /api/rules` | `{"approvalId": "apr_…", "suggestion": 1}` remembers an offered rule; `{"tool": "bash", "prefix": "cargo test"}` creates an explicit rule pinned to the served harness's declaration of the tool. Optional: `"decision": {"kind": "deny", "reason": "…"}`, `"expiresInHours": 8`; explicit rules also take `"pathWithin": "src"` and `"sessionId": "s1"`. Answers `201` with the rule |
+| `DELETE /api/rules/{id}` | Revokes one of the caller's rules; it stops applying from the next call |
+
+Every grant and revocation is recorded as `harness.rule.created` or `harness.rule.revoked`
+with `surface: rest` before the store write. Creating a rule from a held call does not
+decide that call: decide it through `/api/approvals`.
+
+```bash
+# The held call's offers, then "always allow `cargo test …`" (offer 0) for every session.
+curl -s localhost:8080/api/rules/suggestions/apr_…
+curl -s localhost:8080/api/rules -H 'content-type: application/json' \
+  -d '{"approvalId": "apr_…", "suggestion": 0}'
+
+# An explicit rule, and its revocation.
+curl -s localhost:8080/api/rules -H 'content-type: application/json' \
+  -d '{"tool": "bash", "prefix": "cargo test", "expiresInHours": 8}'
+curl -s -X DELETE localhost:8080/api/rules/<rule id>
+```
+
+A `bash` allow rule needs a `prefix` of plain command words that does not start with a
+command runner (`sh`, `bash`, `env`, `sudo` and similar); `exit_plan_mode`, memory writes,
+payments and desktop actions are never covered by a rule.
 
 ## Serving your own harness
 
@@ -275,4 +366,5 @@ resolver builds; without feature `managed` the build fails naming the feature.
 - [Launcher](../deployment/launcher.md)
 - [Agent Engine](../deployment/agent-engine.md)
 - [Managed agent runtime](../managed-agents/runtime.md)
-- Spec: `docs/design/spec-3.1-harness-agent.md` §8.2, §8.5, §7.18
+- [Durability](durability.md)
+- Spec: `docs/design/spec-3.1-harness-agent.md` §8.2, §8.5, §7.18, §13 Q2

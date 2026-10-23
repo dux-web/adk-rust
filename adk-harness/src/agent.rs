@@ -63,6 +63,8 @@ pub struct HarnessInfo {
     pub effort: crate::posture::EffortPolicy,
     /// Whether a `cache_capable` model gets the runner's explicit context cache.
     pub context_caching: bool,
+    /// Which path `web_search` takes (spec 3.1 §7.20).
+    pub web_search: crate::web::WebSearchPath,
 }
 
 /// Project instructions with the trust they load under.
@@ -128,6 +130,13 @@ pub struct HarnessRuntime {
     #[cfg(feature = "graph")]
     pub(crate) plan_graph: Option<Arc<crate::plan_graph::PlanGraphs>>,
     pub(crate) goals: crate::goal::GoalRuntime,
+    /// Reports approval outcomes to the kernel built by `Harness::kernel` (spec 3.2 §7.4).
+    #[cfg(feature = "kernel")]
+    pub(crate) kernel_approvals: Arc<crate::kernel::LateApprovalNotifier>,
+    /// The agenda of the kernel built by `Harness::kernel`, for `propose_followup` (spec 3.2
+    /// §7.5).
+    #[cfg(feature = "kernel")]
+    pub(crate) kernel_agenda: adk_kernel::AgendaHandle,
     /// Provider-executed search and URL tools, when the operator enabled any (spec 3.1 §7.20).
     #[cfg(feature = "web")]
     pub(crate) provider_web: Option<Arc<crate::web::provider::ProviderWebToolset>>,
@@ -138,7 +147,8 @@ pub struct HarnessRuntime {
     pub(crate) hooks: Option<Arc<crate::hooks::HookRunner>>,
     pub(crate) effort: crate::posture::EffortPolicy,
     /// The model whose context the runner caches explicitly, when caching is on.
-    #[cfg(feature = "runner")]
+    // Read by `configure_runner`, which exists with feature `runner` only.
+    #[cfg_attr(not(feature = "runner"), allow(dead_code))]
     pub(crate) cache_capable: Option<Arc<dyn adk_core::CacheCapable>>,
     /// The payments pack's per-request reminder (spec 3.1 §7.16).
     #[cfg(feature = "payments")]
@@ -562,6 +572,41 @@ impl HarnessAgent {
         config
     }
 
+    /// `root` as the root agent of a `Runner` under this harness's layer (spec 3.1 §7.10):
+    /// a review round from [`HarnessTeam::review_round_with`](crate::HarnessTeam::review_round_with),
+    /// or any agent built from the harness's members.
+    ///
+    /// Its `configure_run` applies `root`'s own configuration and then
+    /// [`HarnessRuntime::layer`], so every tool call `root`'s agents make goes through
+    /// `authorize_tool_call` under the harness policy and mode, with the run's audit trail,
+    /// approvals and budget, and the members record `harness.member.*` in that trail. It
+    /// refuses to run without that layer, as the harness does (spec 3.1 §9.2 I17), and with
+    /// feature `observe` meters the run into [`HarnessRuntime::spend`] and records
+    /// `harness.spend`. It never transfers: the runner always starts at `root`. Its name,
+    /// description and sub-agents are `root`'s.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use adk_runner::Runner;
+    ///
+    /// let team = harness.runtime().team().expect("the harness has members");
+    /// let round = team.review_round("review", &["review_correctness", "review_style"], 1)?;
+    /// let runner = harness
+    ///     .configure_runner(
+    ///         Runner::builder().app_name("app").agent(harness.governed_root(round)).session_service(sessions),
+    ///     )
+    ///     .build()?;
+    /// ```
+    pub fn governed_root(&self, root: Arc<dyn Agent>) -> Arc<dyn Agent> {
+        Arc::new(GovernedRoot {
+            runtime: self.runtime.clone(),
+            root,
+            default_mode: self.info.default_mode,
+            isolation: self.info.isolation.clone(),
+        })
+    }
+
     /// Applies the harness run config, approval store and compaction to a runner builder.
     /// Call it before setting a run config of your own on the builder.
     ///
@@ -676,6 +721,13 @@ impl Agent for HarnessAgent {
             mcp.ensure_started(self.runtime.workspace_trusted()).await;
         }
         let events = self.run_governed(ctx.clone()).await?;
+        // What a provider-executed search ran is recorded after each response
+        // (spec 3.1 §7.20).
+        #[cfg(feature = "web")]
+        let events = match &self.runtime.provider_web {
+            Some(provider_web) => provider_web.record_searches(ctx.clone(), events),
+            None => events,
+        };
         Ok(self.with_mode_mirror(&ctx, events).await)
     }
 }
@@ -884,6 +936,97 @@ impl HarnessAgent {
     }
 }
 
+/// An agent run as a runner root under a harness's layer (spec 3.1 §7.10); built by
+/// [`HarnessAgent::governed_root`].
+struct GovernedRoot {
+    runtime: HarnessRuntime,
+    root: Arc<dyn Agent>,
+    default_mode: HarnessMode,
+    isolation: crate::shell::IsolationStatus,
+}
+
+#[async_trait]
+impl Agent for GovernedRoot {
+    fn name(&self) -> &str {
+        self.root.name()
+    }
+
+    fn description(&self) -> &str {
+        self.root.description()
+    }
+
+    fn sub_agents(&self) -> &[Arc<dyn Agent>] {
+        self.root.sub_agents()
+    }
+
+    fn supports_agent_transfer(&self) -> bool {
+        false
+    }
+
+    fn configure_run(&self, agent_name: &str, config: &mut RunConfig) {
+        self.root.configure_run(agent_name, config);
+        self.runtime.layer().apply(config);
+    }
+
+    async fn close(&self) {
+        self.root.close().await;
+    }
+
+    async fn run(&self, ctx: Arc<dyn InvocationContext>) -> Result<EventStream> {
+        let config = ctx.run_config();
+        if config.tool_policy.as_deref().and_then(composed_layer_owner)
+            != Some(self.runtime.policy.owner_id())
+        {
+            return Err(AdkError::new(
+                ErrorComponent::Agent,
+                ErrorCategory::Forbidden,
+                HARNESS_UNGOVERNED_CODE,
+                format!(
+                    "'{}' runs only under its harness's policy; run it as the root agent of a \
+                     Runner, whose configure_run applies the harness layer",
+                    self.root.name()
+                ),
+            ));
+        }
+        #[cfg(feature = "auth")]
+        if !config.audit.as_ref().is_some_and(|trail| {
+            trail.failure_mode() == adk_core::audit_log::AuditFailureMode::Block
+        }) {
+            return Err(crate::identity::audit_required(self.root.name()));
+        }
+        #[cfg(feature = "observe")]
+        {
+            use tracing::Instrument as _;
+            let mode = crate::observe::run_mode(
+                self.runtime.mode_store.as_ref(),
+                self.default_mode,
+                ctx.as_ref(),
+            )
+            .await;
+            let span = crate::observe::run_span(
+                self.root.name(),
+                ctx.invocation_id(),
+                mode,
+                &self.isolation,
+            );
+            let events = self.root.run(ctx.clone()).instrument(span.clone()).await?;
+            Ok(crate::observe::observe_run(
+                events,
+                &ctx,
+                span,
+                self.runtime.spend.clone(),
+                self.runtime.run_trails.clone(),
+                self.runtime.effort.for_mode(mode),
+            ))
+        }
+        #[cfg(not(feature = "observe"))]
+        {
+            let _ = (self.default_mode, &self.isolation);
+            self.root.run(ctx).await
+        }
+    }
+}
+
 impl HarnessAgent {
     /// One turn: the session's running goal, then its running plan, step by step, else the
     /// harness agent (spec 3.1 §7.11).
@@ -905,6 +1048,165 @@ impl HarnessAgent {
             return Ok(stream);
         }
         self.root.run(ctx).await
+    }
+}
+
+/// The error of a standing rule that cannot be created for a call.
+fn rule_refused(message: &str) -> AdkError {
+    AdkError::new(
+        ErrorComponent::Agent,
+        ErrorCategory::InvalidInput,
+        "harness.decision.invalid",
+        message,
+    )
+}
+
+/// Standing rules created and revoked by a person outside a prompt: `Harness::decide`, a
+/// served harness's authenticated REST routes (spec 3.1 §7.5, §8.2).
+impl HarnessAgent {
+    /// The rule `suggestion` becomes for the held call `request`, owned by `owner`
+    /// (spec 3.1 §7.5, §9.2 I2, I8).
+    ///
+    /// The suggestion must pin the call's tool and exact declaration; an allow rule must be
+    /// one [`StandingRule::suggestions`](crate::StandingRule::suggestions) offers for the
+    /// call; a call no rule covers — plan exit, a payment, a memory write, a desktop action,
+    /// a protected or other non-waivable edit — gets none.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let suggestion = StandingRule::suggestions(&held.request).remove(0);
+    /// let rule = harness.rule_for_held_call(&held.request, suggestion, StandingDecision::Allow, &owner)?;
+    /// harness.grant_rule(rule, "rest", Some(&held.request)).await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `harness.decision.invalid` when the call records no tool origin or no rule
+    /// may be created from `suggestion` for it.
+    pub fn rule_for_held_call(
+        &self,
+        request: &adk_core::ToolConfirmationRequest,
+        suggestion: crate::RuleSuggestion,
+        decision: crate::StandingDecision,
+        owner: &crate::RuleOwner,
+    ) -> Result<crate::StandingRule> {
+        let runtime = &self.runtime;
+        let origin = request
+            .origin
+            .as_ref()
+            .ok_or_else(|| rule_refused("the pending call records no tool origin"))?;
+        let kind = runtime.policy.registry().classify(
+            &self.info.name,
+            &request.tool_name,
+            Some(origin),
+            &request.args,
+            adk_core::ToolEffect::NonIdempotent,
+            runtime.policy.isolation_status().isolation(),
+            false,
+        );
+        let protected = kind == crate::ToolKind::Edit
+            && request
+                .args
+                .get("path")
+                .and_then(Value::as_str)
+                .is_none_or(|path| is_protected_target(runtime.workspace.root(), path));
+        if !kind.rule_eligible() || crate::TableRow::of(&kind, protected).is_non_waivable() {
+            return Err(rule_refused("no standing rule applies to this call; decide it once"));
+        }
+        if !suggestion.origin.admits(origin)
+            || !matches!(suggestion.origin, crate::OriginPin::Exact { .. })
+            || suggestion.tool != request.tool_name
+        {
+            return Err(rule_refused(
+                "a remembered rule must pin this call's tool and declaration",
+            ));
+        }
+        if decision == crate::StandingDecision::Allow
+            && !crate::StandingRule::suggestions(request).contains(&suggestion)
+        {
+            return Err(rule_refused("only a suggested rule can be remembered as an allow rule"));
+        }
+        Ok(suggestion.into_rule(owner, decision, Some(request.fingerprint())))
+    }
+
+    /// Stores `rule`, recording `harness.rule.created` with `surface` (such as `rest`) in
+    /// the harness's audit trail before the store write (spec 3.1 §7.5, §9.3, I39).
+    /// `from` is the held call the rule was created from, if any.
+    ///
+    /// The caller authenticates the person the rule's scope and `created_by` name; a rule
+    /// is never created for a model-callable tool's request (spec 3.1 §9.2 I2, I5).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let granted = harness.grant_rule(rule, "rest", None).await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the audit log's error, and then stores nothing, or the store's error.
+    pub async fn grant_rule(
+        &self,
+        rule: crate::StandingRule,
+        surface: &str,
+        from: Option<&adk_core::ToolConfirmationRequest>,
+    ) -> Result<crate::StandingRule> {
+        if let Some(trail) = self.runtime.audit_trail() {
+            let mut fields = crate::approvals::rule_audit_fields(
+                &rule,
+                from.and_then(|request| request.function_call_id.as_deref()),
+            );
+            fields["surface"] = json!(surface);
+            HarnessAudit::new(
+                trail.clone(),
+                AuditActor::subject(rule.created_by.clone()),
+                rule.scope.session_id().unwrap_or_default(),
+            )
+            .record("harness.rule.created", fields)
+            .await?;
+        }
+        self.runtime.standing_rules.grant(rule).await
+    }
+
+    /// Revokes the rule `id` of `user` in `app`, recording `harness.rule.revoked` with
+    /// `surface` before the store write (spec 3.1 §7.5, §9.2 I4, §9.3). Returns the revoked
+    /// rule, or `None` when `user` has no rule `id`, so a person revokes only their own.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let revoked = harness.revoke_rule("adk-rust", "ana", &rule.id, "rest").await?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns the audit log's error, and then revokes nothing, or the store's error.
+    pub async fn revoke_rule(
+        &self,
+        app: &str,
+        user: &str,
+        id: &str,
+        surface: &str,
+    ) -> Result<Option<crate::StandingRule>> {
+        let standing = &self.runtime.standing_rules;
+        let Some(rule) = standing.list(app, user).await?.into_iter().find(|rule| rule.id == id)
+        else {
+            return Ok(None);
+        };
+        if let Some(trail) = self.runtime.audit_trail() {
+            let mut fields = crate::approvals::rule_audit_fields(&rule, None);
+            fields["by"] = json!(user);
+            fields["surface"] = json!(surface);
+            HarnessAudit::new(
+                trail.clone(),
+                AuditActor::subject(adk_core::principal::SubjectRef::human(user)),
+                rule.scope.session_id().unwrap_or_default(),
+            )
+            .record("harness.rule.revoked", fields)
+            .await?;
+        }
+        Ok(standing.revoke(app, id).await?.then_some(rule))
     }
 }
 

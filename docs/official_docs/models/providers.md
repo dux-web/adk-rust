@@ -217,7 +217,7 @@ handles this per request:
 |---------|----------|
 | Declares tools, model GPT-5.6 or later, reasoning not `none` | Responses API (`/responses`) with the same key, organization, project, base URL, reasoning effort, retry policy, and timeouts; `store: false` |
 | No tools | Chat Completions |
-| Model before GPT-5.6, reasoning effort `None` on the client, or `"reasoning_effort": "none"` in the request's `openai` extension | Chat Completions |
+| Model before GPT-5.6, reasoning effort `None` on the client and no `effort` on the request, or `"reasoning_effort": "none"` in the request's `openai` extension | Chat Completions |
 | Client built with `OpenAIClient::compatible` | Chat Completions |
 
 ### Structured Output (JSON Schema)
@@ -495,6 +495,38 @@ async fn main() -> anyhow::Result<()> {
 DeepSeek retired `deepseek-chat`, `deepseek-reasoner`, and the `deepseek-v4-flash` alias on
 2026-07-24. With thinking on, the reasoning arrives as `Part::Thinking`.
 
+### Web search
+
+`DeepSeekClient` speaks Chat Completions, which accepts function tools only. DeepSeek runs
+web search on its other endpoints:
+
+| Endpoint | Client | Tool | Models |
+|---|---|---|---|
+| Responses, `https://api.deepseek.com` ([guide](https://api-docs.deepseek.com/guides/responses_api)) | `OpenAIResponsesClient` (feature `openai`) | `DeepSeekWebSearchTool`, `{"type": "web_search"}` | `deepseek-v4-pro`; `deepseek-flash` ignores the tool |
+| Anthropic-compatible, `https://api.deepseek.com/anthropic` ([guide](https://api-docs.deepseek.com/guides/anthropic_api)) | `AnthropicClient` (feature `anthropic`) | `WebSearchTool`, `web_search_20250305` | Both |
+| Search API, `https://api.deepseek.com/v1/tools/search` ([guide](https://api-docs.deepseek.com/guides/search)) | `adk_harness::DeepSeekSearch` | The harness's governed `web_search` | Any model |
+
+Neither endpoint documents a domain allowlist for the tool. Both clients report the search
+from `Llm::native_web_search()`, which the harness reads to attach it by default.
+
+```rust
+use adk_rust::prelude::*;
+use adk_rust::model::openai::{OpenAIResponsesClient, OpenAIResponsesConfig};
+use adk_tool::DeepSeekWebSearchTool;
+use std::sync::Arc;
+
+fn build() -> anyhow::Result<LlmAgent> {
+    let api_key = std::env::var("DEEPSEEK_API_KEY")?;
+    let model = OpenAIResponsesClient::new(
+        OpenAIResponsesConfig::new(api_key, "deepseek-v4-pro").with_base_url("https://api.deepseek.com"),
+    )?;
+    Ok(LlmAgentBuilder::new("researcher")
+        .model(Arc::new(model))
+        .tool(Arc::new(DeepSeekWebSearchTool::new()))
+        .build()?)
+}
+```
+
 ---
 
 ## Groq
@@ -730,7 +762,8 @@ OpenAI-compatible, Azure OpenAI, Azure AI Inference, Anthropic, DeepSeek, Groq).
 | Behaviour | Rule |
 |-----------|------|
 | Transient upstream errors | HTTP 500, 502, 503, 504, and 529 map to `ErrorCategory::Unavailable` with the upstream status recorded, so `RetryConfig` retries them |
-| `Retry-After` | A delay in seconds or an HTTP-date is attached to the error and used for the next retry, capped at `RetryConfig::max_delay` (default 5 seconds) |
+| `Retry-After` | A delay in seconds or an HTTP-date is attached to the error and used for the next retry. A delay above `RetryConfig::max_server_delay` (default 60 seconds) is not waited: the error is returned with the delay on `AdkError::retry` |
+| Gemini `RetryInfo` | Without a `Retry-After` header, Gemini (AI Studio and Vertex AI) takes the delay from the `retryDelay` of a `google.rpc.RetryInfo` error detail (`"37s"`, `"1.5s"`), which is how the API reports the wait a 429 quota error needs, under the same bound |
 | Mid-stream Anthropic `error` event | Fails the stream with the category of the equivalent HTTP error, so `overloaded_error` and `rate_limit_error` are retryable |
 | Provider error codes | `AdkError::details.metadata["provider_error_code"]` holds the provider's own code as a string: the first Google `ErrorInfo.reason`, then the error object's string `code`, `type`, or `status`. Gemini (AI Studio and Vertex AI), OpenAI (Chat Completions and Responses), OpenAI-compatible, Azure OpenAI, Azure AI Inference, DeepSeek, Anthropic, and OpenRouter record it; codes over 128 bytes or outside `[A-Za-z0-9_.-]` are dropped |
 | Malformed tool arguments | Arguments that are not a JSON object, streamed or not (truncated JSON, an array, a number), or an Anthropic call cut off by `max_tokens`, become `adk_core::invalid_tool_arguments(reason, raw)`; the turn continues and `LlmAgent` answers the call with an error without executing it, so the model can send it again. An empty payload is a zero-argument call with `{}` |
@@ -798,6 +831,39 @@ use adk_core::GenerateContentConfig;
 // Stops at the first "7" on every client that sends `stop_sequences`.
 fn config() -> GenerateContentConfig {
     GenerateContentConfig { stop_sequences: vec!["7".to_string()], ..Default::default() }
+}
+```
+
+### Per-Call Reasoning Effort
+
+`GenerateContentConfig::effort` sets the reasoning effort of one call (`Effort::Low`,
+`Medium`, or `High`). A set value wins over the effort the client was built with; `None`
+keeps the client's configuration. The harness sets it on every request from its
+`EffortPolicy` (spec 3.1 §7.23).
+
+| Client | Sent as | Models that take it |
+|--------|---------|---------------------|
+| `AnthropicClient` | `output_config.effort`, with `thinking: {type: "adaptive"}` when the client sets no thinking mode | Claude 4.6 and later; Claude Opus 4.5 takes the effort without adaptive thinking |
+| `OpenAIClient`, `OpenAICompatible` and its presets, `AzureOpenAIClient`, OpenCode Chat | `reasoning_effort` | the o-series, GPT-OSS, GPT-5 and later except `-chat` models, and any model whose client was built with an effort |
+| `OpenAIResponsesClient`, and `OpenAIClient` when it routes a tool call through Responses | `reasoning.effort` | the same |
+| `GeminiModel`, both transports | `thinking_level`, replacing a configured token budget | Gemini 3 and later, and any model whose client sets a thinking level |
+| `OpenRouterClient` | `reasoning.effort`, unless the request's `openrouter` options set an effort, a token budget, or `enabled: false` | every model |
+| `DeepSeekClient` | `reasoning_effort: "high"` (the API serves `low` and `medium` as `high`) | every model, unless the client disables thinking |
+| `GroqClient` | `reasoning_effort` | GPT-OSS models |
+| `OllamaModel`, `BedrockClient`, `AzureAIClient` | not sent | none |
+
+A model that does not take the effort runs with its client's configuration, and the client
+logs the ignored value at debug level. A request's `openai` extension still overrides the
+Chat Completions body, and its `reasoning` object the Responses one. A request that sets an
+effort on an `OpenAIClient` built with reasoning effort `None` turns reasoning on for that
+call, so a GPT-5.6 tool call goes through the Responses API.
+
+```rust
+use adk_core::{Effort, GenerateContentConfig};
+
+// Every call made with this config runs at high effort, whatever the client's default.
+fn config() -> GenerateContentConfig {
+    GenerateContentConfig { effort: Some(Effort::High), ..Default::default() }
 }
 ```
 
