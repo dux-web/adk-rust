@@ -100,3 +100,42 @@ fn nested_shell_commands() {
         assert!(result.is_ok(), "the enforcer must launch the probe shell");
     }
 }
+
+#[test]
+fn outside_acl_boundaries() {
+    for (name, grant) in [
+        ("private", None),
+        ("users_write", Some("*S-1-5-32-545:(OI)(CI)M")),
+        ("package_read", Some("*S-1-15-2-2:(OI)(CI)RX")),
+        ("package_write", Some("*S-1-15-2-2:(OI)(CI)M")),
+        ("everyone_write", Some("*S-1-1-0:(OI)(CI)M")),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(root.path()).unwrap();
+        let workspace = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let user = std::env::var("USERNAME").unwrap();
+        let mut acl = std::process::Command::new("icacls");
+        acl.arg(&outside).args(["/inheritance:r", "/grant:r"]).arg(format!("{user}:(OI)(CI)F"));
+        if let Some(grant) = grant {
+            acl.args(["/grant", grant]);
+        }
+        let output = acl.output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+        std::fs::write(outside.join("note.txt"), "outside-note").unwrap();
+        let policy = SandboxPolicyBuilder::new().allow_read_write(&workspace).build();
+        let outcome = WindowsEnforcer::new().run_confined(
+            &policy, "cmd.exe".as_ref(),
+            &[OsString::from("/c"), OsString::from(
+                r"echo control> control.txt & type ..\outside\note.txt > read.txt 2> read-error.txt & echo outside-write> ..\outside\written.txt 2> write-error.txt"
+            )], &workspace, Some(Duration::from_secs(20)),
+        ).unwrap();
+        let control = std::fs::read_to_string(workspace.join("control.txt")).unwrap();
+        assert_eq!(control.trim(), "control");
+        let read = std::fs::read_to_string(workspace.join("read.txt")).unwrap_or_default();
+        let written = outside.join("written.txt").exists();
+        println!("ACL BOUNDARY {name}: {outcome:?}; read={read:?}; outside_write={written}");
+    }
+}

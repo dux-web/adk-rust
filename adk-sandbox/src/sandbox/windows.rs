@@ -384,7 +384,12 @@ mod token {
             .collect();
         Some(TokenPlan {
             deny_only,
-            restricting: vec![Sid::everyone(), Sid::restricted(), logon.clone()],
+            restricting: vec![
+                Sid::everyone(),
+                Sid::restricted(),
+                Sid::well_known(15, &[2, 2]),
+                logon.clone(),
+            ],
             default_dacl: vec![user.clone(), Sid::system(), Sid::restricted(), logon],
         })
     }
