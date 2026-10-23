@@ -375,16 +375,17 @@ mod token {
         let keep = [Sid::everyone(), Sid::users(), Sid::authenticated_users(), Sid::interactive()];
         let is_logon = |g: &TokenGroup| g.attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID;
         let logon = groups.iter().find(|g| is_logon(g))?.sid.clone();
-        let deny_only = groups
+        let mut deny_only: Vec<_> = groups
             .iter()
             .filter(|g| {
                 !is_logon(g) && g.attributes & SE_GROUP_INTEGRITY == 0 && !keep.contains(&g.sid)
             })
             .map(|g| g.sid.clone())
             .collect();
+        deny_only.push(user.clone());
         Some(TokenPlan {
             deny_only,
-            restricting: vec![Sid::everyone(), Sid::restricted(), logon.clone()],
+            restricting: vec![Sid::restricted(), logon.clone()],
             default_dacl: vec![user.clone(), Sid::system(), Sid::restricted(), logon],
         })
     }
@@ -413,7 +414,7 @@ mod imp {
         GetTokenInformation, NO_INHERITANCE, PSID, SID_AND_ATTRIBUTES,
         SUB_CONTAINERS_AND_OBJECTS_INHERIT, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
         TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_GROUPS, TOKEN_QUERY,
-        TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenUser,
+        TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenUser, WRITE_RESTRICTED,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
@@ -595,7 +596,7 @@ mod imp {
         let ok = unsafe {
             CreateRestrictedToken(
                 source,
-                DISABLE_MAX_PRIVILEGE,
+                DISABLE_MAX_PRIVILEGE | WRITE_RESTRICTED,
                 deny.len() as u32,
                 deny.as_ptr(),
                 0,
@@ -820,9 +821,10 @@ mod imp {
 
         // Grant the restricting RESTRICTED SID access to each allowed path, so the restricted
         // token's second access check passes there and nowhere else.
-        let restricted = Sid::restricted();
         for entry in grants {
-            grant_path(&entry.path, entry.mode, psid(&restricted))?;
+            for sid in &plan.restricting {
+                grant_path(&entry.path, entry.mode, psid(sid))?;
+            }
         }
 
         let job = create_job()?;

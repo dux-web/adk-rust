@@ -20,14 +20,33 @@ fn native_child_launch() {
     std::fs::write(workspace.join("localcmd.exe"), std::fs::read(&system_cmd).unwrap()).unwrap();
     let acl = std::process::Command::new("icacls").arg(&system_cmd).output().unwrap();
     println!("HOST CMD ACL: {}", String::from_utf8_lossy(&acl.stdout));
-    let mut policy =
-        SandboxPolicyBuilder::new().allow_read_write(&workspace).allow_read(&executable).build();
+    let private_root = tempfile::tempdir().unwrap();
+    let private = private_root.path().join("owner-only.txt");
+    std::fs::write(&private, "private-note").unwrap();
+    let user = std::env::var("USERNAME").unwrap();
+    let acl = std::process::Command::new("icacls")
+        .arg(&private)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{user}:F"))
+        .output()
+        .unwrap();
+    assert!(acl.status.success());
+    let readonly = tempfile::tempdir().unwrap();
+    let readonly_file = readonly.path().join("readonly.txt");
+    std::fs::write(&readonly_file, "readonly-note").unwrap();
+    let mut policy = SandboxPolicyBuilder::new()
+        .allow_read_write(&workspace)
+        .allow_read(&executable)
+        .allow_read(readonly.path())
+        .build();
     for key in ["SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
         if let Ok(value) = std::env::var(key) {
             policy.env.insert(key.into(), value);
         }
     }
     policy.env.insert("ADK_WINDOWS_PROBE_PEER".into(), "1".into());
+    policy.env.insert("ADK_WINDOWS_PRIVATE_PATH".into(), private.display().to_string());
+    policy.env.insert("ADK_WINDOWS_READONLY_PATH".into(), readonly_file.display().to_string());
     let result = WindowsEnforcer::new().run_confined(
         &policy,
         executable.as_os_str(),
@@ -37,6 +56,8 @@ fn native_child_launch() {
     );
     let observed = std::fs::read_to_string(workspace.join("peer-outcome.txt"));
     println!("NATIVE PEER: {result:?}; OBSERVED {observed:?}");
+    println!("HOST PRIVATE CONTENT: {:?}", std::fs::read_to_string(&private));
+    println!("HOST READONLY CONTENT: {:?}", std::fs::read_to_string(&readonly_file));
     assert!(result.is_ok(), "the enforcer must launch the native peer");
 }
 

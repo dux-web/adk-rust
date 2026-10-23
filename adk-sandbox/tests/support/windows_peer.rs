@@ -37,11 +37,29 @@ struct ProcessInfo {
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+    fn SetNamedSecurityInfoW(
+        path: *mut u16,
+        object_type: u32,
+        information: u32,
+        owner: *mut c_void,
+        group: *mut c_void,
+        dacl: *mut c_void,
+        sacl: *mut c_void,
+    ) -> u32;
 }
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
+    fn CreateFileW(
+        path: *const u16,
+        access: u32,
+        share: u32,
+        security: *const c_void,
+        creation: u32,
+        flags: u32,
+        template: *mut c_void,
+    ) -> *mut c_void;
     fn GetCurrentProcessId() -> u32;
     fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
     fn GetLastError() -> u32;
@@ -166,5 +184,50 @@ fn main() {
     }
     observations.push_str(&format!("direct system: {}", direct_spawn(&system.join("cmd.exe"))));
     observations.push_str(&format!("direct local: {}", direct_spawn(&local)));
+    if let Some(path) = std::env::var_os("ADK_WINDOWS_PRIVATE_PATH") {
+        observations.push_str(&format!(
+            "owner-only before read={:?}; write={:?}\n",
+            std::fs::read_to_string(&path),
+            std::fs::write(&path, "first-write")
+        ));
+        let mut wide: Vec<u16> = path.encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(wide.as_ptr(), 0x00040000, 7, std::ptr::null(), 3, 0, std::ptr::null_mut())
+        };
+        let invalid = handle as isize == -1;
+        observations.push_str(&format!(
+            "owner-only WRITE_DAC: ok={}, error={}\n",
+            !invalid,
+            if invalid { unsafe { GetLastError() } } else { 0 }
+        ));
+        if !invalid {
+            unsafe {
+                CloseHandle(handle);
+            }
+        }
+        let set = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                1,
+                4,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        observations.push_str(&format!(
+            "owner-only SetNamedSecurityInfoW null DACL: status={set}; read={:?}; write={:?}\n",
+            std::fs::read_to_string(&path),
+            std::fs::write(&path, "after-acl-write")
+        ));
+    }
+    if let Some(path) = std::env::var_os("ADK_WINDOWS_READONLY_PATH") {
+        observations.push_str(&format!(
+            "read-only read={:?}; write={:?}\n",
+            std::fs::read_to_string(&path),
+            std::fs::write(&path, "readonly-write")
+        ));
+    }
     std::fs::write("peer-outcome.txt", observations).unwrap();
 }
