@@ -14,6 +14,12 @@ fn native_child_launch() {
     let executable = std::path::PathBuf::from(
         std::env::var_os("ADK_WINDOWS_PROBE_EXE").expect("probe executable"),
     );
+    let system_cmd = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32")
+        .join("cmd.exe");
+    std::fs::copy(&system_cmd, workspace.join("localcmd.exe")).unwrap();
+    let acl = std::process::Command::new("icacls").arg(&system_cmd).output().unwrap();
+    println!("HOST CMD ACL: {}", String::from_utf8_lossy(&acl.stdout));
     let mut policy =
         SandboxPolicyBuilder::new().allow_read_write(&workspace).allow_read(&executable).build();
     for key in ["SystemRoot", "PATH", "ComSpec", "PATHEXT", "TEMP", "TMP"] {
