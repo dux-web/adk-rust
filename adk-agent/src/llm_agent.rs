@@ -3144,10 +3144,12 @@ impl ToolExecutor<'_> {
             {
                 match callback(cb_ctx.clone()).await {
                     Ok(Some(modified)) => {
-                        response_content =
+                        let mut replacement =
                             callback_tool_response(modified, &name, id.as_ref(), |text| {
                                 ToolResponse::new(serde_json::json!({ "result": text }))
                             });
+                        ToolResponse::preserve_unknown(&response_content, &mut replacement);
+                        response_content = replacement;
                         break;
                     }
                     Ok(None) => continue,
@@ -3232,7 +3234,9 @@ impl ToolExecutor<'_> {
                             Some(status) => ToolResponse::with_status(modified_result, status),
                             None => ToolResponse::new(modified_result),
                         };
-                        response_content = respond(response);
+                        let mut replacement = respond(response);
+                        ToolResponse::preserve_unknown(&response_content, &mut replacement);
+                        response_content = replacement;
                     }
                     Err(e) => failure = Some(e),
                 }
@@ -3247,9 +3251,9 @@ impl ToolExecutor<'_> {
                     error.message = %self.logged_message(&error.message),
                     "after-tool pipeline failed; withholding the tool result"
                 );
-                // The tool's side effect stands and its ledger record says so; the model is
-                // told not to repeat it, since a new call has a new idempotency key.
-                response_content = if tool_executed {
+                // The tool was entered, so a result-pipeline failure cannot authorize a
+                // repeat under a new idempotency key.
+                let mut replacement = if tool_executed {
                     respond(ToolResponse::for_error(
                         adk_core::result_withheld_response(
                             &name,
@@ -3267,6 +3271,8 @@ impl ToolExecutor<'_> {
                         &error,
                     ))
                 };
+                ToolResponse::preserve_unknown(&response_content, &mut replacement);
+                response_content = replacement;
             }
         }
 

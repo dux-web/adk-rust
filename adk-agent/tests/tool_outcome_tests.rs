@@ -269,7 +269,7 @@ enum AfterStage {
 }
 
 #[cfg(feature = "enhanced-plugins")]
-struct FailingAfterPlugin;
+struct FailingAfterPlugin(fn() -> AdkError);
 
 #[cfg(feature = "enhanced-plugins")]
 #[async_trait]
@@ -286,7 +286,7 @@ impl adk_plugin::EnhancedPlugin for FailingAfterPlugin {
         _ctx: Arc<dyn adk_core::CallbackContext>,
         _plugin_ctx: &adk_plugin::PluginContext,
     ) -> Result<adk_plugin::AfterToolCallResult> {
-        Err(audit_error())
+        Err((self.0)())
     }
 }
 
@@ -327,7 +327,7 @@ async fn a_failed_after_tool_stage_withholds_the_result_and_says_the_call_ran() 
             }
             #[cfg(feature = "enhanced-plugins")]
             AfterStage::EnhancedPlugin => {
-                builder = builder.enhanced_plugin(Arc::new(FailingAfterPlugin));
+                builder = builder.enhanced_plugin(Arc::new(FailingAfterPlugin(audit_error)));
             }
         }
         let ledger = Arc::new(InMemoryActionLedger::new());
@@ -934,3 +934,6 @@ async fn concurrency_rejections_skip_execution() {
     assert_eq!(runs.load(Ordering::SeqCst), 0);
     assert!(outcome.failed_answer()["error"].as_str().unwrap().contains("concurrency limit"));
 }
+
+#[path = "tool_outcome/uncertainty.rs"]
+mod uncertainty;

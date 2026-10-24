@@ -388,10 +388,12 @@ pub(crate) async fn screen_tool_result(
                 function_response.response = adk_core::result_blocked_response(tool_name, &reason);
                 function_response.inline_data.clear();
                 function_response.file_data.clear();
-                crate::tool_response::ToolResponse::annotate(
-                    part,
-                    adk_core::ToolResultStatus::Failed,
-                );
+                if part.tool_result_status() != Some(adk_core::ToolResultStatus::OutcomeUnknown) {
+                    crate::tool_response::ToolResponse::annotate(
+                        part,
+                        adk_core::ToolResultStatus::Failed,
+                    );
+                }
                 withheld.push(reason);
             }
         }
