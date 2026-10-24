@@ -829,9 +829,11 @@ not use it as made (`ErrorCategory::is_rejection`: `InvalidInput`, `Forbidden`, 
   `ToolOutcome::error` carries the structured `AdkError`. Tracing records the message when
   `RunConfig::record_payloads` is set.
 - **After-tool failures**: the first failing stage ends the after-tool pipeline, since a later stage
-  may be handed the unscreened result. The tool's side effect stands and its action-ledger record
-  says it completed; the model is told not to repeat the call, because a new call has a new
-  idempotency key.
+  may be handed the unscreened result. A completed action-ledger outcome remains recorded; an
+  interrupted non-idempotent call keeps its begun record and `ToolResultStatus::OutcomeUnknown`
+  annotation through callbacks, plugins and result screening. A later error or withheld result
+  does not establish whether the side effect completed. The model is told not to repeat the call,
+  because a new call has a new idempotency key.
 - **Errors the model should read**: a tool returns `Ok(json!({"error": "..."}))` for a failure
   whose text is meant for the model, or an `on_tool_error` callback supplies that text.
   `McpToolset` does this for an MCP result with `isError: true`, whose text the server wrote
