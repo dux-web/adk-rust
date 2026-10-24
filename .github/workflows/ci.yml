@@ -8,6 +8,10 @@ on:
         description: Revision to check out
         required: false
         type: string
+      tests_revision:
+        description: Committed regression fixtures for a baseline comparison
+        required: false
+        type: string
       linux_suite:
         description: Run a scoped Linux suite under the PR Nix environment
         required: false
@@ -19,6 +23,8 @@ on:
           - team
           - review
           - review-baseline
+          - outcomes
+          - outcomes-baseline
       changelog_only:
         description: Validate UTF-8 fragments without rebuilding unchanged Rust inputs
         required: false
@@ -174,6 +180,20 @@ jobs:
           path.write_text(source.replace(before, after))
           PYTHON
           git diff -- adk-kernel/tests/proactivity_scenarios.rs
+      - name: Apply committed outcome regression fixtures
+        if: inputs.linux_suite == 'outcomes-baseline'
+        env:
+          TESTS_REVISION: ${{ inputs.tests_revision }}
+        run: |
+          set -euo pipefail
+          [[ "$TESTS_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags --depth=1 origin "$TESTS_REVISION"
+          test "$(git rev-parse FETCH_HEAD)" = "$TESTS_REVISION"
+          mkdir -p adk-agent/tests/tool_outcome
+          git show FETCH_HEAD:adk-agent/tests/tool_outcome_tests.rs > adk-agent/tests/tool_outcome_tests.rs
+          git show FETCH_HEAD:adk-agent/tests/tool_outcome/uncertainty.rs > adk-agent/tests/tool_outcome/uncertainty.rs
+          git hash-object adk-agent/tests/tool_outcome_tests.rs adk-agent/tests/tool_outcome/uncertainty.rs
+          git diff --stat
       - name: Run the scoped tests
         env:
           SUITE: ${{ inputs.linux_suite }}
@@ -189,6 +209,13 @@ jobs:
             CI=true devenv shell cargo fmt --all -- --check
             CI=true devenv shell cargo clippy --locked -p adk-kernel --test proactivity_scenarios --no-deps -- -D warnings
             CI=true devenv shell cargo nextest run --locked -p adk-kernel --test proactivity_scenarios --no-fail-fast
+          elif [[ "$SUITE" == outcomes-baseline ]]; then
+            CI=true devenv shell cargo nextest run --locked -p adk-agent --features enhanced-plugins,guardrails --test tool_outcome_tests -E 'test(uncertainty::)' --test-threads 2 --no-fail-fast
+          elif [[ "$SUITE" == outcomes ]]; then
+            CI=true devenv shell cargo fmt --all -- --check
+            CI=true devenv shell cargo clippy --locked -p adk-agent --features enhanced-plugins,guardrails --lib --test tool_outcome_tests --test tool_effect_tests --test tool_callback_tests --test output_guardrail_coverage_tests --no-deps -- -D warnings
+            CI=true devenv shell cargo nextest run --locked -p adk-agent --features enhanced-plugins,guardrails --lib -E 'test(tool_response::tests::)' --test-threads 2 --no-fail-fast
+            CI=true devenv shell cargo nextest run --locked -p adk-agent --features enhanced-plugins,guardrails --test tool_outcome_tests --test tool_effect_tests --test tool_callback_tests --test output_guardrail_coverage_tests --test-threads 2 --no-fail-fast
           else
             CI=true devenv shell cargo nextest run --locked -p adk-agent --features team-tools --lib -E 'test(team::tests::)' --no-fail-fast
           fi
