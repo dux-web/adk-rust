@@ -1378,7 +1378,8 @@ impl LlmAgentBuilder {
     /// `ctx.tool_outcome()` carries the structured error in
     /// [`ToolOutcome::error`](adk_core::ToolOutcome::error).
     /// If the callback returns `Ok(Some(value))`, the value is used as a
-    /// fallback function response to the LLM. If it returns `Ok(None)`,
+    /// fallback function response to the LLM without resolving an unknown execution
+    /// outcome. If it returns `Ok(None)`,
     /// the next callback in the chain is tried. If no callback provides a
     /// fallback, the LLM receives
     /// [`tool_error_response`](adk_core::tool_error_response), which omits the message unless
@@ -3160,7 +3161,13 @@ impl ToolExecutor<'_> {
                             }
                         }
                     }
-                    fallback_result.map(ToolResponse::new).unwrap_or(function_response)
+                    match fallback_result {
+                        Some(value) if outcome_unknown => {
+                            ToolResponse::with_status(value, ToolResultStatus::OutcomeUnknown)
+                        }
+                        Some(value) => ToolResponse::new(value),
+                        None => function_response,
+                    }
                 } else {
                     function_response
                 };

@@ -111,6 +111,48 @@ async fn after_errors_keep_unknown() {
 }
 
 #[tokio::test]
+async fn error_fallback_keeps_unknown() {
+    let value = json!({"isError": true, "error": "domain row"});
+    for runner_hook in [false, true] {
+        let model = ScriptedModel::new(vec![
+            call("charge_card", json!({})),
+            call("charge_card", json!({})),
+        ]);
+        let (mut tool, runs) = CountingTool::ok("charge_card", json!({"charged": true}));
+        tool.delay = Some(Duration::from_secs(5));
+        let mut builder = LlmAgentBuilder::new("payments")
+            .model(model.clone())
+            .tool(Arc::new(tool))
+            .tool_timeout(Duration::from_millis(50));
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let seen = callbacks.clone();
+        let replacement = value.clone();
+        let callback: adk_core::OnToolErrorCallback = Box::new(move |ctx, _, _, _| {
+            assert!(!ctx.tool_outcome().expect("timed-out call").success);
+            seen.fetch_add(1, Ordering::SeqCst);
+            let response = replacement.clone();
+            Box::pin(async move { Ok(Some(response)) })
+        });
+        let mut plugin = None;
+        if runner_hook {
+            plugin = Some(Plugin::new(PluginConfig {
+                name: "fallback".into(),
+                on_tool_error: Some(callback),
+                ..Default::default()
+            }));
+        } else {
+            builder = builder.on_tool_error(callback);
+        }
+        let ledger = Arc::new(InMemoryActionLedger::new());
+        let config = RunConfig::builder().action_ledger(ledger.clone()).build();
+        let outcome = run(builder.build().unwrap(), plugin, config).await;
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        check_replay(outcome, &model, &runs, &ledger, [answer(value.clone()), replay_answer()])
+            .await;
+    }
+}
+
+#[tokio::test]
 async fn callback_replacements_keep_metadata() {
     let value = json!({"isError": true, "error": "domain row"});
     let model =
