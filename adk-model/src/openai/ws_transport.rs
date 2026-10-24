@@ -141,7 +141,7 @@ struct Connection {
     first_sent: bool,
     continuation: Option<Continuation>,
     response_headers: Option<HeaderMap>,
-    preconnect_failure: Option<(HeaderMap, WsRefusal)>,
+    preconnect_failure: Option<(HeaderMap, BeforeEvent)>,
     unused: Option<tokio::task::JoinHandle<()>>,
 }
 impl Connection {
@@ -287,7 +287,21 @@ impl WsTransport {
         if let Err(failure) =
             self.ensure(&mut lease, headers.clone(), observer.as_ref(), None).await
         {
-            lease.guard.preconnect_failure = Some((headers, failure.refusal));
+            // The generation must observe the actual handshake outcome, including
+            // status and retry advice, without sending another upgrade first.
+            let mut error = AdkError::new(
+                failure.error.component,
+                failure.error.category,
+                failure.error.code,
+                failure.error.message.clone(),
+            )
+            .with_details((*failure.error.details).clone());
+            error.retry = failure.error.retry.clone();
+            if let Some(deadline) = failure.error.retry_deadline() {
+                error = error.with_retry_deadline(deadline);
+            }
+            lease.guard.preconnect_failure =
+                Some((headers, BeforeEvent { error, refusal: failure.refusal }));
             return Err(failure.error);
         }
         observe_headers(&mut lease, observer.as_ref());
@@ -454,19 +468,10 @@ impl WsTransport {
         let mut lease = self.lease(self.connection.clone().lock_owned().await);
         let mut attempt = Attempt::start(Transport::WebSocket, None);
         let result: Result<LlmResponseStream, BeforeEvent> = async {
-        if let Some((attempted, refusal)) = lease.guard.preconnect_failure.take()
+        if let Some((attempted, failure)) = lease.guard.preconnect_failure.take()
             && attempted == headers
         {
-            return Err(before(
-                AdkError::new(
-                    ErrorComponent::Model,
-                    ErrorCategory::Unavailable,
-                    "model.openai_responses.ws_preconnect",
-                    "Responses WebSocket preconnection failed",
-                )
-                .with_provider("openai-responses"),
-                refusal,
-            ));
+            return Err(failure);
         }
         let handshake_headers = headers.clone();
         let mut reused = self.ensure(&mut lease, headers, observer.as_ref(), Some(&attempt)).await?;
@@ -620,7 +625,14 @@ fn delivery(mut error: AdkError) -> AdkError {
     error.retry.should_retry = false;
     super::responses_transport::annotate(error, "websocket", "stream")
 }
-fn before(error: AdkError, refusal: WsRefusal) -> BeforeEvent {
+fn before(mut error: AdkError, refusal: WsRefusal) -> BeforeEvent {
+    error.details.metadata.insert(
+        "websocket_refusal".into(),
+        Value::from(match refusal {
+            WsRefusal::Definitive => "definitive",
+            WsRefusal::Transient => "transient",
+        }),
+    );
     BeforeEvent {
         error: super::responses_transport::annotate(error, "websocket", "request"),
         refusal,
@@ -760,8 +772,12 @@ async fn read(lease: &mut Lease, timeout: Duration) -> Result<Value, BeforeEvent
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
             Some(Ok(Message::Close(frame))) => {
                 let code = frame.map(|frame| u16::from(frame.code));
+                let mut error = closed();
+                if let Some(code) = code {
+                    error.details.metadata.insert("websocket_close_code".into(), code.into());
+                }
                 return Err(before(
-                    closed(),
+                    error,
                     if matches!(code, Some(1003 | 1008)) {
                         WsRefusal::Definitive
                     } else {

@@ -1,6 +1,96 @@
 use super::*;
 use async_openai::types::responses::{CreateResponseArgs, InputParam};
 use serde_json::json;
+
+#[tokio::test]
+async fn retains_preconnect_causes_without_another_upgrade() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    for status in [426, 503] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket.write_all(format!(
+                "HTTP/1.1 {status} Refused\r\nRetry-After: 2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+        });
+        let transport = WsTransport::lazy(&endpoint, "key", WsOptions::default());
+        let original = transport.preconnect(HeaderMap::new()).await.unwrap_err();
+        let headers = transport.authorization(HeaderMap::new()).unwrap();
+        let failure = transport
+            .send_adapted(
+                json!({"model":"fixture","input":[]}),
+                headers,
+                None,
+                false,
+                (false, false),
+                false,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.error.code, original.code);
+        assert_eq!(failure.error.message, original.message);
+        assert_eq!(failure.error.category, original.category);
+        assert_eq!(failure.error.retry.retry_after_ms, original.retry.retry_after_ms);
+        assert_eq!(failure.error.retry_deadline(), original.retry_deadline());
+        assert_eq!(failure.error.details.upstream_status_code, Some(status));
+        assert_eq!(
+            failure.error.details.metadata["websocket_refusal"],
+            if status == 426 { "definitive" } else { "transient" },
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn retains_close_codes_without_provider_text() {
+    use tokio::net::TcpListener;
+    use tungstenite::protocol::CloseFrame;
+    for code in [1000, 1003, 1008, 1013] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            socket.next().await.unwrap().unwrap();
+            socket
+                .close(Some(CloseFrame { code: code.into(), reason: "fixture secret".into() }))
+                .await
+                .unwrap();
+        });
+        let transport = WsTransport::lazy(&endpoint, "key", WsOptions::default());
+        let headers = transport.authorization(HeaderMap::new()).unwrap();
+        let failure = transport
+            .send_adapted(
+                json!({"model":"fixture","input":[]}),
+                headers,
+                None,
+                false,
+                (false, false),
+                false,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(failure.error.details.metadata["websocket_close_code"], code);
+        assert_eq!(failure.error.details.metadata["transport_phase"], "request");
+        assert_eq!(
+            failure.error.details.metadata["websocket_refusal"],
+            if matches!(code, 1003 | 1008) { "definitive" } else { "transient" },
+        );
+        assert!(!format!("{:?}", failure.error).contains("fixture secret"));
+        server.await.unwrap();
+    }
+}
+
 #[test]
 fn preserves_endpoint_paths() {
     assert_eq!(
@@ -190,7 +280,7 @@ async fn transports_reject_untrusted_certificates() {
         assert!(!transport.is_connected());
     }
     assert_eq!(
-        transport.connection.lock().await.preconnect_failure.as_ref().unwrap().1,
+        transport.connection.lock().await.preconnect_failure.as_ref().unwrap().1.refusal,
         WsRefusal::Definitive
     );
     let error = reqwest_openai::Client::new().get(&endpoint).send().await.unwrap_err();
