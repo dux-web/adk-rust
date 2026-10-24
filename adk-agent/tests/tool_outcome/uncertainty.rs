@@ -207,7 +207,7 @@ async fn withheld_results_keep_unknown() {
     assert_eq!(screened.load(Ordering::SeqCst), 2);
     let expected = answer(adk_core::result_blocked_response(
         "charge_card",
-        "guardrail 'withhold_results' (High): results are under review",
+        "tool guardrail 'withhold_results' (High): results are under review",
     ));
     check_replay(outcome, &model, &runs, &ledger, [expected.clone(), expected]).await;
 }
