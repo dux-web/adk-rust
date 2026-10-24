@@ -122,8 +122,8 @@ mod tests {
         }
         ToolResponse::preserve_unknown(&previous, &mut replacement);
         assert_eq!(
-            replacement,
-            Content {
+            json!(replacement),
+            json!(Content {
                 role: "function".to_string(),
                 parts: vec![Part::FunctionResponse {
                     function_response: FunctionResponseData::new(
@@ -137,7 +137,7 @@ mod tests {
                         "audit": "screened"
                     })),
                 }],
-            }
+            })
         );
     }
 
@@ -158,7 +158,7 @@ mod tests {
             let mut replacement = ToolResponse::new(value).into_content("charge", None);
             let expected = replacement.clone();
             ToolResponse::preserve_unknown(&previous, &mut replacement);
-            assert_eq!(replacement, expected);
+            assert_eq!(json!(replacement), json!(expected));
         }
     }
 
