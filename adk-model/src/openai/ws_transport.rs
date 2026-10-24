@@ -556,7 +556,6 @@ impl WsTransport {
             let mut in_flight = false;
             loop {
                 let value = match next.take() { Some(value) => value, None => read(&mut lease, timeout).await.map_err(|failure| delivery(failure.error))? };
-                if response_recovery && super::responses_transport::ignore_event(&value) { continue; }
                 if value.get("type").and_then(Value::as_str) == Some("error") {
                     // A request-level error rejects the frame before any response
                     // starts, so the socket stays reusable. After a response has

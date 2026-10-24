@@ -3,6 +3,75 @@ use async_openai::types::responses::{CreateResponseArgs, InputParam};
 use serde_json::json;
 
 #[tokio::test]
+async fn retains_protocol_errors_during_response_recovery() {
+    use tokio::net::TcpListener;
+
+    for started in [false, true] {
+        for (status, code) in [(400, "invalid_prompt"), (429, "rate_limit_exceeded")] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                socket.next().await.unwrap().unwrap();
+                if started {
+                    socket
+                        .send(Message::Text(
+                            json!({"type":"response.created","sequence_number":1,"response":{
+                                "id":"fixture","object":"response","created_at":1,
+                                "model":"fixture","status":"in_progress","output":[]
+                            }})
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                socket
+                    .send(Message::Text(
+                        json!({"type":"error","status":status,"error":{
+                            "code":code,"message":"original protocol failure"
+                        }})
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let _ = socket.close(None).await;
+            });
+            let transport = WsTransport::lazy(&endpoint, "key", WsOptions::default());
+            let headers = transport.authorization(HeaderMap::new()).unwrap();
+            let stream = transport
+                .send_adapted(
+                    json!({"model":"fixture","input":[]}),
+                    headers,
+                    None,
+                    false,
+                    (false, false),
+                    true,
+                )
+                .await
+                .unwrap_or_else(|_| panic!("protocol error stream expected"));
+            let failure = tokio::time::timeout(
+                Duration::from_secs(5),
+                futures::TryStreamExt::try_collect::<Vec<_>>(stream),
+            )
+            .await
+            .expect("protocol error deadline")
+            .unwrap_err();
+            assert_eq!(failure.code, "model.openai_responses.ws_error");
+            assert_eq!(failure.message, "original protocol failure");
+            assert_eq!(failure.details.upstream_status_code, Some(status));
+            assert_eq!(failure.details.metadata["provider_error_code"], code);
+            assert_eq!(failure.details.metadata["provider_event_type"], "error");
+            assert_eq!(failure.details.metadata["transport"], "websocket");
+            assert_eq!(failure.retry.should_retry, status == 429);
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn retains_preconnect_causes_without_another_upgrade() {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
