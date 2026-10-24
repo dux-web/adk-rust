@@ -4,7 +4,9 @@
 //! run-store wake-ups, background runs with the harness targets, the extractor and its
 //! non-loopback refusal, the `--store` backend (§6 D-9) — and adds the kernel: a worker per
 //! queue class, the scheduler, the process table and the control plane on the kernel
-//! home's socket and under `/api/kernel` on HTTP.
+//! home's socket and under `/api/kernel` on HTTP. The kernel keeps its content-free
+//! activity ledger beside its other stores, with the subject key in the home, and runs the
+//! daily baseline pass, which the harness's model words (spec 3.2 §7.10).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +19,8 @@ use adk_core::{
 };
 use adk_harness::HarnessMode;
 use adk_kernel::control::ControlPlaneConfig;
+use adk_kernel::proc::baselines::LlmPhraser;
+use adk_kernel::proc::{Ledger, LedgerKey, LedgerStore};
 use adk_kernel::{KernelConfig, ProcessStore, QueueClass};
 use adk_server::background::{BackgroundState, DurableWorkerConfig};
 use anyhow::{Context, Result, bail};
@@ -35,6 +39,10 @@ struct KernelStores {
     schedules: Arc<dyn ScheduleStore>,
     /// Mounted drivers and their parked calls (spec 3.2 §7.7).
     drivers: Arc<dyn adk_kernel::drivers::DriverStore>,
+    /// The activity ledger, its observations and pass state (spec 3.2 §7.10).
+    ledger: Arc<dyn LedgerStore>,
+    /// Whether nothing outlives the kernel (`--ephemeral`).
+    ephemeral: bool,
     /// The kill switch's shared state; `None` keeps it in this process.
     governance: Option<Arc<dyn GovernanceStateStore>>,
     /// Where they are, for the banner.
@@ -44,6 +52,8 @@ struct KernelStores {
 /// `adk-rust up` (spec 3.2 §8.1): runs until Ctrl-C or `SIGTERM`, then drains and stops.
 pub async fn up(model: ResolvedModel, instruction: Option<String>, up: UpArgs) -> Result<()> {
     let UpArgs { home, bind, auth_token, store, harness, .. } = up;
+    // The baseline pass's observations are worded by the harness's model (spec 3.2 §7.10).
+    let phraser = Arc::new(LlmPhraser::new(model.llm.clone()));
     // Only `max_concurrent_runs` of a workspace's [kernel] table applies, so the directory
     // the workspace resolves from is enough here.
     let workspace = match &harness.dir {
@@ -167,13 +177,33 @@ pub async fn up(model: ResolvedModel, instruction: Option<String>, up: UpArgs) -
             .with_control(ControlPlaneConfig::default())
             .with_clock(Arc::new(adk_core::SystemClock)),
     );
+    // The subject key stays in the home; an ephemeral kernel's ledger and key end with it.
+    let key = if stores.ephemeral {
+        LedgerKey::generate()?
+    } else {
+        let path = home.join(LedgerKey::FILE);
+        // A protected DACL stands in for mode 0600 (spec 3.2 §10 W4); the kernel fills the
+        // empty file with the key.
+        #[cfg(all(windows, any(feature = "audit", feature = "persist")))]
+        if !path.exists() {
+            std::fs::create_dir_all(&home)?;
+            if let Err(error) = crate::owner_only::create_new(&path)
+                && error.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(error).with_context(|| format!("failed to create {}", path.display()));
+            }
+        }
+        LedgerKey::load_or_create(&path)?
+    };
     let mut kernel = harness
         .kernel()
         .config(config)
         .process_store(stores.processes)
         .agenda_store(stores.agenda)
         .schedule_store(stores.schedules)
-        .drivers(drivers);
+        .drivers(drivers)
+        .ledger(Ledger::new(stores.ledger, key))
+        .observation_phraser(phraser);
     if tick {
         // The tick distils this workspace's sessions, and the kernel's own, which name none.
         let recorded = setup.resolved.workspace.display().to_string();
@@ -185,6 +215,13 @@ pub async fn up(model: ResolvedModel, instruction: Option<String>, up: UpArgs) -
             },
         ));
         kernel = kernel.consolidator(adk_kernel::PartitionId::default(), Arc::new(consolidator));
+    }
+    if setup.memory_on() {
+        // The pass's observations are put to the user; a confirmed one is remembered.
+        let user = adk_core::UserId::new(setup.user.clone())?;
+        let audience = harness.observation_audience(&user)?;
+        kernel =
+            kernel.observation_audience(adk_kernel::PartitionId::default(), Arc::new(audience));
     }
     let kernel = kernel.build()?;
     // The inbox decides through the harness's approval service, which wakes the kernel's
@@ -221,7 +258,7 @@ pub async fn up(model: ResolvedModel, instruction: Option<String>, up: UpArgs) -
         )));
     }
     println!(
-        "  store {}: sessions, approvals, runs, processes, agenda, schedules, drivers",
+        "  store {}: sessions, approvals, runs, processes, agenda, schedules, drivers, the activity ledger",
         stores.label
     );
     println!("  plans {}", setup.plans_note());
@@ -280,11 +317,15 @@ async fn kernel_stores(setup: &Setup, store: Option<&str>) -> Result<KernelStore
         governance.migrate().await?;
         let drivers = adk_kernel::stores::SqliteDriverStore::new(db.pool.clone());
         drivers.migrate().await?;
+        let ledger = adk_kernel::proc::SqliteLedgerStore::new(db.pool.clone());
+        ledger.migrate().await?;
         return Ok(KernelStores {
             processes: Arc::new(processes),
             agenda: Arc::new(agenda),
             schedules: Arc::new(schedules),
             drivers: Arc::new(drivers),
+            ledger: Arc::new(ledger),
+            ephemeral: false,
             governance: Some(Arc::new(governance)),
             label: "harness.db".into(),
         });
@@ -295,6 +336,8 @@ async fn kernel_stores(setup: &Setup, store: Option<&str>) -> Result<KernelStore
         agenda: Arc::new(adk_kernel::InMemoryAgendaStore::new()),
         schedules: Arc::new(adk_core::InMemoryScheduleStore::new()),
         drivers: Arc::new(adk_kernel::stores::InMemoryDriverStore::new()),
+        ledger: Arc::new(adk_kernel::proc::InMemoryLedgerStore::new()),
+        ephemeral: true,
         governance: None,
         label: "memory (--ephemeral): nothing outlives the kernel".into(),
     })
@@ -316,11 +359,15 @@ async fn shared_kernel_stores(url: &str) -> Result<KernelStores> {
             governance.migrate().await?;
             let drivers = adk_kernel::stores::PostgresDriverStore::connect(url).await?;
             drivers.migrate().await?;
+            let ledger = adk_kernel::proc::PostgresLedgerStore::new(processes.pool().clone());
+            ledger.migrate().await?;
             Ok(KernelStores {
                 processes: Arc::new(processes),
                 agenda: Arc::new(agenda),
                 schedules: Arc::new(schedules),
                 drivers: Arc::new(drivers),
+                ledger: Arc::new(ledger),
+                ephemeral: false,
                 governance: Some(Arc::new(governance)),
                 label,
             })
@@ -337,11 +384,16 @@ async fn shared_kernel_stores(url: &str) -> Result<KernelStores> {
             governance.migrate().await?;
             let drivers = adk_kernel::stores::RedisDriverStore::connect(url).await?;
             drivers.migrate().await?;
+            let ledger =
+                adk_kernel::proc::RedisLedgerStore::from_client(processes.client().clone());
+            ledger.migrate().await?;
             Ok(KernelStores {
                 processes: Arc::new(processes),
                 agenda: Arc::new(agenda),
                 schedules: Arc::new(schedules),
                 drivers: Arc::new(drivers),
+                ledger: Arc::new(ledger),
+                ephemeral: false,
                 governance: Some(Arc::new(governance)),
                 label,
             })

@@ -12,6 +12,7 @@
 //! | Approvals | `StoreApprovalService::with_run_store`, so a decision wakes the parked run; `spawn_approval_ticker` for expiries |
 //! | Kill switch | [`KernelConfig::governance`]: `GovernanceControl::mirrored` with a 250 ms poll on multi-replica ([`KernelConfig::mirrored_governance`], K-I8) |
 //! | Control plane | [`ControlPlane`] over [`KernelConfig::control`] (§7.11) |
+//! | `/proc` (feature `proc`) | `KernelBuilder::ledger`: a sink on the bus writes every event's ledger row; the hosted runtime's `ProgressSource` gets the ledger at start; with `proc-baselines` the maintenance tick enqueues the daily `kernel.proc` pass, and [`KernelBuilder::observation_audience`] puts a partition's observations to a person as agenda questions (§7.10) |
 //!
 //! Lifecycle: [`pause`](Kernel::pause) shuts each worker's claim loop down and lets running
 //! processes finish their attempt; [`drain`](Kernel::drain) suspends running processes at
@@ -55,13 +56,15 @@ use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::agenda::{Agenda, AgendaHandle, AgendaStore, ProactivityPolicy};
+use crate::agenda::{Agenda, AgendaHandle, AgendaStore, ObservationAudience, ProactivityPolicy};
 use crate::audit;
 use crate::bus::{EventBus, EventSink, EventSubscriber, KernelEvent};
 use crate::consolidation::{ConsolidationExecutor, ConsolidationTicker, Consolidator};
 use crate::control::{ControlPlane, ControlPlaneConfig};
 use crate::error::{KernelError, Result};
 use crate::partition::PartitionId;
+#[cfg(feature = "proc")]
+use crate::proc::{Ledger, LedgerEventSink};
 use crate::process::{ProcessHandle, ProcessTable, ProgressSource, Suspension};
 use crate::sched::{QueueClass, QuietHours, Quotas};
 use crate::stores::ProcessFilter;
@@ -420,6 +423,8 @@ struct KernelInner {
     drivers: Option<crate::drivers::DriverSupervisor>,
     runtime: tokio::sync::Mutex<Runtime>,
     status: Arc<RwLock<Status>>,
+    #[cfg(feature = "proc")]
+    ledger: Option<Ledger>,
 }
 
 /// What a started kernel runs besides its claim loops.
@@ -529,6 +534,10 @@ impl Kernel {
         sup.draining.store(false, Ordering::SeqCst);
         if let Some(progress) = &sup.progress {
             progress.attach(ProcessHandle::new(&sup));
+            #[cfg(feature = "proc")]
+            if let Some(ledger) = &self.inner.ledger {
+                progress.attach_ledger(Arc::new(ledger.clone()));
+            }
         }
         if !governance.is_frozen() {
             sup.wake_suspended(&Suspension::Freeze).await;
@@ -874,6 +883,13 @@ impl Kernel {
         &self.inner.router
     }
 
+    /// The content-free activity ledger the kernel writes, when it was built with one
+    /// (spec 3.2 §7.10, feature `proc`).
+    #[cfg(feature = "proc")]
+    pub fn ledger(&self) -> Option<&Ledger> {
+        self.inner.ledger.as_ref()
+    }
+
     /// Subscribes to the event bus from now on.
     pub fn events(&self) -> EventSubscriber {
         self.inner.sup.bus.subscribe()
@@ -1202,6 +1218,13 @@ fn spawn_maintenance(
             if sup.external_wakes_due().await {
                 sup.nudge();
             }
+            // The day that ended gets its baseline pass, once (spec 3.2 §7.10).
+            #[cfg(feature = "proc-baselines")]
+            if let Some(proc) = &sup.proc
+                && proc.tick(&sup.runs, &sup.queues, sup.clock.now()).await
+            {
+                sup.nudge();
+            }
             sup.attribute_all().await;
             agenda.tick().await;
             sup.review().await;
@@ -1244,11 +1267,26 @@ fn spawn_maintenance(
 struct KernelWorkflows {
     user: Option<Arc<dyn WorkflowExecutor>>,
     wake: KernelWakeExecutor,
+    /// The daily baseline pass, `kernel.proc` (spec 3.2 §7.10).
+    #[cfg(feature = "proc-baselines")]
+    proc: Option<Arc<crate::proc::baselines::ProcRuntime>>,
+}
+
+impl KernelWorkflows {
+    /// The baseline pass when `workflow_id` names it.
+    #[cfg(feature = "proc-baselines")]
+    fn proc_for(&self, workflow_id: &str) -> Option<&Arc<crate::proc::baselines::ProcRuntime>> {
+        self.proc.as_ref().filter(|_| workflow_id == crate::proc::baselines::PROC_TARGET)
+    }
 }
 
 #[async_trait]
 impl WorkflowExecutor for KernelWorkflows {
     fn has_workflow(&self, workflow_id: &str) -> bool {
+        #[cfg(feature = "proc-baselines")]
+        if self.proc_for(workflow_id).is_some() {
+            return true;
+        }
         self.wake.has_workflow(workflow_id)
             || self.user.as_ref().is_some_and(|user| user.has_workflow(workflow_id))
     }
@@ -1259,6 +1297,14 @@ impl WorkflowExecutor for KernelWorkflows {
         input: WorkflowState,
         cancel_token: CancellationToken,
     ) -> std::result::Result<serde_json::Value, String> {
+        #[cfg(feature = "proc-baselines")]
+        if let Some(proc) = self.proc_for(workflow_id) {
+            let input = serde_json::Value::Object(input.into_iter().collect());
+            return tokio::select! {
+                done = proc.execute(input) => done,
+                () = cancel_token.cancelled() => Err("the baseline pass was cancelled".to_string()),
+            };
+        }
         match &self.user {
             Some(user) if !self.wake.has_workflow(workflow_id) => {
                 user.execute(workflow_id, input, cancel_token).await
@@ -1273,6 +1319,10 @@ impl WorkflowExecutor for KernelWorkflows {
         input: WorkflowState,
         run: WorkflowRunContext,
     ) -> std::result::Result<serde_json::Value, String> {
+        #[cfg(feature = "proc-baselines")]
+        if self.proc_for(workflow_id).is_some() {
+            return self.execute(workflow_id, input, run.cancel).await;
+        }
         match &self.user {
             Some(user) if !self.wake.has_workflow(workflow_id) => {
                 user.execute_durable(workflow_id, input, run).await
@@ -1370,6 +1420,13 @@ pub struct KernelBuilder {
     consolidators: BTreeMap<PartitionId, Arc<dyn Consolidator>>,
     #[cfg(feature = "drivers")]
     drivers: Option<crate::drivers::DriverSupervisor>,
+    audiences: BTreeMap<PartitionId, Arc<dyn ObservationAudience>>,
+    #[cfg(feature = "proc")]
+    ledger: Option<Ledger>,
+    #[cfg(feature = "proc-baselines")]
+    baselines: Option<crate::proc::baselines::BaselinePolicy>,
+    #[cfg(feature = "proc-baselines")]
+    phraser: Option<Arc<dyn crate::proc::baselines::ObservationPhraser>>,
 }
 
 impl fmt::Debug for KernelBuilder {
@@ -1555,6 +1612,55 @@ impl KernelBuilder {
         self
     }
 
+    /// Registers `audience` for `partition` (spec 3.2 §7.10): the daily baseline pass puts
+    /// the partition's observations to the person it names as
+    /// [`AgendaOrigin::Observation`](crate::AgendaOrigin::Observation) questions, and a
+    /// confirmation is remembered through it. Without one, observations stay at
+    /// `/api/kernel/proc/observations` and nobody is asked.
+    #[must_use]
+    pub fn observation_audience(
+        mut self,
+        partition: impl Into<PartitionId>,
+        audience: Arc<dyn ObservationAudience>,
+    ) -> Self {
+        self.audiences.insert(partition.into(), audience);
+        self
+    }
+
+    /// Keeps the content-free activity ledger in `ledger` (spec 3.2 §7.10, feature `proc`):
+    /// every event but `Health` writes its row, the [`ProgressSource`] gets the ledger at
+    /// start so the hosted runtime writes its own activity, and rows are stamped on
+    /// [`KernelConfig::clock`].
+    #[cfg(feature = "proc")]
+    #[must_use]
+    pub fn ledger(mut self, ledger: Ledger) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Runs the daily baseline pass under `policy` (spec 3.2 §7.10, feature
+    /// `proc-baselines`). With a ledger and no policy, the pass runs under
+    /// `BaselinePolicy::default()`; `BaselinePolicy::disabled()` turns it off.
+    #[cfg(feature = "proc-baselines")]
+    #[must_use]
+    pub fn baseline_policy(mut self, policy: crate::proc::baselines::BaselinePolicy) -> Self {
+        self.baselines = Some(policy);
+        self
+    }
+
+    /// Words observations with `phraser`, a model used only after the deterministic
+    /// detection (spec 3.2 §7.10, feature `proc-baselines`); without one the kernel's
+    /// template words them.
+    #[cfg(feature = "proc-baselines")]
+    #[must_use]
+    pub fn observation_phraser(
+        mut self,
+        phraser: Arc<dyn crate::proc::baselines::ObservationPhraser>,
+    ) -> Self {
+        self.phraser = Some(phraser);
+        self
+    }
+
     /// Builds the kernel. Nothing runs until [`Kernel::start`].
     ///
     /// # Errors
@@ -1588,6 +1694,37 @@ impl KernelBuilder {
             bus.add_sink(sink);
         }
         let trigger_names = self.triggers.iter().map(|trigger| trigger.name.clone()).collect();
+        #[cfg(feature = "proc")]
+        let ledger = self.ledger.map(|ledger| ledger.with_clock(Arc::clone(&config.clock)));
+        #[cfg(feature = "proc")]
+        if let Some(ledger) = &ledger {
+            bus.add_sink(Arc::new(LedgerEventSink::new(
+                ledger.clone(),
+                runs.clone(),
+                processes.clone(),
+            )));
+        }
+        let kernel_id = format!("kernel-{}", uuid::Uuid::new_v4());
+        // The kernel's own proposers reach the agenda through this handle, bound below.
+        let kernel_agenda = AgendaHandle::new();
+        #[cfg(feature = "proc-baselines")]
+        let proc = ledger.as_ref().map(|ledger| {
+            let mut pass = crate::proc::baselines::BaselinePass::new(
+                ledger.clone(),
+                self.baselines.clone().unwrap_or_default(),
+            );
+            if let Some(phraser) = self.phraser.clone() {
+                pass = pass.with_phraser(phraser);
+            }
+            Arc::new(crate::proc::baselines::ProcRuntime::new(
+                pass,
+                bus.clone(),
+                self.audit.clone(),
+                kernel_id.clone(),
+                config.app_name.clone(),
+                kernel_agenda.clone(),
+            ))
+        });
         let router = self
             .triggers
             .into_iter()
@@ -1596,7 +1733,7 @@ impl KernelBuilder {
             .with_clock(Arc::clone(&config.clock));
         let sup = Arc::new(Supervision {
             app_name: config.app_name.clone(),
-            kernel_id: format!("kernel-{}", uuid::Uuid::new_v4()),
+            kernel_id,
             queues: config.queues.clone(),
             runs: runs.clone(),
             processes,
@@ -1621,26 +1758,29 @@ impl KernelBuilder {
             reviewed: std::sync::Mutex::new(None),
             crons: std::sync::Mutex::new(BTreeMap::new()),
             triggers: trigger_names,
+            #[cfg(feature = "proc-baselines")]
+            proc: proc.clone(),
         });
         let run_finished = Arc::new(RunFinishedWakeSource::new());
         let hooks =
             Arc::new(KernelHooks { sup: Arc::clone(&sup), run_finished: run_finished.clone() });
         // The consolidation tick's workflow sits before the caller's (spec 3.2 §7.5).
         let consolidators = Arc::new(self.consolidators);
-        let tick_agenda = AgendaHandle::new();
         let user_workflows = if consolidators.is_empty() {
             self.workflows.clone()
         } else {
             Some(Arc::new(ConsolidationExecutor::new(
                 Arc::clone(&sup),
                 Arc::clone(&consolidators),
-                tick_agenda.clone(),
+                kernel_agenda.clone(),
                 self.workflows.clone(),
             )) as Arc<dyn WorkflowExecutor>)
         };
         let workflows = Arc::new(KernelWorkflows {
             user: user_workflows,
             wake: KernelWakeExecutor::new(router.clone()),
+            #[cfg(feature = "proc-baselines")]
+            proc,
         });
         let workers = config
             .queues
@@ -1664,8 +1804,13 @@ impl KernelBuilder {
         let mut wake_sources = self.wake_sources;
         wake_sources.push(run_finished);
         let processes = ProcessTable::supervised(Arc::clone(&sup), self.spend);
-        let agenda = Agenda::new(Arc::clone(&sup), processes.clone(), self.approvals.clone());
-        for handle in self.agenda_handles.iter().chain([&tick_agenda]) {
+        let agenda = Agenda::new(
+            Arc::clone(&sup),
+            processes.clone(),
+            self.approvals.clone(),
+            self.audiences,
+        );
+        for handle in self.agenda_handles.iter().chain([&kernel_agenda]) {
             handle.bind(&agenda);
         }
         let consolidation = (!consolidators.is_empty())
@@ -1689,6 +1834,8 @@ impl KernelBuilder {
                 drivers: self.drivers,
                 runtime: tokio::sync::Mutex::new(Runtime::default()),
                 status: Arc::new(RwLock::new(Status::default())),
+                #[cfg(feature = "proc")]
+                ledger,
             }),
         })
     }

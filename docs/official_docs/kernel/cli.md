@@ -19,6 +19,7 @@ own (spec 3.2 §8.1, K-I17).
 | `adk-rust wake --file GLOB\|--cron EXPR\|--webhook NAME -- "task"` | A sleeping process that runs the task when it wakes |
 | `adk-rust freeze [--reason R]` / `unfreeze` | The kill switch, on every replica |
 | `adk-rust events [--follow] [--after CURSOR] [--json]` | The event bus |
+| `adk-rust proc [ledger\|baselines\|observations]` | The activity ledger (`--export FILE` for JSONL), each partition's baselines, the observations ([`/proc`](proc.md)) |
 | `adk-rust goal TEXT --until CMD` | With a kernel running, enqueues the goal on its `background` queue and follows it |
 | `adk-rust drivers list\|mount FILE [--yes]\|unmount ID\|restart ID\|reapprove ID` | The kernel's [drivers](drivers.md): MCP servers it supervises under the manifests you mounted |
 
@@ -54,14 +55,14 @@ adk-rust up --home /srv/kernel                     # socket and harness.db under
 
 ```text
 $ adk-rust up --mode ask
-  store harness.db: sessions, approvals, runs, processes, schedules
+  store harness.db: sessions, approvals, runs, processes, schedules, the activity ledger
   plans checkpointed in harness.db
 ADK-Rust kernel up on http://127.0.0.1:8080
   socket /Users/ana/Library/Application Support/adk-rust/kernel.sock
   home /Users/ana/Library/Application Support/adk-rust
   mode ask · shell host (full user permissions, network)
   queues interactive, background, maintenance
-  control: adk-rust ps | top | attach | kill | suspend | resume | freeze | events
+  control: adk-rust ps | top | attach | kill | suspend | resume | freeze | events | proc
   approvals: GET /api/approvals, POST /api/approvals/{id}/decide
 Press Ctrl+C to drain and stop
 ```
@@ -206,13 +207,13 @@ approved ab264c4b-f8f5-413e-937a-b364be35b52f: now scheduled on 1 wake(s)
 | Subcommand | Does |
 |---|---|
 | `list [--partition P] [--state S] [--limit N]` | The items, oldest first; the default |
-| `approve ID` | Approves a proposed item as you; it runs once admitted |
-| `reject ID [--reason R]` | Rejects a proposed or approved item |
-| `schedule ID --at TIME` | Runs the item at a time — RFC 3339, `HH:MM` local, or `+30m`, `+2h`, `+1d` — approving a proposed item first |
+| `approve ID` | Approves a proposed item as you; it runs once admitted. For an `observation`, confirms it: nothing runs, and its statement is remembered as known ([`/proc`](proc.md#answering-an-observation)) |
+| `reject ID [--reason R]` | Rejects a proposed or approved item; for an `observation`, dismisses it with nothing remembered |
+| `schedule ID --at TIME` | Runs the item at a time — RFC 3339, `HH:MM` local, or `+30m`, `+2h`, `+1d` — approving a proposed item first; refused for an `observation`, which is answered, never scheduled |
 | `schedule ID --cron EXPR` | At the next time the cron expression (UTC) fires |
 
-An ID may be a unique prefix. An item the consolidation tick proposed is approved only by a
-person; `agenda approve` over the socket or loopback is one.
+An ID may be a unique prefix. An item the consolidation tick or the baseline pass proposed is
+approved only by a person; `agenda approve` over the socket or loopback is one.
 
 ## `adk-rust wake`
 
